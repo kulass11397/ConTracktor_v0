@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+contractor_tracker.db
+contractor_tracker.db-shm
+contractor_tracker.db-wal
+*.db-journal
+*.log
+.idea/
+.vscode/
