@@ -7,6 +7,7 @@ No third-party packages are required.
 from __future__ import annotations
 
 import hashlib
+import calendar
 import os
 import secrets
 import shutil
@@ -27,6 +28,16 @@ DEFAULT_PHASES = [
     "Pre-Construction", "Site Preparation", "Foundation", "Structural",
     "Roofing", "Electrical", "Plumbing", "Finishes", "Inspection & Handover",
 ]
+
+NAVY = "#0F1A2E"
+NAVY_ACTIVE = "#243047"
+ORANGE = "#F59E0B"
+GREEN = "#10B981"
+RED = "#EF4444"
+INK = "#111827"
+MUTED = "#6B7280"
+SURFACE = "#F5F7FA"
+WHITE = "#FFFFFF"
 
 
 def cents(value: str | Decimal) -> int:
@@ -96,6 +107,13 @@ class Database:
             id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
             name TEXT NOT NULL, sort_order INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS project_heads (
+            id INTEGER PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            name TEXT NOT NULL, position TEXT NOT NULL DEFAULT '',
+            pin_salt TEXT NOT NULL, pin_hash TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
         CREATE TABLE IF NOT EXISTS tasks (
             id INTEGER PRIMARY KEY, phase_id INTEGER NOT NULL REFERENCES phases(id) ON DELETE CASCADE,
             milestone TEXT NOT NULL DEFAULT '', name TEXT NOT NULL, deadline TEXT NOT NULL DEFAULT '',
@@ -159,7 +177,14 @@ class Database:
         CREATE INDEX IF NOT EXISTS idx_tasks_phase ON tasks(phase_id);
         CREATE INDEX IF NOT EXISTS idx_events_project_date ON calendar_events(project_id, event_date);
         """)
+        self._ensure_column("expenses", "authorized_by_head_id", "INTEGER")
+        self._ensure_column("remittances", "authorized_by_head_id", "INTEGER")
         self.conn.commit()
+
+    def _ensure_column(self, table: str, column: str, definition: str):
+        columns = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def one(self, sql, params=()):
         return self.conn.execute(sql, params).fetchone()
@@ -191,6 +216,13 @@ class Database:
                 "INSERT INTO phases(project_id,name,sort_order) VALUES(?,?,?)",
                 [(project_id, name, index) for index, name in enumerate(DEFAULT_PHASES)],
             )
+            for head in values.get("heads", []):
+                salt, digest = hash_pin(head["pin"])
+                self.conn.execute(
+                    """INSERT INTO project_heads(project_id,name,position,pin_salt,pin_hash)
+                       VALUES(?,?,?,?,?)""",
+                    (project_id, head["name"], head["position"], salt, digest),
+                )
             self.conn.execute(
                 "INSERT INTO audit_log(project_id,action,details) VALUES(?,?,?)",
                 (project_id, "PROJECT_CREATED", values["name"]),
@@ -246,6 +278,179 @@ def dialog(parent, title, fields, initial=None):
     return win.result
 
 
+class HeadEditorDialog(tk.Toplevel):
+    """Small reusable editor for a project head and their private approval PIN."""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Add Project Head")
+        self.resizable(False, False)
+        self.result = None
+        self.vars = {key: tk.StringVar() for key in ("name", "position", "pin", "confirm")}
+        body = ttk.Frame(self, padding=20); body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Project head", style="DialogTitle.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+        labels = [("name", "Full name", False), ("position", "Position", False),
+                  ("pin", "Private PIN", True), ("confirm", "Confirm PIN", True)]
+        for row, (key, label, secret) in enumerate(labels, 1):
+            ttk.Label(body, text=label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=5)
+            ttk.Entry(body, textvariable=self.vars[key], show="*" if secret else "", width=34).grid(
+                row=row, column=1, pady=5)
+        ttk.Label(body, text="PINs are hashed and are never displayed again.", style="Muted.TLabel").grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=(6, 12))
+        buttons = ttk.Frame(body); buttons.grid(row=6, column=0, columnspan=2, sticky="e")
+        ttk.Button(buttons, text="Cancel", style="Secondary.TButton", command=self.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(buttons, text="Add Head", style="Primary.TButton", command=self.save).pack(side="right")
+        self.transient(parent); self.grab_set(); self.bind("<Escape>", lambda _e: self.destroy())
+
+    def save(self):
+        values = {key: var.get().strip() for key, var in self.vars.items()}
+        if not values["name"] or not values["position"]:
+            messagebox.showerror(APP_TITLE, "Name and position are required.", parent=self); return
+        if values["pin"] != values["confirm"]:
+            messagebox.showerror(APP_TITLE, "The PIN confirmation does not match.", parent=self); return
+        try:
+            hash_pin(values["pin"])
+        except ValueError as exc:
+            messagebox.showerror(APP_TITLE, str(exc), parent=self); return
+        self.result = {"name": values["name"], "position": values["position"], "pin": values["pin"]}
+        self.destroy()
+
+
+class ProjectDialog(tk.Toplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Create New Project")
+        self.geometry("760x610")
+        self.minsize(700, 560)
+        self.result = None
+        self.heads = []
+        self.vars = {key: tk.StringVar() for key in
+                     ("name", "client", "contract_value", "start_date", "target_date", "notes")}
+        self.vars["start_date"].set(date.today().isoformat())
+        body = ttk.Frame(self, padding=22); body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Create a new project", style="DialogTitle.TLabel").pack(anchor="w")
+        ttk.Label(body, text="Project heads will authorize protected financial activity.",
+                  style="Muted.TLabel").pack(anchor="w", pady=(2, 14))
+        fields = ttk.Frame(body); fields.pack(fill="x")
+        specs = [("name", "Project name"), ("client", "Client"),
+                 ("contract_value", "Contract value"), ("start_date", "Start date (YYYY-MM-DD)"),
+                 ("target_date", "Target date (YYYY-MM-DD)"), ("notes", "Notes")]
+        for index, (key, label) in enumerate(specs):
+            row, col = divmod(index, 2)
+            cell = ttk.Frame(fields); cell.grid(row=row, column=col, sticky="ew", padx=(0 if col == 0 else 8, 8 if col == 0 else 0), pady=5)
+            ttk.Label(cell, text=label).pack(anchor="w")
+            ttk.Entry(cell, textvariable=self.vars[key]).pack(fill="x", pady=(3, 0))
+        fields.columnconfigure(0, weight=1); fields.columnconfigure(1, weight=1)
+        headbar = ttk.Frame(body); headbar.pack(fill="x", pady=(18, 6))
+        ttk.Label(headbar, text="Project heads", style="Section.TLabel").pack(side="left")
+        ttk.Button(headbar, text="+ Add Head", style="Primary.TButton", command=self.add_head).pack(side="right")
+        ttk.Button(headbar, text="Remove", style="Secondary.TButton", command=self.remove_head).pack(side="right", padx=6)
+        self.tree = ttk.Treeview(body, columns=("name", "position"), show="headings", height=7)
+        self.tree.heading("name", text="NAME"); self.tree.heading("position", text="POSITION")
+        self.tree.column("name", width=280); self.tree.column("position", width=260)
+        self.tree.pack(fill="both", expand=True)
+        footer = ttk.Frame(body); footer.pack(fill="x", pady=(16, 0))
+        ttk.Button(footer, text="Cancel", style="Secondary.TButton", command=self.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(footer, text="Create Project", style="Primary.TButton", command=self.save).pack(side="right")
+        self.transient(parent); self.grab_set(); self.bind("<Escape>", lambda _e: self.destroy())
+
+    def add_head(self):
+        win = HeadEditorDialog(self); self.wait_window(win)
+        if win.result:
+            self.heads.append(win.result); self.refresh_heads()
+
+    def remove_head(self):
+        selected = self.tree.selection()
+        if selected:
+            self.heads.pop(int(selected[0])); self.refresh_heads()
+
+    def refresh_heads(self):
+        self.tree.delete(*self.tree.get_children())
+        for index, head in enumerate(self.heads):
+            self.tree.insert("", "end", iid=str(index), values=(head["name"], head["position"]))
+
+    def save(self):
+        values = {key: var.get().strip() for key, var in self.vars.items()}
+        try:
+            if not values["name"]: raise ValueError("Project name is required.")
+            cents(values["contract_value"])
+            valid_date(values["start_date"]); valid_date(values["target_date"])
+            if not self.heads: raise ValueError("Add at least one project head with a private PIN.")
+        except ValueError as exc:
+            messagebox.showerror(APP_TITLE, str(exc), parent=self); return
+        values["heads"] = list(self.heads); self.result = values; self.destroy()
+
+
+class HeadAuthorizationDialog(tk.Toplevel):
+    def __init__(self, parent, heads, action: str, details: str):
+        super().__init__(parent)
+        self.title("Project Head Authorization")
+        self.resizable(False, False)
+        self.result = None
+        self.heads = {f"{row['name']} — {row['position']}": row for row in heads}
+        self.head_var = tk.StringVar(value=next(iter(self.heads), "")); self.pin_var = tk.StringVar()
+        body = ttk.Frame(self, padding=22); body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Confirm protected action", style="DialogTitle.TLabel").pack(anchor="w")
+        ttk.Label(body, text=action, style="Section.TLabel").pack(anchor="w", pady=(8, 2))
+        ttk.Label(body, text=details, wraplength=430, style="Muted.TLabel").pack(anchor="w", pady=(0, 14))
+        ttk.Label(body, text="Authorizing project head").pack(anchor="w")
+        ttk.Combobox(body, textvariable=self.head_var, values=list(self.heads), state="readonly", width=48).pack(fill="x", pady=(3, 10))
+        ttk.Label(body, text="Private PIN").pack(anchor="w")
+        entry = ttk.Entry(body, textvariable=self.pin_var, show="*", width=48); entry.pack(fill="x", pady=(3, 14)); entry.focus_set()
+        footer = ttk.Frame(body); footer.pack(fill="x")
+        ttk.Button(footer, text="Cancel", style="Secondary.TButton", command=self.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(footer, text="Authorize & Continue", style="Primary.TButton", command=self.authorize).pack(side="right")
+        self.transient(parent); self.grab_set(); self.bind("<Escape>", lambda _e: self.destroy())
+        self.bind("<Return>", lambda _e: self.authorize())
+
+    def authorize(self):
+        head = self.heads.get(self.head_var.get())
+        if head and verify_pin(self.pin_var.get(), head["pin_salt"], head["pin_hash"]):
+            self.result = head; self.destroy(); return
+        self.pin_var.set("")
+        messagebox.showerror(APP_TITLE, "Incorrect project-head PIN.", parent=self)
+
+
+class ManageHeadsDialog(tk.Toplevel):
+    def __init__(self, parent, db, project_id):
+        super().__init__(parent)
+        self.title("Manage Project Heads"); self.geometry("610x420")
+        self.db, self.project_id = db, project_id
+        body = ttk.Frame(self, padding=20); body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Project heads", style="DialogTitle.TLabel").pack(anchor="w")
+        ttk.Label(body, text="Heads can authorize expenses, remittances and payroll commitments.", style="Muted.TLabel").pack(anchor="w", pady=(2, 12))
+        bar = ttk.Frame(body); bar.pack(fill="x")
+        ttk.Button(bar, text="+ Add Head", style="Primary.TButton", command=self.add).pack(side="left")
+        ttk.Button(bar, text="Remove Selected", style="Secondary.TButton", command=self.remove).pack(side="left", padx=6)
+        self.tree = ttk.Treeview(body, columns=("name", "position"), show="headings")
+        self.tree.heading("name", text="NAME"); self.tree.heading("position", text="POSITION")
+        self.tree.pack(fill="both", expand=True, pady=10)
+        ttk.Button(body, text="Done", style="Primary.TButton", command=self.destroy).pack(anchor="e")
+        self.refresh(); self.transient(parent); self.grab_set()
+
+    def refresh(self):
+        self.tree.delete(*self.tree.get_children())
+        for row in self.db.all("SELECT * FROM project_heads WHERE project_id=? AND active=1 ORDER BY name", (self.project_id,)):
+            self.tree.insert("", "end", iid=row["id"], values=(row["name"], row["position"]))
+
+    def add(self):
+        win = HeadEditorDialog(self); self.wait_window(win)
+        if win.result:
+            salt, digest = hash_pin(win.result["pin"])
+            self.db.execute("INSERT INTO project_heads(project_id,name,position,pin_salt,pin_hash) VALUES(?,?,?,?,?)",
+                            (self.project_id, win.result["name"], win.result["position"], salt, digest))
+            self.refresh()
+
+    def remove(self):
+        selected = self.tree.selection()
+        count = self.db.one("SELECT COUNT(*) n FROM project_heads WHERE project_id=? AND active=1", (self.project_id,))["n"]
+        if not selected: return
+        if count <= 1:
+            messagebox.showerror(APP_TITLE, "A project must keep at least one active head.", parent=self); return
+        if messagebox.askyesno(APP_TITLE, "Remove this project head?", parent=self):
+            self.db.execute("UPDATE project_heads SET active=0 WHERE id=?", (int(selected[0]),)); self.refresh()
+
+
 class BaseTab(ttk.Frame):
     def __init__(self, app):
         super().__init__(app.notebook, padding=10)
@@ -288,6 +493,14 @@ def make_tree(parent, columns: list[tuple[str, str, int]]):
     return tree
 
 
+def metric_card(parent, title: str, accent: str = ORANGE):
+    card = tk.Frame(parent, bg=WHITE, highlightbackground="#D8DEE8", highlightthickness=1, padx=16, pady=13)
+    tk.Label(card, text=title.upper(), bg=WHITE, fg=MUTED, font=("Segoe UI", 9, "bold")).pack(anchor="w")
+    value = tk.Label(card, text="—", bg=WHITE, fg=accent, font=("Segoe UI", 22, "bold"))
+    value.pack(anchor="w", pady=(7, 0))
+    return card, value
+
+
 class ProjectsTab(BaseTab):
     FIELDS = [
         ("name", "Project name"), ("client", "Client"), ("contract_value", "Contract value"),
@@ -297,25 +510,34 @@ class ProjectsTab(BaseTab):
 
     def __init__(self, app):
         super().__init__(app)
-        welcome = ttk.Label(self, text="Welcome — start by creating a project", style="Title.TLabel")
-        welcome.pack(anchor="w")
-        ttk.Label(
-            self, text="Each project keeps its own phases, expenses, people, payroll, funds and calendar."
-        ).pack(anchor="w", pady=(2, 12))
-        bar = ttk.Frame(self)
-        bar.pack(fill="x")
-        ttk.Button(bar, text="＋ Create Project", command=self.add).pack(side="left")
-        ttk.Button(bar, text="Edit Project", command=self.edit).pack(side="left", padx=6)
-        self.summary = ttk.Label(self, text="")
-        self.summary.pack(anchor="w", pady=14)
-        self.tree = make_tree(self, [
+        header = ttk.Frame(self); header.pack(fill="x")
+        title = ttk.Frame(header); title.pack(side="left")
+        ttk.Label(title, text="Dashboard Overview", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(title, text="Real-time project metrics and upcoming activity.", style="Muted.TLabel").pack(anchor="w")
+        ttk.Button(header, text="+ New Project", style="Primary.TButton", command=self.add).pack(side="right")
+        ttk.Button(header, text="Project Heads", style="Secondary.TButton", command=self.manage_heads).pack(side="right", padx=7)
+        ttk.Button(header, text="Edit Project", style="Secondary.TButton", command=self.edit).pack(side="right")
+        cards = ttk.Frame(self); cards.pack(fill="x", pady=(18, 14))
+        self.contract_card, self.contract_value = metric_card(cards, "Total Contract Value", INK)
+        self.paid_card, self.paid_value = metric_card(cards, "Paid Expenses", GREEN)
+        self.outstanding_card, self.outstanding_value = metric_card(cards, "Outstanding", RED)
+        self.progress_card, self.progress_value = metric_card(cards, "Overall Progress", ORANGE)
+        for card in (self.contract_card, self.paid_card, self.outstanding_card, self.progress_card):
+            card.pack(side="left", fill="x", expand=True, padx=(0, 9))
+        lower = ttk.Panedwindow(self, orient="horizontal"); lower.pack(fill="both", expand=True)
+        projects = ttk.Frame(lower, padding=(0, 0, 8, 0)); events = ttk.Frame(lower, padding=(8, 0, 0, 0))
+        lower.add(projects, weight=3); lower.add(events, weight=2)
+        ttk.Label(projects, text="Projects", style="Section.TLabel").pack(anchor="w", pady=(0, 5))
+        self.tree = make_tree(projects, [
             ("name", "Project", 230), ("client", "Client", 190), ("contract", "Contract Value", 130),
             ("start", "Start", 100), ("target", "Target", 100),
         ])
         self.tree.bind("<Double-1>", self.choose)
+        ttk.Label(events, text="Upcoming Events", style="Section.TLabel").pack(anchor="w", pady=(0, 5))
+        self.events = make_tree(events, [("date", "Date", 95), ("event", "Event", 230), ("type", "Type", 90)])
 
     def add(self):
-        data = dialog(self, "Create Project", self.FIELDS, {"start_date": date.today().isoformat()})
+        win = ProjectDialog(self); self.wait_window(win); data = win.result
         if not data:
             return
         try:
@@ -325,6 +547,10 @@ class ProjectsTab(BaseTab):
             self.app.load_projects(project_id)
         except (ValueError, sqlite3.Error) as exc:
             messagebox.showerror(APP_TITLE, str(exc))
+
+    def manage_heads(self):
+        if not self.require_project(): return
+        win = ManageHeadsDialog(self, self.db, self.project_id); self.wait_window(win)
 
     def edit(self):
         if not self.require_project():
@@ -357,6 +583,7 @@ class ProjectsTab(BaseTab):
 
     def refresh(self):
         self.tree.delete(*self.tree.get_children())
+        self.events.delete(*self.events.get_children())
         for row in self.db.all("SELECT * FROM projects ORDER BY created_at DESC"):
             self.tree.insert("", "end", iid=row["id"], values=(
                 row["name"], row["client"], money(row["contract_value_cents"]),
@@ -374,11 +601,22 @@ class ProjectsTab(BaseTab):
                 (self.project_id,),
             )["total"]
             progress = round(tasks["done"] * 100 / tasks["total"]) if tasks["total"] else 0
-            self.summary.config(
-                text=f"Selected: {row['name']}     Task progress: {progress}%     Paid expenses: {money(paid)}"
-            )
+            outstanding = self.db.one(
+                """SELECT COALESCE(SUM(e.total_cents),0)-COALESCE(SUM(x.paid),0) total
+                   FROM expenses e LEFT JOIN (SELECT expense_id,SUM(amount_cents) paid FROM payments GROUP BY expense_id) x
+                   ON x.expense_id=e.id WHERE e.project_id=? AND e.voided=0""", (self.project_id,)
+            )["total"]
+            self.contract_value.config(text=money(row["contract_value_cents"]))
+            self.paid_value.config(text=money(paid))
+            self.outstanding_value.config(text=money(outstanding))
+            self.progress_value.config(text=f"{progress}%")
+            for event in self.db.all(
+                """SELECT * FROM calendar_events WHERE project_id=? AND completed=0 AND event_date>=?
+                   ORDER BY event_date,event_time LIMIT 8""", (self.project_id, date.today().isoformat())):
+                self.events.insert("", "end", iid=event["id"], values=(event["event_date"], event["title"], event["type"]))
         else:
-            self.summary.config(text="No project selected.")
+            for label in (self.contract_value, self.paid_value, self.outstanding_value, self.progress_value):
+                label.config(text="—")
 
 
 class ProgressTab(BaseTab):
@@ -551,6 +789,7 @@ class ExpensesTab(BaseTab):
             ("name", "Name", 150), ("supplier", "Supplier", 130), ("trade", "Trade", 105),
             ("phase", "Phase", 120), ("date", "Date", 90), ("total", "Total", 100),
             ("paid", "Paid", 100), ("balance", "Balance", 100), ("status", "Status", 90),
+            ("authorized", "Authorized by", 140),
         ])
 
     def phase_map(self):
@@ -564,7 +803,7 @@ class ExpensesTab(BaseTab):
             fields.append((spec[0], spec[1], [""] + list(self.phase_map())) if spec[0] == "phase" else spec)
         return dialog(self, "Expense", fields, initial)
 
-    def save_values(self, data, expense_id=None):
+    def save_values(self, data, expense_id=None, authorized_head_id=None):
         if not data["name"]:
             raise ValueError("Expense name is required.")
         quantity = qty_decimal(data["qty"])
@@ -588,8 +827,9 @@ class ExpensesTab(BaseTab):
         else:
             self.db.execute(
                 """INSERT INTO expenses(project_id,name,item,dimensions,supplier,qty,unit,
-                   unit_price_cents,total_cents,phase_id,area,trade,expense_date,due_date,invoice_no,notes)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (self.project_id,) + values
+                   unit_price_cents,total_cents,phase_id,area,trade,expense_date,due_date,invoice_no,notes,
+                   authorized_by_head_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (self.project_id,) + values + (authorized_head_id,)
             )
             self.db.audit(self.project_id, "EXPENSE_ADDED", data["name"])
 
@@ -599,7 +839,14 @@ class ExpensesTab(BaseTab):
         data = self.expense_form({"qty": "1", "expense_date": date.today().isoformat()})
         if data:
             try:
-                self.save_values(data)
+                quantity = qty_decimal(data["qty"]); total = int(quantity * cents(data["unit_price"]))
+                head = self.app.authorize(
+                    "Add expense",
+                    f"{data['name']} — {money(total)}\nSupplier: {data['supplier'] or 'Not specified'}"
+                )
+                if not head: return
+                self.save_values(data, authorized_head_id=head["id"])
+                self.db.audit(self.project_id, "EXPENSE_AUTHORIZED", f"{data['name']} by {head['name']}")
                 self.app.refresh_all()
             except (ValueError, sqlite3.Error) as exc:
                 messagebox.showerror(APP_TITLE, str(exc))
@@ -658,7 +905,9 @@ class ExpensesTab(BaseTab):
 
     def void(self):
         expense_id = self.selected_id(self.tree)
-        if expense_id:
+        if expense_id and messagebox.askyesno(
+            APP_TITLE, "Void or restore the selected expense?\n\nThe audit history will be retained."
+        ):
             self.db.execute(
                 "UPDATE expenses SET voided=CASE voided WHEN 1 THEN 0 ELSE 1 END WHERE id=?", (expense_id,)
             )
@@ -672,9 +921,11 @@ class ExpensesTab(BaseTab):
             return
         search = f"%{self.filter_var.get().strip()}%"
         rows = self.db.all(
-            """SELECT e.*,COALESCE(ph.name,'') phase,COALESCE(SUM(p.amount_cents),0) paid
+            """SELECT e.*,COALESCE(ph.name,'') phase,COALESCE(h.name,'') authorized_by,
+               COALESCE(SUM(p.amount_cents),0) paid
                FROM expenses e LEFT JOIN phases ph ON ph.id=e.phase_id
                LEFT JOIN payments p ON p.expense_id=e.id
+               LEFT JOIN project_heads h ON h.id=e.authorized_by_head_id
                WHERE e.project_id=? AND (e.name LIKE ? OR e.item LIKE ? OR e.supplier LIKE ?
                  OR e.trade LIKE ? OR e.area LIKE ? OR e.expense_date LIKE ? OR ph.name LIKE ?)
                GROUP BY e.id ORDER BY e.expense_date DESC,e.id DESC""",
@@ -693,6 +944,7 @@ class ExpensesTab(BaseTab):
             self.tree.insert("", "end", iid=row["id"], values=(
                 row["name"], row["supplier"], row["trade"], row["phase"], row["expense_date"],
                 money(row["total_cents"]), money(row["paid"]), money(balance), status,
+                row["authorized_by"] or "Legacy / not recorded",
             ))
         self.totals.config(
             text=f"Committed {money(committed)}   |   Paid {money(paid_total)}   |   Outstanding {money(outstanding)}"
@@ -756,6 +1008,50 @@ class ContactsTab(BaseTab):
                 ))
 
 
+class KioskWindow(tk.Toplevel):
+    """Full-screen employee clock designed for a shared site computer."""
+    def __init__(self, payroll):
+        super().__init__(payroll)
+        self.payroll = payroll
+        self.title("ConTracktor Site Kiosk")
+        self.configure(bg=NAVY)
+        self.attributes("-fullscreen", True)
+        self.employee_no = tk.StringVar(); self.pin = tk.StringVar()
+        top = tk.Frame(self, bg=NAVY, padx=34, pady=22); top.pack(fill="x")
+        tk.Label(top, text="ConTracktor", bg=NAVY, fg=WHITE,
+                 font=("Segoe UI", 23, "bold")).pack(side="left")
+        ttk.Button(top, text="Exit Kiosk", style="Secondary.TButton", command=self.destroy).pack(side="right")
+        project = payroll.db.one("SELECT name FROM projects WHERE id=?", (payroll.project_id,))
+        tk.Label(self, text=project["name"] if project else "Site Attendance", bg=NAVY,
+                 fg="#9CA3AF", font=("Segoe UI", 13)).pack()
+        self.clock_label = tk.Label(self, text="", bg=NAVY, fg=ORANGE,
+                                    font=("Consolas", 54, "bold"))
+        self.clock_label.pack(pady=(45, 30))
+        card = tk.Frame(self, bg=WHITE, padx=42, pady=36,
+                        highlightthickness=1, highlightbackground="#D8DEE8")
+        card.pack(ipadx=40)
+        tk.Label(card, text="ENTER EMPLOYEE NUMBER AND PIN", bg=WHITE, fg=INK,
+                 font=("Segoe UI", 13, "bold")).pack(pady=(0, 18))
+        ttk.Entry(card, textvariable=self.employee_no, font=("Segoe UI", 18), width=26).pack(ipady=8, pady=5)
+        ttk.Entry(card, textvariable=self.pin, show="*", font=("Segoe UI", 22), width=26).pack(ipady=8, pady=5)
+        buttons = tk.Frame(card, bg=WHITE); buttons.pack(fill="x", pady=(22, 0))
+        ttk.Button(buttons, text="TIME IN", style="Success.TButton",
+                   command=lambda: self.submit("in")).pack(side="left", fill="x", expand=True, padx=(0, 6), ipady=10)
+        ttk.Button(buttons, text="TIME OUT", style="Secondary.TButton",
+                   command=lambda: self.submit("out")).pack(side="left", fill="x", expand=True, padx=(6, 0), ipady=10)
+        tk.Label(self, text="Press Esc to exit kiosk mode", bg=NAVY, fg="#7F8CA3").pack(side="bottom", pady=20)
+        self.bind("<Escape>", lambda _e: self.destroy()); self.update_clock()
+
+    def update_clock(self):
+        if self.winfo_exists():
+            self.clock_label.config(text=datetime.now().strftime("%I:%M:%S %p"))
+            self.after(1000, self.update_clock)
+
+    def submit(self, direction):
+        if self.payroll.process_clock(direction, self.employee_no.get(), self.pin.get(), self):
+            self.employee_no.set(""); self.pin.set("")
+
+
 class PayrollTab(BaseTab):
     EMPLOYEE_FIELDS = [
         ("employee_no", "Employee number"), ("pin", "PIN (4+ characters)"), ("name", "Name"),
@@ -771,17 +1067,24 @@ class PayrollTab(BaseTab):
         ttk.Button(actions, text="＋ Add Employee", command=self.add_employee).pack(side="left")
         ttk.Button(actions, text="Edit Employee", command=self.edit_employee).pack(side="left", padx=5)
         ttk.Button(actions, text="Commit Closed Attendance to Expenses", command=self.commit).pack(side="left")
-        clock = ttk.LabelFrame(self, text="Employee time clock", padding=8)
-        clock.pack(fill="x", pady=6)
-        ttk.Label(clock, text="Employee no.").pack(side="left")
+        clock = tk.Frame(self, bg=NAVY, padx=16, pady=12)
+        clock.pack(fill="x", pady=8)
+        tk.Label(clock, text="SITE KIOSK", bg=NAVY, fg=WHITE,
+                 font=("Segoe UI", 12, "bold")).pack(side="left", padx=(0, 15))
+        tk.Label(clock, text="Employee no.", bg=NAVY, fg="#CBD5E1").pack(side="left")
         self.employee_no = tk.StringVar()
-        ttk.Entry(clock, textvariable=self.employee_no, width=16).pack(side="left", padx=5)
-        ttk.Label(clock, text="PIN").pack(side="left")
+        ttk.Entry(clock, textvariable=self.employee_no, width=14).pack(side="left", padx=5)
+        tk.Label(clock, text="PIN", bg=NAVY, fg="#CBD5E1").pack(side="left")
         self.pin = tk.StringVar()
-        ttk.Entry(clock, textvariable=self.pin, show="•", width=12).pack(side="left", padx=5)
-        ttk.Button(clock, text="Time In / Time Out", command=self.clock).pack(side="left", padx=5)
-        self.summary = ttk.Label(clock)
-        self.summary.pack(side="right")
+        ttk.Entry(clock, textvariable=self.pin, show="*", width=10).pack(side="left", padx=5)
+        ttk.Button(clock, text="IN", style="Success.TButton",
+                   command=lambda: self.clock("in")).pack(side="left", padx=3)
+        ttk.Button(clock, text="OUT", style="Secondary.TButton",
+                   command=lambda: self.clock("out")).pack(side="left", padx=3)
+        ttk.Button(clock, text="Expand Kiosk", style="Primary.TButton",
+                   command=self.open_kiosk).pack(side="right")
+        self.summary = tk.Label(clock, text="", bg=NAVY, fg=WHITE)
+        self.summary.pack(side="right", padx=12)
         lists = ttk.Notebook(self)
         lists.pack(fill="both", expand=True, pady=(6, 0))
         employee_page = ttk.Frame(lists, padding=4)
@@ -848,21 +1151,34 @@ class PayrollTab(BaseTab):
             except (ValueError, sqlite3.Error) as exc:
                 messagebox.showerror(APP_TITLE, str(exc))
 
-    def clock(self):
+    def open_kiosk(self):
+        if self.require_project():
+            KioskWindow(self)
+
+    def clock(self, direction=None):
+        self.process_clock(direction, self.employee_no.get(), self.pin.get(), self)
+
+    def process_clock(self, direction, employee_no, pin, parent=None):
         if not self.require_project():
-            return
+            return False
         employee = self.db.one("SELECT * FROM employees WHERE project_id=? AND employee_no=? AND active=1",
-                               (self.project_id, self.employee_no.get().strip()))
-        if not employee or not verify_pin(self.pin.get(), employee["pin_salt"], employee["pin_hash"]):
-            messagebox.showerror(APP_TITLE, "Employee number or PIN is incorrect.")
-            return
+                               (self.project_id, employee_no.strip()))
+        if not employee or not verify_pin(pin, employee["pin_salt"], employee["pin_hash"]):
+            messagebox.showerror(APP_TITLE, "Employee number or PIN is incorrect.", parent=parent)
+            return False
         open_row = self.db.one("SELECT * FROM attendance WHERE employee_id=? AND clock_out=''",
                                (employee["id"],))
         now = datetime.now()
+        if direction == "in" and open_row:
+            messagebox.showinfo(APP_TITLE, f"{employee['name']} is already clocked in.", parent=parent)
+            return False
+        if direction == "out" and not open_row:
+            messagebox.showinfo(APP_TITLE, f"{employee['name']} is not currently clocked in.", parent=parent)
+            return False
         if not open_row:
             self.db.execute("INSERT INTO attendance(employee_id,clock_in) VALUES(?,?)",
                             (employee["id"], now.isoformat(timespec="seconds")))
-            messagebox.showinfo(APP_TITLE, f"Time in recorded for {employee['name']} at {now:%I:%M %p}.")
+            messagebox.showinfo(APP_TITLE, f"Welcome, {employee['name']}!\nTime in: {now:%I:%M %p}", parent=parent)
         else:
             started = datetime.fromisoformat(open_row["clock_in"])
             hours = max(Decimal("0"), Decimal(str((now - started).total_seconds() / 3600))).quantize(
@@ -880,10 +1196,11 @@ class PayrollTab(BaseTab):
                 (now.isoformat(timespec="seconds"), str(hours), gross, open_row["id"]),
             )
             messagebox.showinfo(
-                APP_TITLE, f"Time out recorded for {employee['name']}.\nHours: {hours}\nGross: {money(gross)}"
+                APP_TITLE, f"Goodbye, {employee['name']}!\nHours: {hours}\nGross: {money(gross)}", parent=parent
             )
         self.pin.set("")
         self.app.refresh_all()
+        return True
 
     def commit(self):
         if not self.require_project():
@@ -897,22 +1214,29 @@ class PayrollTab(BaseTab):
             messagebox.showinfo(APP_TITLE, "There is no uncommitted closed attendance.")
             return
         total = sum(r["gross_cents"] for r in rows)
+        head = self.app.authorize(
+            "Commit payroll to expenses",
+            f"{len(rows)} closed attendance record(s) totaling {money(total)}.\n"
+            "This will create one unpaid payroll expense."
+        )
+        if not head: return
         batch = datetime.now().strftime("%Y%m%d-%H%M%S")
         with self.db.conn:
             cur = self.db.conn.execute(
                 """INSERT INTO expenses(project_id,name,item,supplier,qty,unit,unit_price_cents,
-                   total_cents,trade,expense_date,due_date,payroll_batch,notes)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   total_cents,trade,expense_date,due_date,payroll_batch,notes,authorized_by_head_id)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (self.project_id, f"Payroll {date.today():%Y-%m-%d}", "Closed attendance payroll",
                  "Payroll", "1", "batch", total, total, "Labor", date.today().isoformat(),
-                 date.today().isoformat(), batch, f"{len(rows)} attendance record(s)"),
+                 date.today().isoformat(), batch, f"{len(rows)} attendance record(s)", head["id"]),
             )
             expense_id = cur.lastrowid
             self.db.conn.executemany(
                 "UPDATE attendance SET committed_expense_id=? WHERE id=?",
                 [(expense_id, r["id"]) for r in rows],
             )
-        self.db.audit(self.project_id, "PAYROLL_COMMITTED", f"{batch}: {money(total)}")
+        self.db.audit(self.project_id, "PAYROLL_COMMITTED",
+                      f"{batch}: {money(total)} authorized by {head['name']}")
         messagebox.showinfo(APP_TITLE, f"Payroll of {money(total)} was added as an unpaid expense.")
         self.app.refresh_all()
 
@@ -966,8 +1290,8 @@ class RemittancesTab(BaseTab):
         ttk.Button(bar, text="Void / Restore", command=self.void).pack(side="left")
         self.tree = make_tree(self, [
             ("date", "Date", 95), ("type", "Type", 100), ("amount", "Amount", 110),
-            ("purpose", "Purpose", 210), ("care", "C/O", 150), ("signature", "Signature", 170),
-            ("status", "Status", 70),
+            ("purpose", "Purpose", 210), ("care", "C/O", 150),
+            ("authorized", "Authorized by", 140), ("status", "Status", 70),
         ])
 
     def add(self):
@@ -980,13 +1304,19 @@ class RemittancesTab(BaseTab):
                 amount = cents(data["amount"])
                 if amount <= 0:
                     raise ValueError("Amount must be greater than zero.")
+                head = self.app.authorize(
+                    f"Record {data['type'].lower()}",
+                    f"{money(amount)} — {data['purpose'] or 'No purpose supplied'}"
+                )
+                if not head: return
                 self.db.execute(
                     """INSERT INTO remittances(project_id,type,amount_cents,txn_date,purpose,
-                       care_of,signature,notes) VALUES(?,?,?,?,?,?,?,?)""",
+                       care_of,signature,notes,authorized_by_head_id) VALUES(?,?,?,?,?,?,?,?,?)""",
                     (self.project_id, data["type"], amount, valid_date(data["txn_date"], True),
-                     data["purpose"], data["care_of"], data["signature"], data["notes"]),
+                     data["purpose"], data["care_of"], data["signature"], data["notes"], head["id"]),
                 )
-                self.db.audit(self.project_id, "REMITTANCE_ADDED", f"{data['type']} {money(amount)}")
+                self.db.audit(self.project_id, "REMITTANCE_ADDED",
+                              f"{data['type']} {money(amount)} authorized by {head['name']}")
                 self.app.refresh_all()
             except ValueError as exc:
                 messagebox.showerror(APP_TITLE, str(exc))
@@ -1017,7 +1347,9 @@ class RemittancesTab(BaseTab):
 
     def void(self):
         record_id = self.selected_id(self.tree)
-        if record_id:
+        if record_id and messagebox.askyesno(
+            APP_TITLE, "Void or restore the selected transaction?\n\nThe audit history will be retained."
+        ):
             self.db.execute(
                 "UPDATE remittances SET voided=CASE voided WHEN 1 THEN 0 ELSE 1 END WHERE id=?",
                 (record_id,),
@@ -1030,8 +1362,10 @@ class RemittancesTab(BaseTab):
         if not self.project_id:
             self.progress["value"] = 0
             return
-        rows = self.db.all("SELECT * FROM remittances WHERE project_id=? ORDER BY txn_date DESC,id DESC",
-                           (self.project_id,))
+        rows = self.db.all(
+            """SELECT r.*,COALESCE(h.name,'') authorized_by FROM remittances r
+               LEFT JOIN project_heads h ON h.id=r.authorized_by_head_id
+               WHERE r.project_id=? ORDER BY r.txn_date DESC,r.id DESC""", (self.project_id,))
         deposits = withdrawals = 0
         for row in rows:
             if not row["voided"]:
@@ -1041,7 +1375,8 @@ class RemittancesTab(BaseTab):
                     withdrawals += row["amount_cents"]
             self.tree.insert("", "end", iid=row["id"], values=(
                 row["txn_date"], row["type"], money(row["amount_cents"]), row["purpose"],
-                row["care_of"], row["signature"], "VOID" if row["voided"] else "Active",
+                row["care_of"], row["authorized_by"] or "Legacy / not recorded",
+                "VOID" if row["voided"] else "Active",
             ))
         contract = self.db.one("SELECT contract_value_cents FROM projects WHERE id=?",
                                (self.project_id,))["contract_value_cents"]
@@ -1054,23 +1389,38 @@ class RemittancesTab(BaseTab):
 
 class CalendarTab(BaseTab):
     FIELDS = [
-        ("type", "Type", ["Appointment", "Reminder", "Deadline"]),
+        ("type", "Type", ["Meeting", "Deadline", "Schedule", "Reminder"]),
         ("title", "Title"), ("event_date", "Date (YYYY-MM-DD)"),
         ("event_time", "Time (e.g. 09:30 AM)"), ("notes", "Notes"),
     ]
 
     def __init__(self, app):
         super().__init__(app)
-        ttk.Label(self, text="Calendar planner", style="Title.TLabel").pack(anchor="w")
-        bar = ttk.Frame(self); bar.pack(fill="x", pady=(10, 0))
-        ttk.Button(bar, text="＋ Add Event", command=self.add).pack(side="left")
-        ttk.Button(bar, text="Edit", command=self.edit).pack(side="left", padx=5)
-        ttk.Button(bar, text="✓ Toggle Complete", command=self.toggle).pack(side="left")
-        ttk.Button(bar, text="Delete", command=self.delete).pack(side="left", padx=5)
-        self.tree = make_tree(self, [
-            ("done", "Done", 55), ("date", "Date", 100), ("time", "Time", 100),
-            ("type", "Type", 110), ("title", "Title", 260), ("notes", "Notes", 300),
+        self.display_year, self.display_month = date.today().year, date.today().month
+        header = ttk.Frame(self); header.pack(fill="x")
+        ttk.Label(header, text="Project Calendar", style="Title.TLabel").pack(side="left")
+        ttk.Button(header, text="+ Event", style="Primary.TButton", command=self.add).pack(side="right")
+        ttk.Button(header, text="Delete", style="Secondary.TButton", command=self.delete).pack(side="right", padx=6)
+        ttk.Button(header, text="Edit", style="Secondary.TButton", command=self.edit).pack(side="right")
+        body = ttk.Panedwindow(self, orient="horizontal"); body.pack(fill="both", expand=True, pady=(12, 0))
+        left = ttk.Frame(body); right = ttk.Frame(body, padding=(10, 0, 0, 0))
+        body.add(left, weight=4); body.add(right, weight=2)
+        monthbar = ttk.Frame(left); monthbar.pack(fill="x", pady=(0, 8))
+        self.month_title = ttk.Label(monthbar, text="", style="Section.TLabel"); self.month_title.pack(side="left")
+        ttk.Button(monthbar, text="‹", style="Secondary.TButton", command=lambda: self.shift_month(-1)).pack(side="right", padx=2)
+        ttk.Button(monthbar, text="›", style="Secondary.TButton", command=lambda: self.shift_month(1)).pack(side="right")
+        self.calendar_frame = tk.Frame(left, bg="#D8DEE8"); self.calendar_frame.pack(fill="both", expand=True)
+        ttk.Label(right, text="Upcoming", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
+        self.tree = make_tree(right, [
+            ("date", "Date", 90), ("type", "Type", 85), ("title", "Event", 210),
+            ("time", "Time", 85), ("done", "Done", 55),
         ])
+
+    def shift_month(self, delta):
+        month = self.display_month + delta
+        if month < 1: self.display_year -= 1; month = 12
+        if month > 12: self.display_year += 1; month = 1
+        self.display_month = month; self.refresh()
 
     def add(self):
         if not self.require_project():
@@ -1121,15 +1471,42 @@ class CalendarTab(BaseTab):
 
     def refresh(self):
         self.tree.delete(*self.tree.get_children())
-        if self.project_id:
-            for row in self.db.all(
-                "SELECT * FROM calendar_events WHERE project_id=? ORDER BY event_date,event_time,id",
-                (self.project_id,),
-            ):
-                self.tree.insert("", "end", iid=row["id"], values=(
-                    "✓" if row["completed"] else "", row["event_date"], row["event_time"],
-                    row["type"], row["title"], row["notes"],
-                ))
+        for child in self.calendar_frame.winfo_children(): child.destroy()
+        self.month_title.config(text=f"{calendar.month_name[self.display_month]} {self.display_year}")
+        rows = self.db.all(
+            "SELECT * FROM calendar_events WHERE project_id=? ORDER BY event_date,event_time,id",
+            (self.project_id,),
+        ) if self.project_id else []
+        events_by_day = {}
+        for row in rows:
+            try:
+                event_day = date.fromisoformat(row["event_date"])
+                if event_day.year == self.display_year and event_day.month == self.display_month:
+                    events_by_day.setdefault(event_day.day, []).append(row)
+            except ValueError:
+                pass
+            self.tree.insert("", "end", iid=row["id"], values=(
+                row["event_date"], row["type"], row["title"], row["event_time"],
+                "Yes" if row["completed"] else "",
+            ))
+        for col, name in enumerate(("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")):
+            tk.Label(self.calendar_frame, text=name, bg="#EEF1F5", fg=MUTED,
+                     font=("Segoe UI", 9, "bold"), pady=8).grid(
+                         row=0, column=col, sticky="nsew", padx=1, pady=1)
+            self.calendar_frame.columnconfigure(col, weight=1, uniform="day")
+        for week_index, week in enumerate(calendar.monthcalendar(self.display_year, self.display_month), 1):
+            self.calendar_frame.rowconfigure(week_index, weight=1, uniform="week")
+            for col, day in enumerate(week):
+                cell = tk.Frame(self.calendar_frame, bg=WHITE, padx=6, pady=5)
+                cell.grid(row=week_index, column=col, sticky="nsew", padx=1, pady=1)
+                if day:
+                    tk.Label(cell, text=str(day), bg=WHITE, fg=INK,
+                             font=("Segoe UI", 9, "bold")).pack(anchor="ne")
+                    for event in events_by_day.get(day, [])[:2]:
+                        color = RED if event["type"] == "Deadline" else (
+                            ORANGE if event["type"] == "Meeting" else NAVY_ACTIVE)
+                        tk.Label(cell, text=event["title"][:18], bg=color, fg=WHITE,
+                                 font=("Segoe UI", 8), padx=4, pady=2).pack(fill="x", anchor="w", pady=2)
 
 
 class ContractorApp(tk.Tk):
@@ -1143,31 +1520,109 @@ class ContractorApp(tk.Tk):
         self.project_lookup = {}
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         style = ttk.Style(self)
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
-        style.configure("Title.TLabel", font=("Segoe UI", 16, "bold"))
-        style.configure("TButton", padding=(8, 5))
-        header = ttk.Frame(self, padding=(12, 9))
-        header.pack(fill="x")
-        ttk.Label(header, text=APP_TITLE, font=("Segoe UI", 17, "bold")).pack(side="left")
-        ttk.Label(header, text="Current project:").pack(side="left", padx=(28, 5))
+        if "clam" in style.theme_names(): style.theme_use("clam")
+        self.configure(bg=SURFACE)
+        style.configure("TFrame", background=SURFACE)
+        style.configure("TLabel", background=SURFACE, foreground=INK, font=("Segoe UI", 10))
+        style.configure("Title.TLabel", background=SURFACE, foreground=INK, font=("Segoe UI", 20, "bold"))
+        style.configure("DialogTitle.TLabel", background=SURFACE, foreground=INK, font=("Segoe UI", 17, "bold"))
+        style.configure("Section.TLabel", background=SURFACE, foreground=INK, font=("Segoe UI", 13, "bold"))
+        style.configure("Muted.TLabel", background=SURFACE, foreground=MUTED, font=("Segoe UI", 9))
+        style.configure("TButton", padding=(10, 7), font=("Segoe UI", 9, "bold"))
+        style.configure("Primary.TButton", background=ORANGE, foreground=INK, borderwidth=0)
+        style.map("Primary.TButton", background=[("active", "#FBBF24")])
+        style.configure("Secondary.TButton", background=WHITE, foreground=INK, bordercolor="#CBD5E1")
+        style.configure("Success.TButton", background=GREEN, foreground=WHITE, borderwidth=0)
+        style.map("Success.TButton", background=[("active", "#059669")])
+        style.configure("Treeview", background=WHITE, fieldbackground=WHITE, foreground=INK,
+                        rowheight=36, borderwidth=0, font=("Segoe UI", 9))
+        style.configure("Treeview.Heading", background="#EEF1F5", foreground=INK,
+                        font=("Segoe UI", 9, "bold"), relief="flat")
+        style.map("Treeview", background=[("selected", NAVY_ACTIVE)], foreground=[("selected", WHITE)])
+        style.configure("TProgressbar", background=ORANGE, troughcolor="#E5E7EB")
+
+        shell = tk.Frame(self, bg=SURFACE); shell.pack(fill="both", expand=True)
+        sidebar = tk.Frame(shell, bg=NAVY, width=225); sidebar.pack(side="left", fill="y"); sidebar.pack_propagate(False)
+        brand = tk.Frame(sidebar, bg=NAVY, padx=20, pady=24); brand.pack(fill="x")
+        tk.Label(brand, text="ConTracktor", bg=NAVY, fg=WHITE,
+                 font=("Segoe UI", 20, "bold")).pack(anchor="w")
+        tk.Label(brand, text="PRO SUITE", bg=NAVY, fg=ORANGE,
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        nav = tk.Frame(sidebar, bg=NAVY, pady=18); nav.pack(fill="x")
+        self.nav_buttons = {}
+        nav_items = [("Dashboard", "▦"), ("Progress", "↗"), ("Expenses", "▣"),
+                     ("Contacts", "▤"), ("Payroll", "▥"), ("Remittances", "▧"),
+                     ("Calendar", "□")]
+        for name, icon in nav_items:
+            btn = tk.Button(nav, text=f"  {icon}   {name}", anchor="w", bg=NAVY, fg="#AAB4C5",
+                            activebackground=NAVY_ACTIVE, activeforeground=WHITE, bd=0,
+                            font=("Segoe UI", 10, "bold"), padx=14, pady=12,
+                            command=lambda n=name: self.show_page(n))
+            btn.pack(fill="x"); self.nav_buttons[name] = btn
+        tk.Label(sidebar, text="Local • SQLite", bg=NAVY, fg="#6F7B91",
+                 font=("Segoe UI", 9)).pack(side="bottom", anchor="w", padx=20, pady=18)
+
+        body = tk.Frame(shell, bg=SURFACE); body.pack(side="left", fill="both", expand=True)
+        header = tk.Frame(body, bg=WHITE, height=64, highlightthickness=1,
+                          highlightbackground="#E5E7EB", padx=18, pady=11)
+        header.pack(fill="x"); header.pack_propagate(False)
+        tk.Label(header, text="Current project", bg=WHITE, fg=MUTED,
+                 font=("Segoe UI", 9)).pack(side="left", padx=(0, 8))
         self.project_var = tk.StringVar()
         self.project_combo = ttk.Combobox(header, textvariable=self.project_var, state="readonly", width=33)
         self.project_combo.pack(side="left")
         self.project_combo.bind("<<ComboboxSelected>>", self.combo_selected)
-        ttk.Button(header, text="Export TXT", command=self.export_text).pack(side="right")
-        ttk.Button(header, text="Backup Database", command=self.backup).pack(side="right", padx=6)
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        ttk.Button(header, text="+ New Project", style="Primary.TButton",
+                   command=lambda: self.pages["Dashboard"].add()).pack(side="right")
+        tools = tk.Menubutton(header, text="Tools ▾", bg=WHITE, fg=INK, relief="solid", bd=1,
+                              font=("Segoe UI", 9, "bold"), padx=12, pady=6)
+        tools_menu = tk.Menu(tools, tearoff=False)
+        tools_menu.add_command(label="Export project to TXT", command=self.export_text)
+        tools_menu.add_command(label="Backup SQLite database", command=self.backup)
+        tools_menu.add_separator()
+        tools_menu.add_command(label="Manage project heads", command=self.manage_current_heads)
+        tools.configure(menu=tools_menu); tools.pack(side="right", padx=8)
+
+        self.notebook = tk.Frame(body, bg=SURFACE)
+        self.notebook.pack(fill="both", expand=True, padx=18, pady=16)
         self.tabs = [
-            ("Projects", ProjectsTab(self)), ("Progress", ProgressTab(self)),
+            ("Dashboard", ProjectsTab(self)), ("Progress", ProgressTab(self)),
             ("Expenses", ExpensesTab(self)), ("Contacts", ContactsTab(self)),
-            ("Attendance / Payroll", PayrollTab(self)), ("Remittances", RemittancesTab(self)),
+            ("Payroll", PayrollTab(self)), ("Remittances", RemittancesTab(self)),
             ("Calendar", CalendarTab(self)),
         ]
+        self.pages = dict(self.tabs)
         for label, tab in self.tabs:
-            self.notebook.add(tab, text=label)
+            tab.place(x=0, y=0, relwidth=1, relheight=1)
+        self.show_page("Dashboard")
         self.load_projects()
+
+    def show_page(self, name):
+        page = getattr(self, "pages", {}).get(name)
+        if page: page.tkraise(); page.refresh()
+        for label, button in getattr(self, "nav_buttons", {}).items():
+            active = label == name
+            button.configure(bg=NAVY_ACTIVE if active else NAVY,
+                             fg=WHITE if active else "#AAB4C5")
+
+    def authorize(self, action: str, details: str):
+        if not self.project_id:
+            messagebox.showinfo(APP_TITLE, "Create or select a project first."); return None
+        heads = self.db.all(
+            "SELECT * FROM project_heads WHERE project_id=? AND active=1 ORDER BY name", (self.project_id,))
+        if not heads:
+            if messagebox.askyesno(APP_TITLE, "This project has no project head yet. Add one now?"):
+                self.manage_current_heads()
+                heads = self.db.all(
+                    "SELECT * FROM project_heads WHERE project_id=? AND active=1 ORDER BY name", (self.project_id,))
+        if not heads: return None
+        win = HeadAuthorizationDialog(self, heads, action, details); self.wait_window(win)
+        return win.result
+
+    def manage_current_heads(self):
+        if not self.project_id:
+            messagebox.showinfo(APP_TITLE, "Create or select a project first."); return
+        win = ManageHeadsDialog(self, self.db, self.project_id); self.wait_window(win)
 
     def load_projects(self, select_id=None):
         rows = self.db.all("SELECT id,name FROM projects ORDER BY name")
@@ -1196,7 +1651,7 @@ class ContractorApp(tk.Tk):
             tab.refresh()
 
     def backup(self):
-        if not DB_PATH.exists():
+        if not self.db.path.exists():
             messagebox.showinfo(APP_TITLE, "There is no database to back up yet.")
             return
         default = f"contractor_tracker_backup_{datetime.now():%Y%m%d_%H%M%S}.db"
@@ -1232,14 +1687,18 @@ class ContractorApp(tk.Tk):
             f"Notes: {project['notes']}", "",
         ]
         sections = [
+            ("PROJECT HEADS",
+             "SELECT name,position,active,created_at FROM project_heads WHERE project_id=? ORDER BY name"),
             ("PHASES & TASKS",
              """SELECT p.name phase,t.milestone,t.name,t.deadline,t.completed FROM phases p
                 LEFT JOIN tasks t ON t.phase_id=p.id WHERE p.project_id=?
                 ORDER BY p.sort_order,t.deadline,t.id"""),
             ("EXPENSES",
              """SELECT e.name,e.item,e.supplier,e.trade,e.expense_date,e.total_cents,e.voided,
+                COALESCE(h.name,'Legacy / not recorded') authorized_by,
                 COALESCE(SUM(pay.amount_cents),0) paid_cents FROM expenses e
-                LEFT JOIN payments pay ON pay.expense_id=e.id WHERE e.project_id=?
+                LEFT JOIN payments pay ON pay.expense_id=e.id
+                LEFT JOIN project_heads h ON h.id=e.authorized_by_head_id WHERE e.project_id=?
                 GROUP BY e.id ORDER BY e.expense_date,e.id"""),
             ("CONTACTS", "SELECT name,role,company,phone,email,address FROM contacts WHERE project_id=? ORDER BY name"),
             ("EMPLOYEES",
@@ -1250,8 +1709,10 @@ class ContractorApp(tk.Tk):
                 FROM attendance a JOIN employees e ON e.id=a.employee_id
                 WHERE e.project_id=? ORDER BY a.clock_in"""),
             ("REMITTANCES",
-             """SELECT txn_date,type,amount_cents,purpose,care_of,signature,voided
-                FROM remittances WHERE project_id=? ORDER BY txn_date"""),
+             """SELECT r.txn_date,r.type,r.amount_cents,r.purpose,r.care_of,r.signature,
+                COALESCE(h.name,'Legacy / not recorded') authorized_by,r.voided
+                FROM remittances r LEFT JOIN project_heads h ON h.id=r.authorized_by_head_id
+                WHERE r.project_id=? ORDER BY r.txn_date"""),
             ("CALENDAR",
              "SELECT event_date,event_time,type,title,completed,notes FROM calendar_events WHERE project_id=? ORDER BY event_date,event_time"),
             ("AUDIT LOG",
