@@ -1,57 +1,59 @@
-# Contractor Project Tracker
+# ConTracktor v0
 
-A local desktop prototype built entirely with Python's standard library:
+ConTracktor is a local contractor project-management prototype built with Python, Tkinter, and SQLite. It follows the supplied dark-sidebar dashboard design and requires no server, browser, cloud account, or third-party Python package.
 
-- Tkinter desktop interface
-- SQLite local database
-- No cloud account, browser, server, or third-party package
-- Human-readable text export that opens in Windows Notepad
+## Requirements
 
-## Run in an IDE
+- Windows, macOS, or Linux
+- Python 3.11 or newer with Tkinter
 
-1. Open this folder in PyCharm, VS Code, IDLE, or another Python IDE.
-2. Select `app.py`.
-3. Run the file with Python 3.11 or newer.
+## Run it
 
-You can also open a terminal in this folder and run:
+In an IDE, open this folder and run `app.py`.
+
+From PowerShell or a terminal:
 
 ```powershell
 python app.py
 ```
 
-The application creates `contractor_tracker.db` beside `app.py` the first time
-it starts. All project information is stored in that file.
+On Windows, you can also double-click `run_app.bat`.
 
-## First test
+The app creates `contractor_tracker.db` beside `app.py` on first launch. That single SQLite file contains the local project data.
 
-1. Create a project on the **Projects** tab.
-2. Select it in the **Current project** list at the top.
-3. Add tasks under the default phases and mark some complete.
-4. Add an expense, then record a full or partial payment.
-5. Add an employee and use their employee number and PIN to time in and out.
-6. Commit closed attendance to Expenses. It will appear as an unpaid payroll
-   expense and cannot be committed twice.
-7. Add deposits and withdrawals under Remittances.
-8. Select **Export TXT** to save a complete report and open it in Notepad.
+## Recommended first walkthrough
 
-## Financial behavior
+1. Choose **New Project** on the Dashboard.
+2. Enter the project details and add one or more project heads. Each head creates a private PIN.
+3. Add milestones and tasks under the default, removable construction phases.
+4. Add an expense. Review the confirmation and have a project head authorize it with their PIN.
+5. Add employees, then use the attendance kiosk to time in and out. Choose **Expand Kiosk** for a dedicated full-screen employee station; press Escape to leave it.
+6. Commit completed attendance to the expense ledger. A project-head PIN is required and the payroll batch appears as an unpaid expense.
+7. Record client deposits and construction withdrawals. These also require project-head authorization.
+8. Add contacts and calendar reminders, meetings, schedules, or deadlines.
+9. Open **Tools** to export a project report to a UTF-8 text file or create a safe SQLite backup.
 
-- Expense totals are calculated from quantity × unit price.
-- Payments are separate records, supporting unpaid, partially paid and paid
-  expenses.
-- Financial records are voided/restored instead of silently hard-deleted.
-- Payroll is committed once as an unpaid expense.
-- Important changes are retained in the exported audit log.
-- Currency values are stored as integer cents to avoid floating-point errors.
+## Included modules
 
-## Local safety
+- Dashboard with financial, progress, and upcoming-event summaries
+- Construction phases, milestones, deadlines, completion tracking, and automatic progress
+- Detailed expense ledger, payments, status, filtering, void/restore, and authorizer history
+- Contacts directory
+- Employee roster, PIN attendance, hourly/daily pay calculation, and payroll-to-expense commit
+- Client deposit and contractor withdrawal ledger with funding progress
+- Month calendar and upcoming-event list
+- Multiple project heads with salted, one-way hashed PINs
+- Text export, audit log, and SQLite backup
 
-Use **Backup Database** regularly. Save backups somewhere different from the
-working folder, such as an external drive. The backup tool uses SQLite's own
-safe backup operation.
+## Financial and security behavior
 
-This is an evaluation prototype, not certified accounting or statutory payroll
-software. Define overtime, break, tax, deduction, and payroll rounding rules
-before using it for real wages. Daily-rate pay is currently prorated using:
+- Currency is stored as integer cents to avoid floating-point rounding errors.
+- Payments are separate records, allowing unpaid, partial, and paid expense states.
+- Expenses and remittances are voided/restored instead of silently deleted.
+- Payroll attendance can be committed only once.
+- Project-head and employee PINs are salted and hashed; the original PIN is not stored.
+- Expense creation, remittance creation, and payroll commit require a project-head PIN and record the authorizer.
 
-`hours worked ÷ standard hours × daily rate`
+This remains a local prototype. Anyone who can copy the database file can access its business data, although they cannot read the original PINs from it. Protect the Windows account, enable full-disk encryption such as BitLocker where available, and save regular backups to a separate drive. A server is unnecessary for one trusted computer, but authentication, encrypted transport, access roles, and managed backups should be designed before multi-computer or internet use.
+
+This is not certified accounting or statutory payroll software. Confirm overtime, break, tax, deduction, and rounding rules before using it for real wages. Daily-rate pay is prorated as `hours worked / standard hours * daily rate`.
