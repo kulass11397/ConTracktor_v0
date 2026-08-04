@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app import Database, cents, hash_pin, money, verify_pin
+from app import Database, cents, hash_pin, money, resolve_db_path, verify_pin
 
 
 class ContractorTrackerTests(unittest.TestCase):
@@ -48,6 +48,14 @@ class ContractorTrackerTests(unittest.TestCase):
             self.assertIn("authorized_by_head_id", expense_columns)
             self.assertIn("authorized_by_head_id", remittance_columns)
             db.close()
+
+    def test_resolve_db_path_reuses_existing_project_database(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            existing = base / "contractor_tracker.db"
+            existing.write_text("placeholder", encoding="utf-8")
+            resolved = resolve_db_path(base / "new_app_dir")
+            self.assertEqual(resolved, existing)
 
 
 if __name__ == "__main__":
