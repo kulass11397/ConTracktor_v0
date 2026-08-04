@@ -23,7 +23,51 @@ from tkinter import filedialog, messagebox, ttk
 
 APP_TITLE = "Contractor Project Tracker"
 APP_DIR = Path(__file__).resolve().parent
-DB_PATH = APP_DIR / "contractor_tracker.db"
+
+
+def resolve_db_path(candidate: Path | str | None = None) -> Path:
+    names = ("contractor_tracker.db", "contractor_tracker.sqlite3", "app.db", "tracker.db")
+
+    if candidate is not None:
+        candidate = Path(candidate).expanduser()
+        if candidate.suffix.lower() in {".db", ".sqlite", ".sqlite3"}:
+            return candidate
+
+        candidates = [candidate]
+        if candidate.exists() and candidate.is_dir():
+            candidates = [candidate] + list(candidate.parents)
+        elif not candidate.name:
+            candidates = [candidate]
+        else:
+            candidates = [candidate, candidate.parent] + list(candidate.parents)
+
+        for root in candidates:
+            for name in names:
+                db_path = root / name if root != root.parent and root.exists() else root / name
+                if db_path.exists():
+                    return db_path
+
+        if candidate.exists() and candidate.is_dir():
+            return candidate / "contractor_tracker.db"
+        if candidate.suffix == "":
+            return candidate / "contractor_tracker.db"
+        return candidate
+
+    env_path = os.environ.get("CONTRACTOR_DB_PATH")
+    if env_path:
+        return Path(env_path).expanduser()
+
+    roots = [APP_DIR, APP_DIR.parent, APP_DIR.parent.parent]
+    for root in roots:
+        for name in names:
+            db_path = root / name
+            if db_path.exists():
+                return db_path
+
+    return APP_DIR / "contractor_tracker.db"
+
+
+DB_PATH = resolve_db_path()
 DEFAULT_PHASES = [
     "Pre-Construction", "Site Preparation", "Foundation", "Structural",
     "Roofing", "Electrical", "Plumbing", "Finishes", "Inspection & Handover",
@@ -87,9 +131,9 @@ def verify_pin(pin: str, salt_hex: str, digest_hex: str) -> bool:
 
 
 class Database:
-    def __init__(self, path: Path = DB_PATH):
-        self.path = path
-        self.conn = sqlite3.connect(path)
+    def __init__(self, path: Path | str | None = DB_PATH):
+        self.path = resolve_db_path(path)
+        self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
@@ -316,6 +360,78 @@ class HeadEditorDialog(tk.Toplevel):
         self.destroy()
 
 
+class DatePickerPopup(tk.Toplevel):
+    def __init__(self, parent, target_var):
+        super().__init__(parent)
+        self.target_var = target_var
+        self.title("Pick a date")
+        self.resizable(False, False)
+        self.current_year = date.today().year
+        self.current_month = date.today().month
+        initial = target_var.get().strip()
+        if initial:
+            try:
+                parsed = date.fromisoformat(initial)
+                self.current_year = parsed.year
+                self.current_month = parsed.month
+            except ValueError:
+                pass
+        self.header = ttk.Frame(self, padding=(10, 10, 10, 6)); self.header.pack(fill="x")
+        self.prev_month = ttk.Button(self.header, text="<", command=self.shift_month, width=3)
+        self.prev_month.pack(side="left")
+        self.month_label = ttk.Label(self.header, text="", font=("Segoe UI", 10, "bold"))
+        self.month_label.pack(side="left", expand=True)
+        self.next_month = ttk.Button(self.header, text=">", command=self.shift_month, width=3)
+        self.next_month.pack(side="right")
+        self.days_frame = ttk.Frame(self, padding=(10, 0, 10, 10)); self.days_frame.pack()
+        for col, name in enumerate(("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")):
+            ttk.Label(self.days_frame, text=name, width=3).grid(row=0, column=col, padx=2, pady=2)
+        self.day_buttons = []
+        self.render_calendar()
+        self.transient(parent); self.grab_set(); self.bind("<Escape>", lambda _e: self.destroy())
+
+    def shift_month(self):
+        if self.focus_get() is self.next_month:
+            self.current_month += 1
+        else:
+            self.current_month -= 1
+        if self.current_month > 12:
+            self.current_month = 1; self.current_year += 1
+        if self.current_month < 1:
+            self.current_month = 12; self.current_year -= 1
+        self.render_calendar()
+
+    def render_calendar(self):
+        self.month_label.config(text=f"{calendar.month_name[self.current_month]} {self.current_year}")
+        for child in self.days_frame.winfo_children():
+            if child is not self.month_label:
+                child.destroy()
+        self.day_buttons = []
+        for row in range(1, 7):
+            for col in range(7):
+                btn = tk.Button(self.days_frame, text="", width=3, height=1, bg="#F3F4F6", fg="#111827",
+                                bd=1, relief="solid", command=lambda: None)
+                btn.grid(row=row, column=col, padx=2, pady=2)
+                self.day_buttons.append(btn)
+        month_days = calendar.monthcalendar(self.current_year, self.current_month)
+        idx = 0
+        for week in month_days:
+            for col, day in enumerate(week):
+                button = self.day_buttons[idx]
+                if day == 0:
+                    button.config(text="", state="disabled", bg="#F9FAFB", command=lambda: None)
+                else:
+                    date_value = date(self.current_year, self.current_month, day)
+                    button.config(text=str(day), state="normal", bg="#FFFFFF",
+                                  command=lambda value=date_value.isoformat(): self.select(value))
+                idx += 1
+        self.days_frame.update_idletasks()
+
+    def select(self, value: str):
+        self.target_var.set(value)
+        self.destroy()
+
+
 class ProjectDialog(tk.Toplevel):
     def __init__(self, parent):
         super().__init__(parent)
@@ -339,20 +455,24 @@ class ProjectDialog(tk.Toplevel):
             row, col = divmod(index, 2)
             cell = ttk.Frame(fields); cell.grid(row=row, column=col, sticky="ew", padx=(0 if col == 0 else 8, 8 if col == 0 else 0), pady=5)
             ttk.Label(cell, text=label).pack(anchor="w")
-            ttk.Entry(cell, textvariable=self.vars[key]).pack(fill="x", pady=(3, 0))
+            entry_frame = ttk.Frame(cell); entry_frame.pack(fill="x", pady=(3, 0))
+            ttk.Entry(entry_frame, textvariable=self.vars[key]).pack(side="left", fill="x", expand=True)
+            if key in {"start_date", "target_date"}:
+                ttk.Button(entry_frame, text="📅", width=3, command=lambda current=self.vars[key]: self.open_date_picker(current)).pack(side="right", padx=(6, 0))
         fields.columnconfigure(0, weight=1); fields.columnconfigure(1, weight=1)
         headbar = ttk.Frame(body); headbar.pack(fill="x", pady=(18, 6))
         ttk.Label(headbar, text="Project heads", style="Section.TLabel").pack(side="left")
-        ttk.Button(headbar, text="+ Add Head", style="Primary.TButton", command=self.add_head).pack(side="right")
         ttk.Button(headbar, text="Remove", style="Secondary.TButton", command=self.remove_head).pack(side="right", padx=6)
+        ttk.Button(headbar, text="+ Add Head", style="Primary.TButton", command=self.add_head).pack(side="right")
+        ttk.Button(headbar, text="Create This Project", style="Primary.TButton", command=self.save, width=18).pack(side="right", padx=(6, 0))
         self.tree = ttk.Treeview(body, columns=("name", "position"), show="headings", height=7)
         self.tree.heading("name", text="NAME"); self.tree.heading("position", text="POSITION")
         self.tree.column("name", width=280); self.tree.column("position", width=260)
         self.tree.pack(fill="both", expand=True)
-        footer = ttk.Frame(body); footer.pack(fill="x", pady=(16, 0))
-        ttk.Button(footer, text="Cancel", style="Secondary.TButton", command=self.destroy).pack(side="right", padx=(8, 0))
-        ttk.Button(footer, text="Create Project", style="Primary.TButton", command=self.save).pack(side="right")
         self.transient(parent); self.grab_set(); self.bind("<Escape>", lambda _e: self.destroy())
+
+    def open_date_picker(self, target_var):
+        DatePickerPopup(self, target_var)
 
     def add_head(self):
         win = HeadEditorDialog(self); self.wait_window(win)
@@ -514,9 +634,9 @@ class ProjectsTab(BaseTab):
         title = ttk.Frame(header); title.pack(side="left")
         ttk.Label(title, text="Dashboard Overview", style="Title.TLabel").pack(anchor="w")
         ttk.Label(title, text="Real-time project metrics and upcoming activity.", style="Muted.TLabel").pack(anchor="w")
-        ttk.Button(header, text="+ New Project", style="Primary.TButton", command=self.add).pack(side="right")
-        ttk.Button(header, text="Project Heads", style="Secondary.TButton", command=self.manage_heads).pack(side="right", padx=7)
-        ttk.Button(header, text="Edit Project", style="Secondary.TButton", command=self.edit).pack(side="right")
+        actions = ttk.Frame(header); actions.pack(side="right")
+        ttk.Button(actions, text="Project Heads", style="Secondary.TButton", command=self.manage_heads).pack(side="right", padx=7)
+        ttk.Button(actions, text="Edit Project", style="Secondary.TButton", command=self.edit).pack(side="right")
         cards = ttk.Frame(self); cards.pack(fill="x", pady=(18, 14))
         self.contract_card, self.contract_value = metric_card(cards, "Total Contract Value", INK)
         self.paid_card, self.paid_value = metric_card(cards, "Paid Expenses", GREEN)
