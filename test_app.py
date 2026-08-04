@@ -26,6 +26,29 @@ class ContractorTrackerTests(unittest.TestCase):
             self.assertEqual(count, 9)
             db.close()
 
+    def test_project_heads_are_hashed_and_linked(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "test.db")
+            project_id = db.create_project({
+                "name": "Head Test", "client": "Client", "contract_value": "50000",
+                "start_date": "2026-08-01", "target_date": "2026-10-01", "notes": "",
+                "heads": [{"name": "Alex Cruz", "position": "Project Manager", "pin": "4826"}],
+            })
+            head = db.one("SELECT * FROM project_heads WHERE project_id=?", (project_id,))
+            self.assertEqual(head["name"], "Alex Cruz")
+            self.assertNotEqual(head["pin_hash"], "4826")
+            self.assertTrue(verify_pin("4826", head["pin_salt"], head["pin_hash"]))
+            db.close()
+
+    def test_authorization_columns_exist_for_upgraded_databases(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "test.db")
+            expense_columns = {row["name"] for row in db.all("PRAGMA table_info(expenses)")}
+            remittance_columns = {row["name"] for row in db.all("PRAGMA table_info(remittances)")}
+            self.assertIn("authorized_by_head_id", expense_columns)
+            self.assertIn("authorized_by_head_id", remittance_columns)
+            db.close()
+
 
 if __name__ == "__main__":
     unittest.main()
