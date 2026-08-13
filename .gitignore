@@ -5,7 +5,15 @@ venv/
 contractor_tracker.db
 contractor_tracker.db-shm
 contractor_tracker.db-wal
+*.db
+*.db-shm
+*.db-wal
 *.db-journal
 *.log
 .idea/
 .vscode/
+tmp/
+output/
+Updates/
+pre_*_backup_*/
+app_before_*.py
