@@ -507,10 +507,11 @@ def employee_age(birthday: str, on_date: date | None = None) -> str:
 
 
 def payroll_week_bounds(value: str | date) -> tuple[str, str]:
-    """Return the Monday-Sunday payroll week containing *value*."""
+    """Return the Saturday-Friday payroll week containing *value*."""
     selected = date.fromisoformat(value) if isinstance(value, str) else value
-    monday = selected - timedelta(days=selected.weekday())
-    return monday.isoformat(), (monday + timedelta(days=6)).isoformat()
+    # Python weekday(): Monday=0 ... Saturday=5, Sunday=6.
+    saturday = selected - timedelta(days=(selected.weekday() - 5) % 7)
+    return saturday.isoformat(), (saturday + timedelta(days=6)).isoformat()
 
 
 def employee_photo_image(blob: bytes | None, max_size: int = 170):
@@ -651,6 +652,7 @@ class Database:
     def __init__(self, path: Path | str | None = DB_PATH):
         self.path = resolve_db_path(path)
         self.migration_backup = self._backup_before_shared_cash_migration()
+        self.v120_migration_backup = self._backup_before_v120_migration()
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
@@ -679,6 +681,32 @@ class Database:
             # convenience copy must not make an otherwise healthy database unusable.
             return None
 
+    def _backup_before_v120_migration(self):
+        """Create a recoverable database copy before the v1.2 schema/data repair."""
+        path = Path(self.path)
+        if not path.exists() or path.stat().st_size == 0:
+            return None
+        try:
+            probe = sqlite3.connect(path)
+            has_meta = probe.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_metadata'"
+            ).fetchone()
+            version = None
+            if has_meta:
+                row = probe.execute(
+                    "SELECT value FROM app_metadata WHERE key='schema_version'"
+                ).fetchone()
+                version = row[0] if row else None
+            probe.close()
+            if version == "1.2.0":
+                return None
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup = path.with_name(f"{path.stem}_before_v1_2_0_{stamp}{path.suffix}")
+            shutil.copy2(path, backup)
+            return backup
+        except (OSError, sqlite3.Error):
+            return None
+
     def _create_schema(self):
         self.conn.executescript("""
         CREATE TABLE IF NOT EXISTS projects (
@@ -698,6 +726,10 @@ class Database:
             name TEXT NOT NULL, position TEXT NOT NULL DEFAULT '',
             pin_salt TEXT NOT NULL, pin_hash TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS app_metadata (
+            key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS head_registry (
             id INTEGER PRIMARY KEY, name TEXT NOT NULL, position TEXT NOT NULL DEFAULT '',
@@ -877,6 +909,21 @@ class Database:
             approved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY(batch_id, head_id)
         );
+        CREATE TABLE IF NOT EXISTS cash_advance_batches (
+            id INTEGER PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            batch_ref TEXT NOT NULL UNIQUE,
+            advance_date TEXT NOT NULL,
+            funding_method TEXT NOT NULL,
+            bank_account_id INTEGER REFERENCES bank_accounts(id),
+            cash_allocation_id INTEGER REFERENCES cash_allocations(id),
+            total_cents INTEGER NOT NULL CHECK(total_cents > 0),
+            entry_count INTEGER NOT NULL DEFAULT 0,
+            authorized_by_head_id INTEGER REFERENCES project_heads(id),
+            recorded_at_local TEXT NOT NULL,
+            notes TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
         CREATE TABLE IF NOT EXISTS cash_advances (
             id INTEGER PRIMARY KEY,
             project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -1014,6 +1061,24 @@ class Database:
         self._ensure_column("cash_advances", "cash_allocation_id", "INTEGER")
         self._ensure_column("cash_advances", "repayment_plan", "TEXT NOT NULL DEFAULT 'Manual / Mixed'")
         self._ensure_column("cash_advances", "weekly_deduction_cap_cents", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("cash_advances", "batch_id", "INTEGER")
+        self._ensure_column("cash_advances", "system_reference", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("cash_advances", "recorded_at_local", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("cash_advance_transactions", "recorded_at_local", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("payroll_batches", "week_schedule", "TEXT NOT NULL DEFAULT 'Legacy / Stored Period'")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cash_advance_batch ON cash_advances(batch_id)"
+        )
+        self.conn.execute(
+            """UPDATE cash_advances SET system_reference=COALESCE((
+                   SELECT reference FROM cash_advance_transactions t
+                   WHERE t.advance_id=cash_advances.id AND t.txn_type='Advance'
+                   ORDER BY t.id LIMIT 1),'') WHERE system_reference=''"""
+        )
+        self.conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_cash_advance_system_reference
+               ON cash_advances(system_reference) WHERE system_reference<>''"""
+        )
         # A salary deduction settles an employee receivable; it is not another
         # cash/bank payment against the net payroll expense.
         self.conn.execute(
@@ -1104,6 +1169,12 @@ class Database:
         )
         self._backfill_shared_cash_references()
         self._migrate_cash_repayment_surrenders()
+        self._migrate_v120_payroll_deductions()
+        self.conn.execute(
+            """INSERT INTO app_metadata(key,value,updated_at) VALUES('schema_version','1.2.0',?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at""",
+            (local_timestamp(),),
+        )
         self.conn.commit()
 
     def _backfill_shared_cash_references(self):
@@ -1195,8 +1266,181 @@ class Database:
                  row["cash_allocation_id"], row["amount_cents"], row["txn_date"],
                  stamp, row["authorized_by_head_id"],
                  f"Cash repayment from {row['employee']}; migrated to surrendered custody. "
-                 f"{row['notes'] or ''}".strip()),
+                  f"{row['notes'] or ''}".strip()),
             )
+
+    def _migrate_v120_payroll_deductions(self):
+        """Repair salary deductions posted into a payroll ending before the advance.
+
+        v1.1 selected every unposted salary-deduction schedule for an employee,
+        regardless of the advance's effective date.  When an older payroll was
+        committed late, newer advances could therefore be consumed by that older
+        payroll.  This migration returns only those invalid postings to pending,
+        reapplies them FIFO to the earliest eligible existing payroll, and then
+        reconciles the affected payroll expenses.  All other history is untouched.
+        """
+        already = self.conn.execute(
+            "SELECT value FROM app_metadata WHERE key='payroll_date_repair_v120'"
+        ).fetchone()
+        if already:
+            return
+        invalid = self.conn.execute(
+            """SELECT t.*,ca.employee_id,ca.project_id,ca.advance_date,
+                      ca.weekly_deduction_cap_cents,pb.period_end invalid_period_end
+               FROM cash_advance_transactions t
+               JOIN cash_advances ca ON ca.id=t.advance_id
+               JOIN payroll_batches pb ON pb.id=t.payroll_batch_id
+               WHERE t.txn_type='Salary Deduction' AND t.posted=1
+                 AND t.voided=0 AND ca.voided=0
+                 AND ca.advance_date>pb.period_end
+               ORDER BY ca.advance_date,ca.id,t.id"""
+        ).fetchall()
+        if not invalid:
+            self.conn.execute(
+                "INSERT INTO app_metadata(key,value,updated_at) VALUES('payroll_date_repair_v120','0',?)",
+                (local_timestamp(),),
+            )
+            return
+
+        affected_batches = {row["payroll_batch_id"] for row in invalid}
+        employee_ids = sorted({row["employee_id"] for row in invalid})
+        repaired_amount = sum(row["amount_cents"] for row in invalid)
+        stamp = local_timestamp()
+
+        for row in invalid:
+            note = (row["notes"] or "").strip()
+            note = (note + "; " if note else "") + (
+                f"v1.2 repair: removed from payroll ending {row['invalid_period_end']} "
+                f"because advance date is {row['advance_date']}"
+            )
+            self.conn.execute(
+                """UPDATE cash_advance_transactions
+                   SET posted=0,payroll_batch_id=NULL,txn_date=?,notes=?,recorded_at_local=?
+                   WHERE id=?""",
+                (row["advance_date"], note, stamp, row["id"]),
+            )
+
+        for employee_id in employee_ids:
+            pending_ids = [
+                row["id"] for row in invalid if row["employee_id"] == employee_id
+            ]
+            for transaction_id in pending_ids:
+                while True:
+                    pending = self.conn.execute(
+                        """SELECT t.*,ca.advance_date,ca.weekly_deduction_cap_cents
+                           FROM cash_advance_transactions t
+                           JOIN cash_advances ca ON ca.id=t.advance_id
+                           WHERE t.id=? AND t.posted=0 AND t.voided=0""",
+                        (transaction_id,),
+                    ).fetchone()
+                    if not pending:
+                        break
+                    candidates = self.conn.execute(
+                        """SELECT pb.*,
+                                  COALESCE((SELECT SUM(a.gross_cents) FROM attendance a
+                                    WHERE a.payroll_batch_id=pb.id AND a.employee_id=?),0) employee_gross
+                           FROM payroll_batches pb
+                           WHERE pb.project_id=(SELECT project_id FROM employees WHERE id=?)
+                             AND pb.period_end>=?
+                           ORDER BY pb.period_end,pb.id""",
+                        (employee_id, employee_id, pending["advance_date"]),
+                    ).fetchall()
+                    applied_any = False
+                    for batch in candidates:
+                        posted_for_employee = self.conn.execute(
+                            """SELECT COALESCE(SUM(t.amount_cents),0) total
+                               FROM cash_advance_transactions t
+                               JOIN cash_advances ca ON ca.id=t.advance_id
+                               WHERE t.payroll_batch_id=? AND ca.employee_id=?
+                                 AND t.txn_type='Salary Deduction' AND t.posted=1
+                                 AND t.voided=0 AND ca.voided=0""",
+                            (batch["id"], employee_id),
+                        ).fetchone()["total"]
+                        capacity = max(0, batch["employee_gross"] - posted_for_employee)
+                        if capacity <= 0:
+                            continue
+                        cap = max(0, pending["weekly_deduction_cap_cents"] or 0)
+                        posted_for_advance = self.conn.execute(
+                            """SELECT COALESCE(SUM(amount_cents),0) total
+                               FROM cash_advance_transactions
+                               WHERE payroll_batch_id=? AND advance_id=?
+                                 AND txn_type='Salary Deduction' AND posted=1 AND voided=0""",
+                            (batch["id"], pending["advance_id"]),
+                        ).fetchone()["total"]
+                        cap_left = max(0, cap - posted_for_advance) if cap else capacity
+                        applied = min(pending["amount_cents"], capacity, cap_left)
+                        if applied <= 0:
+                            continue
+                        post_date = (batch["created_at"] or batch["period_end"])[:10]
+                        affected_batches.add(batch["id"])
+                        if applied == pending["amount_cents"]:
+                            self.conn.execute(
+                                """UPDATE cash_advance_transactions
+                                   SET posted=1,payroll_batch_id=?,txn_date=?,recorded_at_local=?
+                                   WHERE id=?""",
+                                (batch["id"], post_date, stamp, pending["id"]),
+                            )
+                        else:
+                            self.conn.execute(
+                                "UPDATE cash_advance_transactions SET amount_cents=? WHERE id=?",
+                                (pending["amount_cents"] - applied, pending["id"]),
+                            )
+                            self.conn.execute(
+                                """INSERT INTO cash_advance_transactions(
+                                   advance_id,txn_type,amount_cents,txn_date,method,
+                                   payroll_batch_id,reference,notes,authorized_by_head_id,
+                                   posted,recorded_at_local)
+                                   VALUES(?,'Salary Deduction',?,?,'Salary Deduction',?,?,?,?,1,?)""",
+                                (pending["advance_id"], applied, post_date, batch["id"],
+                                 pending["reference"], pending["notes"],
+                                 pending["authorized_by_head_id"], stamp),
+                            )
+                        applied_any = True
+                        break
+                    if not applied_any:
+                        break
+
+        for batch_id in sorted(affected_batches):
+            batch = self.conn.execute(
+                "SELECT * FROM payroll_batches WHERE id=?", (batch_id,)
+            ).fetchone()
+            if not batch:
+                continue
+            deductions = self.conn.execute(
+                """SELECT COALESCE(SUM(amount_cents),0) total
+                   FROM cash_advance_transactions
+                   WHERE payroll_batch_id=? AND txn_type='Salary Deduction'
+                     AND posted=1 AND voided=0""",
+                (batch_id,),
+            ).fetchone()["total"]
+            net = max(0, batch["gross_cents"] - deductions)
+            self.conn.execute(
+                "UPDATE payroll_batches SET deduction_cents=?,net_cents=? WHERE id=?",
+                (deductions, net, batch_id),
+            )
+            if batch["expense_id"]:
+                paid = self.conn.execute(
+                    """SELECT COALESCE(SUM(amount_cents),0) total FROM payments
+                       WHERE expense_id=? AND accounting_excluded=0""",
+                    (batch["expense_id"],),
+                ).fetchone()["total"]
+                status = "Paid" if net <= 0 or paid >= net else "Partially Paid" if paid else "Unpaid"
+                self.conn.execute(
+                    """UPDATE expenses SET total_cents=?,unit_price_cents=?,status=?
+                       WHERE id=?""",
+                    (net, net, status, batch["expense_id"]),
+                )
+            self.conn.execute(
+                """INSERT INTO audit_log(project_id,action,details,created_at)
+                   VALUES(?,'PAYROLL_DEDUCTION_DATE_REPAIRED',?,?)""",
+                (batch["project_id"],
+                 f"{batch['batch_ref']} reconciled to {money(deductions)} deductions and {money(net)} net pay",
+                 stamp),
+            )
+        self.conn.execute(
+            "INSERT INTO app_metadata(key,value,updated_at) VALUES('payroll_date_repair_v120',?,?)",
+            (f"{len(invalid)} postings / {repaired_amount} cents", stamp),
+        )
 
     def _migrate_project_head_registry(self):
         """Import legacy project-bound heads once and set their requested default PIN."""
@@ -1269,6 +1513,45 @@ class Database:
             """INSERT INTO head_registry(name,position,pin_salt,pin_hash)
                VALUES(?,?,?,?)""", (name, position, salt, digest)
         ).lastrowid
+
+    def update_registered_head(self, registry_id: int, name: str, position: str,
+                               current_pin: str, new_pin: str = ""):
+        """Edit a registry identity and propagate it to every linked project."""
+        head = self.one("SELECT * FROM head_registry WHERE id=? AND active=1", (registry_id,))
+        if not head:
+            raise ValueError("The selected project head is no longer active.")
+        if not verify_pin(current_pin, head["pin_salt"], head["pin_hash"]):
+            raise ValueError("The current project-head PIN is incorrect.")
+        name, position = name.strip(), position.strip()
+        if not name or not position:
+            raise ValueError("Name and position are required.")
+        salt, digest = head["pin_salt"], head["pin_hash"]
+        if new_pin:
+            salt, digest = hash_pin(new_pin)
+        assigned_projects = self.all(
+            "SELECT DISTINCT project_id FROM project_heads WHERE registry_head_id=?",
+            (registry_id,),
+        )
+        with self.conn:
+            self.conn.execute(
+                """UPDATE head_registry SET name=?,position=?,pin_salt=?,pin_hash=?
+                   WHERE id=?""",
+                (name, position, salt, digest, registry_id),
+            )
+            self.conn.execute(
+                """UPDATE project_heads SET name=?,position=?,pin_salt=?,pin_hash=?
+                   WHERE registry_head_id=?""",
+                (name, position, salt, digest, registry_id),
+            )
+            for project in assigned_projects:
+                self.conn.execute(
+                    """INSERT INTO audit_log(project_id,action,details,created_at)
+                       VALUES(?,'PROJECT_HEAD_UPDATED',?,?)""",
+                    (project["project_id"],
+                     f"Registry head #{registry_id} updated to {name} / {position}; "
+                     f"PIN {'changed' if new_pin else 'retained'}",
+                     local_timestamp()),
+                )
 
     def _assign_registered_heads(self, project_id: int, registry_ids):
         for registry_id in dict.fromkeys(int(value) for value in registry_ids):
@@ -1965,8 +2248,9 @@ class Database:
             options[label] = row["id"]
         return options
 
-    def salary_deduction_plan(self, employee_id: int, available_gross_cents: int):
-        """Allocate this payroll's safe deduction across pending schedules FIFO."""
+    def salary_deduction_plan(self, employee_id: int, available_gross_cents: int,
+                              eligible_through: str | None = None):
+        """Allocate safe deductions FIFO without using a future-dated advance."""
         remaining_pay = max(0, int(available_gross_cents))
         if remaining_pay <= 0:
             return []
@@ -1975,8 +2259,10 @@ class Database:
                FROM cash_advance_transactions t
                JOIN cash_advances ca ON ca.id=t.advance_id
                WHERE ca.employee_id=? AND ca.voided=0 AND t.voided=0
-                 AND t.txn_type='Salary Deduction' AND t.posted=0
-               ORDER BY ca.advance_date,ca.id,t.id""", (employee_id,)
+                  AND t.txn_type='Salary Deduction' AND t.posted=0
+                  AND (? IS NULL OR ca.advance_date<=?)
+               ORDER BY ca.advance_date,ca.id,t.id""",
+            (employee_id, eligible_through, eligible_through)
         )
         used_by_advance, plan = {}, []
         for row in rows:
@@ -2206,7 +2492,8 @@ class Database:
         for employee in employees:
             deduction = sum(
                 item["amount_cents"]
-                for item in self.salary_deduction_plan(employee["id"], employee["gross_cents"])
+                for item in self.salary_deduction_plan(
+                    employee["id"], employee["gross_cents"], week_end)
             )
             row = dict(employee)
             row.update(week_start=week_start, week_end=week_end,
@@ -2268,7 +2555,9 @@ class Database:
             )
         deduction_plan = []
         for employee_id, employee_gross in gross_by_employee.items():
-            deduction_plan.extend(self.salary_deduction_plan(employee_id, employee_gross))
+            deduction_plan.extend(
+                self.salary_deduction_plan(employee_id, employee_gross, week_end)
+            )
         gross = sum(row["gross_cents"] for row in attendance)
         deduction_total = sum(item["amount_cents"] for item in deduction_plan)
         net = gross - deduction_total
@@ -2296,7 +2585,7 @@ class Database:
             batch_id = self.conn.execute(
                 """INSERT INTO payroll_batches(project_id,batch_ref,period_start,
                    period_end,gross_cents,deduction_cents,net_cents,expense_id,
-                   authorized_by_head_id) VALUES(?,?,?,?,?,?,?,?,?)""",
+                   authorized_by_head_id,week_schedule) VALUES(?,?,?,?,?,?,?,?,?,'Saturday-Friday')""",
                 (project_id, reference, week_start, week_end, gross,
                  deduction_total, net, expense_id, authorized_by_head_id),
             ).lastrowid
@@ -2495,6 +2784,62 @@ class HeadEditorDialog(tk.Toplevel):
         self.destroy()
 
 
+class ProjectHeadEditDialog(tk.Toplevel):
+    """Secure registry editor that never exposes a stored PIN."""
+    def __init__(self, parent, head):
+        super().__init__(parent)
+        self.title("Edit Project Head")
+        self.resizable(False, False)
+        self.result = None
+        self.vars = {
+            "name": tk.StringVar(value=head["name"]),
+            "position": tk.StringVar(value=head["position"]),
+            "current_pin": tk.StringVar(),
+            "new_pin": tk.StringVar(),
+            "confirm_pin": tk.StringVar(),
+        }
+        body = ttk.Frame(self, padding=22); body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Edit project head", style="DialogTitle.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        ttk.Label(
+            body,
+            text="The current PIN confirms the change. Leave the new PIN blank to retain it.",
+            style="Muted.TLabel",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 12))
+        fields = (
+            ("name", "Full name", False), ("position", "Position", False),
+            ("current_pin", "Current PIN", True), ("new_pin", "New PIN", True),
+            ("confirm_pin", "Confirm new PIN", True),
+        )
+        for row, (key, label, secret) in enumerate(fields, 2):
+            ttk.Label(body, text=label).grid(row=row, column=0, sticky="w", padx=(0, 14), pady=5)
+            ttk.Entry(body, textvariable=self.vars[key], show="*" if secret else "", width=36).grid(
+                row=row, column=1, sticky="ew", pady=5)
+        buttons = ttk.Frame(body); buttons.grid(row=7, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(buttons, text="Save Changes", style="Primary.TButton",
+                   command=self.save).pack(side="right", padx=(0, 8))
+        self.transient(parent); self.grab_set(); self.bind("<Escape>", lambda _e: self.destroy())
+
+    def save(self):
+        values = {key: var.get().strip() for key, var in self.vars.items()}
+        if not values["name"] or not values["position"] or not values["current_pin"]:
+            messagebox.showerror(
+                APP_TITLE, "Name, position and current PIN are required.", parent=self)
+            return
+        if values["new_pin"] != values["confirm_pin"]:
+            messagebox.showerror(APP_TITLE, "The new PIN confirmation does not match.", parent=self)
+            return
+        if values["new_pin"]:
+            try:
+                hash_pin(values["new_pin"])
+            except ValueError as exc:
+                messagebox.showerror(APP_TITLE, str(exc), parent=self)
+                return
+        self.result = values
+        self.destroy()
+
+
 class HeadRegistryDialog(tk.Toplevel):
     """Global reusable project-head directory."""
     def __init__(self, parent, db):
@@ -2515,6 +2860,9 @@ class HeadRegistryDialog(tk.Toplevel):
         ttk.Button(
             bar, text="+ Add Project Head", style="Primary.TButton", command=self.add
         ).pack(side="left")
+        ttk.Button(
+            bar, text="Edit Project Head", style="Secondary.TButton", command=self.edit
+        ).pack(side="left", padx=(6, 0))
         ttk.Label(
             bar, text="PINs are stored as hashes.", style="Muted.TLabel"
         ).pack(side="right")
@@ -2528,6 +2876,7 @@ class HeadRegistryDialog(tk.Toplevel):
         self.tree.column("position", width=230, stretch=True)
         self.tree.column("pin", width=105, anchor="center", stretch=False)
         self.tree.pack(fill="both", expand=True)
+        self.tree.bind("<Double-1>", lambda _event: self.edit())
         ttk.Button(
             body, text="Done", style="Primary.TButton", command=self.destroy
         ).pack(anchor="e", pady=(12, 0))
@@ -2559,11 +2908,45 @@ class HeadRegistryDialog(tk.Toplevel):
         except (ValueError, sqlite3.Error) as exc:
             messagebox.showerror(APP_TITLE, str(exc), parent=self)
 
+    def edit(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showinfo(APP_TITLE, "Select a project head to edit.", parent=self)
+            return
+        head = self.db.one("SELECT * FROM head_registry WHERE id=?", (int(selected[0]),))
+        if not head:
+            return
+        win = ProjectHeadEditDialog(self, head)
+        self.wait_window(win)
+        if not win.result:
+            return
+        values = win.result
+        try:
+            self.db.update_registered_head(
+                head["id"], values["name"], values["position"],
+                values["current_pin"], values["new_pin"],
+            )
+            self.refresh()
+            messagebox.showinfo(
+                APP_TITLE,
+                f"{values['name']} was updated across every assigned project.",
+                parent=self,
+            )
+        except (ValueError, sqlite3.Error) as exc:
+            messagebox.showerror(APP_TITLE, str(exc), parent=self)
+
 
 class DatePickerPopup(tk.Toplevel):
-    def __init__(self, parent, target_var):
+    """Calendar with scrollable year, month and day controls.
+
+    The spin controls make distant dates such as employee birthdays practical,
+    while the calendar grid remains convenient for ordinary transaction dates.
+    """
+    def __init__(self, parent, target_var, year_min=1900, year_max=2100):
         super().__init__(parent)
         self.target_var = target_var
+        self.year_min = int(year_min)
+        self.year_max = int(year_max)
         self.title("Pick a date")
         self.resizable(False, False)
         self.current_year = date.today().year
@@ -2576,36 +2959,93 @@ class DatePickerPopup(tk.Toplevel):
                 self.current_month = parsed.month
             except ValueError:
                 pass
-        self.header = ttk.Frame(self, padding=(10, 10, 10, 6)); self.header.pack(fill="x")
-        self.prev_month = ttk.Button(self.header, text="<", command=self.shift_month, width=3)
+        selectors = ttk.LabelFrame(self, text="Scroll or type a date", padding=10)
+        selectors.pack(fill="x", padx=10, pady=(10, 4))
+        self.year_var = tk.IntVar(value=self.current_year)
+        self.month_var = tk.StringVar(value=calendar.month_name[self.current_month])
+        self.day_var = tk.IntVar(value=parsed.day if initial and 'parsed' in locals() else 1)
+        ttk.Label(selectors, text="Year").grid(row=0, column=0, sticky="w")
+        ttk.Label(selectors, text="Month").grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(selectors, text="Day").grid(row=0, column=2, sticky="w", padx=(8, 0))
+        self.year_spin = ttk.Spinbox(
+            selectors, from_=self.year_min, to=self.year_max,
+            textvariable=self.year_var, width=8, wrap=False, command=self.selector_changed)
+        self.month_combo = ttk.Combobox(
+            selectors, textvariable=self.month_var,
+            values=list(calendar.month_name)[1:], state="readonly", width=12)
+        self.day_spin = ttk.Spinbox(
+            selectors, from_=1, to=31, textvariable=self.day_var,
+            width=6, wrap=True)
+        self.year_spin.grid(row=1, column=0, sticky="ew")
+        self.month_combo.grid(row=1, column=1, sticky="ew", padx=(8, 0))
+        self.day_spin.grid(row=1, column=2, sticky="ew", padx=(8, 0))
+        ttk.Button(selectors, text="Use selected date", style="Primary.TButton",
+                   command=self.select_from_controls).grid(row=1, column=3, padx=(10, 0))
+        self.month_combo.bind("<<ComboboxSelected>>", self.selector_changed)
+        self.year_spin.bind("<Return>", self.selector_changed)
+        self.year_spin.bind("<FocusOut>", self.selector_changed)
+
+        self.header = ttk.Frame(self, padding=(10, 6, 10, 6)); self.header.pack(fill="x")
+        self.prev_month = ttk.Button(
+            self.header, text="<", command=lambda: self.shift_month(-1), width=3)
         self.prev_month.pack(side="left")
         self.month_label = ttk.Label(self.header, text="", font=("Segoe UI", 10, "bold"))
         self.month_label.pack(side="left", expand=True)
-        self.next_month = ttk.Button(self.header, text=">", command=self.shift_month, width=3)
+        self.next_month = ttk.Button(
+            self.header, text=">", command=lambda: self.shift_month(1), width=3)
         self.next_month.pack(side="right")
         self.days_frame = ttk.Frame(self, padding=(10, 0, 10, 10)); self.days_frame.pack()
-        for col, name in enumerate(("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")):
-            ttk.Label(self.days_frame, text=name, width=3).grid(row=0, column=col, padx=2, pady=2)
         self.day_buttons = []
         self.render_calendar()
         self.transient(parent); self.grab_set(); self.bind("<Escape>", lambda _e: self.destroy())
 
-    def shift_month(self):
-        if self.focus_get() is self.next_month:
-            self.current_month += 1
-        else:
-            self.current_month -= 1
+    def shift_month(self, direction):
+        self.current_month += direction
         if self.current_month > 12:
             self.current_month = 1; self.current_year += 1
         if self.current_month < 1:
             self.current_month = 12; self.current_year -= 1
+        self.current_year = min(self.year_max, max(self.year_min, self.current_year))
+        self.year_var.set(self.current_year)
+        self.month_var.set(calendar.month_name[self.current_month])
         self.render_calendar()
+
+    def selector_changed(self, _event=None):
+        try:
+            selected_year = int(self.year_var.get())
+            selected_month = list(calendar.month_name).index(self.month_var.get())
+        except (ValueError, tk.TclError):
+            return
+        if not 1 <= selected_month <= 12:
+            return
+        self.current_year = min(self.year_max, max(self.year_min, selected_year))
+        self.current_month = selected_month
+        self.year_var.set(self.current_year)
+        self.render_calendar()
+
+    def select_from_controls(self):
+        try:
+            selected = date(int(self.year_var.get()),
+                            list(calendar.month_name).index(self.month_var.get()),
+                            int(self.day_var.get()))
+        except (ValueError, tk.TclError):
+            messagebox.showerror(APP_TITLE, "Select a valid year, month and day.", parent=self)
+            return
+        if not self.year_min <= selected.year <= self.year_max:
+            messagebox.showerror(
+                APP_TITLE,
+                f"Year must be between {self.year_min} and {self.year_max}.",
+                parent=self,
+            )
+            return
+        self.select(selected.isoformat())
 
     def render_calendar(self):
         self.month_label.config(text=f"{calendar.month_name[self.current_month]} {self.current_year}")
         for child in self.days_frame.winfo_children():
-            if child is not self.month_label:
-                child.destroy()
+            child.destroy()
+        for col, name in enumerate(("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")):
+            ttk.Label(self.days_frame, text=name, width=3).grid(row=0, column=col, padx=2, pady=2)
         self.day_buttons = []
         for row in range(1, 7):
             for col in range(7):
@@ -2912,10 +3352,12 @@ class ManageHeadsDialog(tk.Toplevel):
         self.registry_combo.pack(side="left", fill="x", expand=True)
         ttk.Button(bar, text="+ Assign", style="Primary.TButton", command=self.add).pack(side="left", padx=6)
         ttk.Button(bar, text="Head Registry", style="Secondary.TButton", command=self.open_registry).pack(side="left")
+        ttk.Button(bar, text="Edit Head", style="Secondary.TButton", command=self.edit).pack(side="left", padx=(6, 0))
         ttk.Button(bar, text="Remove", style="Secondary.TButton", command=self.remove).pack(side="left", padx=(6, 0))
         self.tree = ttk.Treeview(body, columns=("name", "position"), show="headings")
         self.tree.heading("name", text="NAME"); self.tree.heading("position", text="POSITION")
         self.tree.pack(fill="both", expand=True, pady=10)
+        self.tree.bind("<Double-1>", lambda _event: self.edit())
         ttk.Button(body, text="Done", style="Primary.TButton", command=self.destroy).pack(anchor="e")
         self.refresh_registry(); self.refresh(); self.transient(parent); self.grab_set()
 
@@ -2947,6 +3389,26 @@ class ManageHeadsDialog(tk.Toplevel):
     def open_registry(self):
         win = HeadRegistryDialog(self, self.db); self.wait_window(win)
         self.refresh_registry()
+
+    def edit(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showinfo(APP_TITLE, "Select a project head to edit.", parent=self); return
+        project_head = self.db.one("SELECT * FROM project_heads WHERE id=?", (int(selected[0]),))
+        if not project_head or not project_head["registry_head_id"]:
+            messagebox.showerror(APP_TITLE, "This head is not linked to the shared registry.", parent=self); return
+        head = self.db.one("SELECT * FROM head_registry WHERE id=?", (project_head["registry_head_id"],))
+        win = ProjectHeadEditDialog(self, head); self.wait_window(win)
+        if not win.result: return
+        values = win.result
+        try:
+            self.db.update_registered_head(
+                head["id"], values["name"], values["position"],
+                values["current_pin"], values["new_pin"])
+            self.refresh_registry(); self.refresh()
+            messagebox.showinfo(APP_TITLE, "Project-head details were updated.", parent=self)
+        except (ValueError, sqlite3.Error) as exc:
+            messagebox.showerror(APP_TITLE, str(exc), parent=self)
 
     def remove(self):
         selected = self.tree.selection()
@@ -4534,7 +4996,7 @@ class PaymentHistoryDialog(tk.Toplevel):
         ttk.Label(body, text="Payment history", style="DialogTitle.TLabel").pack(anchor="w")
         ttk.Label(
             body,
-            text=(f"{expense['name']} / {expense['item']}  â€¢  Total paid {money(paid)}  â€¢  "
+            text=(f"{expense['name']} / {expense['item']}  |  Total paid {money(paid)}  |  "
                   f"Outstanding {money(max(0, expense['total_cents'] - paid))}"),
             style="Muted.TLabel",
         ).pack(anchor="w", pady=(3, 12))
@@ -4625,7 +5087,7 @@ class ExpenseDetailsDialog(tk.Toplevel):
             label_column, value_column = pair * 2, pair * 2 + 1
             ttk.Label(body, text=label, style="Muted.TLabel").grid(
                 row=grid_row, column=label_column, sticky="nw", padx=((0 if not pair else 20), 8), pady=5)
-            ttk.Label(body, text=value or "â€”", wraplength=255, justify="left").grid(
+            ttk.Label(body, text=value or "-", wraplength=255, justify="left").grid(
                 row=grid_row, column=value_column, sticky="nw", pady=5)
             body.columnconfigure(value_column, weight=1)
         buttons = ttk.Frame(body); buttons.grid(
@@ -5833,7 +6295,7 @@ class ExpensesTab(BaseTab):
             advance_status = ("Advance Settled" if net_total == 0 else
                               "Advance Partial" if row["recovery_total"] else "Advance Outstanding")
             display_status = ("VOID" if row["voided"] else
-                              f"Paid â€¢ {advance_status}" if row["cash_advance_id"] else
+                              f"Paid - {advance_status}" if row["cash_advance_id"] else
                               "Paid" if outstanding <= 0 and row["total_cents"] > 0 else
                               "Partially Paid" if row["payment_total"] > 0 else "Unpaid")
             row_tag = "void" if row["voided"] else "paid" if outstanding <= 0 else "pending-partial" if row["payment_total"] else "unpaid"
@@ -5958,8 +6420,8 @@ class ExpensesTab(BaseTab):
             "paid": money(row["payment_total"]),
             "outstanding": money(max(0, row["total_cents"] - row["payment_total"])),
             "status": ("VOID" if row["voided"] else
-                       ("Paid â€¢ Advance Settled" if row["recovery_total"]>=row["total_cents"] else
-                        "Paid â€¢ Advance Partial" if row["recovery_total"] else "Paid â€¢ Advance Outstanding") if row["cash_advance_id"] else
+                       ("Paid - Advance Settled" if row["recovery_total"]>=row["total_cents"] else
+                        "Paid - Advance Partial" if row["recovery_total"] else "Paid - Advance Outstanding") if row["cash_advance_id"] else
                        "Paid" if row["payment_total"] >= row["total_cents"] and row["total_cents"] > 0 else
                        "Partially Paid" if row["payment_total"] > 0 else "Unpaid"),
             "allocation": row["allocation_references"] or "Legacy / Unlinked",
@@ -6341,8 +6803,10 @@ class EmployeeEditorDialog(tk.Toplevel):
                 line = ttk.Frame(cell); line.pack(fill="x")
                 ttk.Entry(line, textvariable=self.vars[key], state="readonly").pack(
                     side="left", fill="x", expand=True)
-                ttk.Button(line, text="U0001F4C5", width=3,
-                           command=lambda: DatePickerPopup(self, self.vars["birthday"])).pack(
+                ttk.Button(line, text="\U0001F4C5", width=3,
+                           command=lambda: DatePickerPopup(
+                               self, self.vars["birthday"], year_min=1900,
+                               year_max=date.today().year)).pack(
                                side="left", padx=(4, 0))
             else:
                 ttk.Entry(cell, textvariable=self.vars[key],
@@ -6457,9 +6921,9 @@ class EmployeeProfileDialog(tk.Toplevel):
                   style="DialogTitle.TLabel").pack(anchor="w")
         info = ttk.Frame(profile_details); info.pack(fill="x", pady=(10, 8))
         details = [("Employee number", employee["employee_no"]), ("Position", employee["position"]),
-            ("Class", employee["class"]), ("Birthday", employee["birthday"] or "â€”"),
-            ("Age", employee_age(employee["birthday"]) or "â€”"),
-            ("Contact number", employee["contact_number"] or "â€”"),
+            ("Class", employee["class"]), ("Birthday", employee["birthday"] or "-"),
+            ("Age", employee_age(employee["birthday"]) or "-"),
+            ("Contact number", employee["contact_number"] or "-"),
             ("Daily rate", money(daily)), ("Hourly rate", money(int((Decimal(daily)/8).quantize(Decimal('1'), rounding=ROUND_HALF_UP)))),
             ("Outstanding advances", money(max(0, outstanding)))]
         for index, (label, value) in enumerate(details):
@@ -6509,7 +6973,7 @@ class BatchAttendanceDialog(tk.Toplevel):
         super().__init__(parent); self.title("Batch Attendance"); self.geometry("920x650"); self.result=None
         body=ttk.Frame(self,padding=18); body.pack(fill="both",expand=True)
         ttk.Label(body,text="Mark batch attendance",style="DialogTitle.TLabel").pack(anchor="w")
-        ttk.Label(body,text="Select employees and adjust individual times. Lunch overlap from 12:00â€“1:00 PM is unpaid.",style="Muted.TLabel").pack(anchor="w",pady=(2,10))
+        ttk.Label(body,text="Select employees and adjust individual times. Lunch overlap from 12:00-1:00 PM is unpaid.",style="Muted.TLabel").pack(anchor="w",pady=(2,10))
         defaults=ttk.Frame(body); defaults.pack(fill="x")
         self.work_date=tk.StringVar(value=date.today().isoformat()); self.default_in=tk.StringVar(value="08:00"); self.default_out=tk.StringVar(value="17:00")
         for label,var,width in (("Date",self.work_date,12),("Default in",self.default_in,8),("Default out",self.default_out,8)):
@@ -6608,10 +7072,18 @@ class CashAdvanceGrantDialog(tk.Toplevel):
             if key=="method": widget=ttk.Combobox(cell,textvariable=self.vars[key],values=["Cash Allocation","Bank Transfer"],state="readonly")
             elif key=="allocation": widget=ttk.Combobox(cell,textvariable=self.vars[key],values=list(allocations),state="readonly")
             elif key=="bank": widget=ttk.Combobox(cell,textvariable=self.vars[key],values=list(banks),state="readonly")
+            elif key=="date":
+                line=ttk.Frame(cell); line.pack(fill="x")
+                widget=ttk.Entry(line,textvariable=self.vars[key],state="readonly")
+                widget.pack(side="left",fill="x",expand=True)
+                ttk.Button(line,text="Calendar",width=9,
+                           command=lambda:DatePickerPopup(self,self.vars["date"])).pack(
+                               side="left",padx=(4,0))
             elif key=="repayment_plan": widget=ttk.Combobox(cell,textvariable=self.vars[key],
                 values=["Salary Deduction","Cash Repayment","Bank Repayment","Manual / Mixed"],state="readonly")
             else: widget=ttk.Entry(cell,textvariable=self.vars[key])
-            widget.pack(fill="x"); form.columnconfigure(col,weight=1)
+            if key!="date": widget.pack(fill="x")
+            form.columnconfigure(col,weight=1)
             if key=="bank": self.bank_widget=widget
             if key=="allocation": self.allocation_widget=widget
             if key=="weekly_cap": self.cap_widget=widget
@@ -6636,6 +7108,208 @@ class CashAdvanceGrantDialog(tk.Toplevel):
         self.result={key:var.get().strip() for key,var in self.vars.items()}; self.result["employee_id"]=int(selected[0]); self.destroy()
 
 
+class CashAdvanceBatchDialog(tk.Toplevel):
+    """Stage multiple Wednesday advances and authorize the batch once."""
+    def __init__(self, parent, employees, banks, allocations):
+        super().__init__(parent)
+        self.title("Batch Cash Advance Grant")
+        self.geometry("1180x790"); self.minsize(980, 680); self.resizable(True, True)
+        self.result = None
+        self.employees = {str(row["id"]): row for row in employees}
+        self.banks, self.allocations = banks, allocations
+        self.staged = {}
+        body = ttk.Frame(self, padding=18); body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1); body.rowconfigure(4, weight=1)
+        ttk.Label(body, text="Batch employee cash advances", style="DialogTitle.TLabel").grid(
+            row=0, column=0, sticky="w")
+        ttk.Label(
+            body,
+            text="Use one effective date and one funding source. Stage each employee amount, then authorize the complete batch once.",
+            style="Muted.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(2, 10))
+
+        shared = ttk.LabelFrame(body, text="Batch funding", padding=10)
+        shared.grid(row=2, column=0, sticky="ew")
+        for column in range(4): shared.columnconfigure(column, weight=1)
+        self.vars = {
+            "date": tk.StringVar(value=date.today().isoformat()),
+            "method": tk.StringVar(value="Cash Allocation"),
+            "allocation": tk.StringVar(), "bank": tk.StringVar(),
+            "amount": tk.StringVar(), "reason": tk.StringVar(),
+            "repayment_plan": tk.StringVar(value="Salary Deduction"),
+            "weekly_cap": tk.StringVar(), "search": tk.StringVar(),
+        }
+        ttk.Label(shared, text="Effective advance date").grid(row=0, column=0, sticky="w")
+        date_line = ttk.Frame(shared); date_line.grid(row=1, column=0, sticky="ew", padx=(0, 8))
+        ttk.Entry(date_line, textvariable=self.vars["date"], state="readonly").pack(
+            side="left", fill="x", expand=True)
+        ttk.Button(date_line, text="Calendar", width=9,
+                   command=lambda: DatePickerPopup(self, self.vars["date"])).pack(
+                       side="left", padx=(4, 0))
+        ttk.Label(shared, text="Funding source").grid(row=0, column=1, sticky="w")
+        self.method_widget = ttk.Combobox(
+            shared, textvariable=self.vars["method"],
+            values=["Cash Allocation", "Bank Transfer"], state="readonly")
+        self.method_widget.grid(row=1, column=1, sticky="ew", padx=(0, 8))
+        ttk.Label(shared, text="Petty cash / direct procurement").grid(row=0, column=2, sticky="w")
+        self.allocation_widget = ttk.Combobox(
+            shared, textvariable=self.vars["allocation"],
+            values=list(allocations), state="readonly")
+        self.allocation_widget.grid(row=1, column=2, sticky="ew", padx=(0, 8))
+        ttk.Label(shared, text="Bank account").grid(row=0, column=3, sticky="w")
+        self.bank_widget = ttk.Combobox(
+            shared, textvariable=self.vars["bank"], values=list(banks), state="readonly")
+        self.bank_widget.grid(row=1, column=3, sticky="ew")
+
+        entry_area = ttk.Panedwindow(body, orient="horizontal")
+        entry_area.grid(row=3, column=0, sticky="nsew", pady=(10, 8))
+        employee_frame = ttk.LabelFrame(entry_area, text="Select employees", padding=8)
+        details_frame = ttk.LabelFrame(entry_area, text="Advance details for selected employees", padding=8)
+        entry_area.add(employee_frame, weight=3); entry_area.add(details_frame, weight=2)
+        employee_frame.columnconfigure(0, weight=1); employee_frame.rowconfigure(1, weight=1)
+        ttk.Entry(employee_frame, textvariable=self.vars["search"]).grid(
+            row=0, column=0, sticky="ew", pady=(0, 5))
+        self.employee_tree = ttk.Treeview(
+            employee_frame, columns=("no", "name", "position", "class"),
+            show="headings", selectmode="extended", height=8)
+        for key, label, width in (("no", "Employee No.", 110), ("name", "Name", 190),
+                                  ("position", "Position", 140), ("class", "Class", 80)):
+            self.employee_tree.heading(key, text=label); self.employee_tree.column(key, width=width)
+        employee_scroll = ttk.Scrollbar(employee_frame, orient="vertical", command=self.employee_tree.yview)
+        self.employee_tree.configure(yscrollcommand=employee_scroll.set)
+        self.employee_tree.grid(row=1, column=0, sticky="nsew"); employee_scroll.grid(row=1, column=1, sticky="ns")
+
+        detail_fields = (
+            ("amount", "Amount"), ("reason", "Reason"),
+            ("repayment_plan", "Repayment method"),
+            ("weekly_cap", "Maximum weekly deduction (optional)"),
+        )
+        details_frame.columnconfigure(0, weight=1)
+        for row_index, (key, label) in enumerate(detail_fields):
+            ttk.Label(details_frame, text=label).grid(row=row_index * 2, column=0, sticky="w")
+            if key == "repayment_plan":
+                widget = ttk.Combobox(
+                    details_frame, textvariable=self.vars[key],
+                    values=["Salary Deduction", "Cash Repayment", "Bank Repayment", "Manual / Mixed"],
+                    state="readonly")
+            else:
+                widget = ttk.Entry(details_frame, textvariable=self.vars[key])
+            widget.grid(row=row_index * 2 + 1, column=0, sticky="ew", pady=(0, 7))
+            if key == "weekly_cap": self.cap_widget = widget
+        detail_buttons = ttk.Frame(details_frame)
+        detail_buttons.grid(row=8, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(detail_buttons, text="Stage Selected Employees", style="Primary.TButton",
+                   command=self.stage_selected).pack(side="left")
+
+        staged_frame = ttk.LabelFrame(body, text="Staged advances", padding=8)
+        staged_frame.grid(row=4, column=0, sticky="nsew")
+        staged_frame.columnconfigure(0, weight=1); staged_frame.rowconfigure(1, weight=1)
+        staged_bar = ttk.Frame(staged_frame); staged_bar.grid(row=0, column=0, sticky="ew", pady=(0, 5))
+        ttk.Button(staged_bar, text="Remove Selected", command=self.remove_staged).pack(side="left")
+        self.total_label = ttk.Label(staged_bar, text="Entries: 0 | Batch total: 0.00", style="Section.TLabel")
+        self.total_label.pack(side="right")
+        columns = (("employee", "Employee", 190), ("number", "Employee No.", 110),
+                   ("amount", "Amount", 100), ("plan", "Repayment", 125),
+                   ("cap", "Weekly Limit", 100), ("reason", "Reason", 260))
+        self.staged_tree = ttk.Treeview(
+            staged_frame, columns=[item[0] for item in columns], show="headings", height=8)
+        for key, label, width in columns:
+            self.staged_tree.heading(key, text=label); self.staged_tree.column(key, width=width)
+        staged_scroll = ttk.Scrollbar(staged_frame, orient="vertical", command=self.staged_tree.yview)
+        self.staged_tree.configure(yscrollcommand=staged_scroll.set)
+        self.staged_tree.grid(row=1, column=0, sticky="nsew"); staged_scroll.grid(row=1, column=1, sticky="ns")
+
+        buttons = ttk.Frame(body); buttons.grid(row=5, column=0, sticky="ew", pady=(12, 0))
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(buttons, text="Review and Authorize Batch", style="Primary.TButton",
+                   command=self.save).pack(side="right", padx=(0, 8))
+        self.vars["search"].trace_add("write", self.render_employees)
+        self.vars["method"].trace_add("write", self.update_source_state)
+        self.vars["repayment_plan"].trace_add("write", self.update_plan_state)
+        self.render_employees(); self.update_source_state(); self.update_plan_state()
+        if allocations: self.vars["allocation"].set(next(iter(allocations)))
+        if banks: self.vars["bank"].set(next(iter(banks)))
+        self.transient(parent); self.grab_set(); self.bind("<Escape>", lambda _e: self.destroy())
+
+    def render_employees(self, *_args):
+        self.employee_tree.delete(*self.employee_tree.get_children())
+        term = self.vars["search"].get().strip().lower()
+        for key, employee in self.employees.items():
+            haystack = f"{employee['employee_no']} {employee['name']} {employee['position']} {employee['class']}".lower()
+            if term in haystack:
+                self.employee_tree.insert("", "end", iid=key, values=(
+                    employee["employee_no"], employee["name"], employee["position"], employee["class"]))
+
+    def update_source_state(self, *_args):
+        transfer = self.vars["method"].get() == "Bank Transfer"
+        self.bank_widget.configure(state="readonly" if transfer else "disabled")
+        self.allocation_widget.configure(state="disabled" if transfer else "readonly")
+
+    def update_plan_state(self, *_args):
+        salary = self.vars["repayment_plan"].get() == "Salary Deduction"
+        self.cap_widget.configure(state="normal" if salary else "disabled")
+        if not salary: self.vars["weekly_cap"].set("")
+
+    def stage_selected(self):
+        selected = self.employee_tree.selection()
+        if not selected:
+            messagebox.showerror(APP_TITLE, "Select at least one employee.", parent=self); return
+        try:
+            amount = cents(self.vars["amount"].get())
+            if amount <= 0: raise ValueError("Enter a positive advance amount.")
+            if not self.vars["reason"].get().strip(): raise ValueError("Reason is required.")
+            weekly_cap = 0
+            if self.vars["repayment_plan"].get() == "Salary Deduction" and self.vars["weekly_cap"].get().strip():
+                weekly_cap = cents(self.vars["weekly_cap"].get())
+                if weekly_cap <= 0: raise ValueError("Weekly deduction limit must be positive.")
+        except ValueError as exc:
+            messagebox.showerror(APP_TITLE, str(exc), parent=self); return
+        for employee_id in selected:
+            employee = self.employees[employee_id]
+            self.staged[employee_id] = {
+                "employee_id": int(employee_id), "employee": employee["name"],
+                "employee_no": employee["employee_no"], "amount_cents": amount,
+                "reason": self.vars["reason"].get().strip(),
+                "repayment_plan": self.vars["repayment_plan"].get(),
+                "weekly_cap_cents": weekly_cap,
+            }
+        self.refresh_staged()
+
+    def remove_staged(self):
+        for item in self.staged_tree.selection(): self.staged.pop(item, None)
+        self.refresh_staged()
+
+    def refresh_staged(self):
+        self.staged_tree.delete(*self.staged_tree.get_children())
+        total = 0
+        for key, row in self.staged.items():
+            total += row["amount_cents"]
+            self.staged_tree.insert("", "end", iid=key, values=(
+                row["employee"], row["employee_no"], money(row["amount_cents"]),
+                row["repayment_plan"], money(row["weekly_cap_cents"]) if row["weekly_cap_cents"] else "No limit",
+                row["reason"]))
+        self.total_label.config(text=f"Entries: {len(self.staged)} | Batch total: {money(total)}")
+
+    def save(self):
+        if not self.staged:
+            messagebox.showerror(APP_TITLE, "Stage at least one employee advance.", parent=self); return
+        try:
+            valid_date(self.vars["date"].get(), True)
+        except ValueError as exc:
+            messagebox.showerror(APP_TITLE, str(exc), parent=self); return
+        if self.vars["method"].get() == "Bank Transfer":
+            if self.vars["bank"].get() not in self.banks:
+                messagebox.showerror(APP_TITLE, "Select a funded bank account.", parent=self); return
+        elif self.vars["allocation"].get() not in self.allocations:
+            messagebox.showerror(APP_TITLE, "Select an active cash allocation.", parent=self); return
+        self.result = {
+            "date": self.vars["date"].get(), "method": self.vars["method"].get(),
+            "allocation": self.vars["allocation"].get(), "bank": self.vars["bank"].get(),
+            "entries": list(self.staged.values()),
+        }
+        self.destroy()
+
+
 class CashAdvanceRecoveryDialog(tk.Toplevel):
     def __init__(self,parent,advances,banks):
         super().__init__(parent); self.title("Record Advance Recovery"); self.result=None
@@ -6655,8 +7329,15 @@ class CashAdvanceRecoveryDialog(tk.Toplevel):
             if key=="advance":widget=ttk.Combobox(cell,textvariable=self.vars[key],values=list(advances),state="readonly")
             elif key=="method":widget=ttk.Combobox(cell,textvariable=self.vars[key],values=["Cash Repayment","Bank Repayment","Salary Deduction"],state="readonly")
             elif key=="bank":widget=ttk.Combobox(cell,textvariable=self.vars[key],values=list(banks),state="readonly")
+            elif key=="txn_date":
+                line=ttk.Frame(cell); line.pack(fill="x")
+                widget=ttk.Entry(line,textvariable=self.vars[key],state="readonly")
+                widget.pack(side="left",fill="x",expand=True)
+                ttk.Button(line,text="Calendar",width=9,
+                           command=lambda:DatePickerPopup(self,self.vars["txn_date"])).pack(
+                               side="left",padx=(4,0))
             else:widget=ttk.Entry(cell,textvariable=self.vars[key])
-            widget.pack(fill="x")
+            if key!="txn_date":widget.pack(fill="x")
             if key=="bank":self.bank_widget=widget
         self.plan_note=ttk.Label(body,text="",style="Muted.TLabel"); self.plan_note.pack(anchor="w",pady=(10,0))
         buttons=ttk.Frame(body); buttons.pack(fill="x",pady=(18,0))
@@ -6687,7 +7368,7 @@ class PayrollBatchDetailsDialog(tk.Toplevel):
         self.minsize(980,580); self.resizable(True,True)
         batch=db.one("SELECT * FROM payroll_batches WHERE id=?",(batch_id,)); body=ttk.Frame(self,padding=18); body.pack(fill="both",expand=True)
         ttk.Label(body,text=f"Payroll batch {batch['batch_ref']}",style="DialogTitle.TLabel").pack(anchor="w")
-        ttk.Label(body,text=f"{batch['period_start']} to {batch['period_end']}  â€¢  Gross {money(batch['gross_cents'])}  â€¢  Deductions {money(batch['deduction_cents'])}  â€¢  Net {money(batch['net_cents'])}",style="Muted.TLabel").pack(anchor="w",pady=(3,10))
+        ttk.Label(body,text=f"{batch['period_start']} to {batch['period_end']}  |  Gross {money(batch['gross_cents'])}  |  Deductions {money(batch['deduction_cents'])}  |  Net {money(batch['net_cents'])}",style="Muted.TLabel").pack(anchor="w",pady=(3,10))
         notebook=ttk.Notebook(body); notebook.pack(fill="both",expand=True)
         summary_page=ttk.Frame(notebook,padding=6); detail_page=ttk.Frame(notebook,padding=6)
         notebook.add(summary_page,text="Employee Weekly Summary")
@@ -6778,7 +7459,7 @@ class PayrollTab(BaseTab):
         ttk.Button(weekly_controls,text="<",width=3,command=lambda:self.shift_week(-7)).pack(side="left",padx=(7,3))
         self.week_entry=ttk.Entry(weekly_controls,textvariable=self.week_var,state="readonly",width=12)
         self.week_entry.pack(side="left")
-        ttk.Button(weekly_controls,text="U0001F4C5",width=3,
+        ttk.Button(weekly_controls,text="\U0001F4C5",width=3,
                    command=lambda:DatePickerPopup(self,self.week_var)).pack(side="left",padx=3)
         ttk.Button(weekly_controls,text=">",width=3,command=lambda:self.shift_week(7)).pack(side="left")
         ttk.Button(weekly_controls,text="Current Week",command=self.current_week).pack(side="left",padx=7)
@@ -6793,12 +7474,14 @@ class PayrollTab(BaseTab):
         self.batches=make_tree(batch_page,[("ref","Batch",145),("start","Period Start",95),("end","Period End",95),("count","Entries",65),("gross","Gross",100),("deductions","Deductions",95),("net","Net Payable",100),("head","Authorized by",120),("created","Committed",145)])
         advance_actions=ttk.Frame(advance_page); advance_actions.pack(fill="x",pady=(0,4))
         ttk.Button(advance_actions,text="+ Grant Cash Advance",style="Primary.TButton",command=self.grant_cash_advance).pack(side="left")
+        ttk.Button(advance_actions,text="+ Batch Cash Advances",style="Primary.TButton",
+                   command=self.grant_cash_advance_batch).pack(side="left",padx=5)
         ttk.Button(advance_actions,text="Record Recovery",command=self.record_recovery).pack(side="left",padx=5)
         self.advance_summary=ttk.Label(advance_actions,style="Section.TLabel"); self.advance_summary.pack(side="right")
         pane=ttk.Panedwindow(advance_page,orient="vertical"); pane.pack(fill="both",expand=True)
         advances_frame=ttk.Frame(pane); transactions_frame=ttk.Frame(pane); pane.add(advances_frame,weight=1); pane.add(transactions_frame,weight=1)
         ttk.Label(advances_frame,text="Employee advances",style="Section.TLabel").pack(anchor="w")
-        self.advances=make_tree(advances_frame,[("date","Date",90),("employee","Employee",150),("original","Original",90),("recovered","Recovered",90),("net","Net Amount",90),("mop","Funding Source",110),("plan","Repayment Plan",120),("status","Recovery Status",120),("reason","Reason",180)])
+        self.advances=make_tree(advances_frame,[("date","Date",90),("batch","Batch Ref.",145),("reference","Advance Ref.",135),("employee","Employee",150),("original","Original",90),("recovered","Recovered",90),("net","Net Amount",90),("mop","Funding Source",110),("plan","Repayment Plan",120),("status","Recovery Status",120),("reason","Reason",180)])
         ttk.Label(transactions_frame,text="Every advance and recovery transaction",style="Section.TLabel").pack(anchor="w",pady=(5,0))
         self.advance_transactions=make_tree(transactions_frame,[("date","Date",90),("employee","Employee",140),("type","Transaction",125),("amount","Amount",90),("mop","MOP",100),("reference","Reference",115),("head","Authorized by",115),("balance","Balance after",95)])
         self.employees.bind("<Double-1>",self.open_employee_profile)
@@ -6951,7 +7634,7 @@ class PayrollTab(BaseTab):
             return
         if self.week_var.get()!=week_start:
             self.week_var.set(week_start);return
-        self.week_range_label.config(text=f"Monday {week_start} through Sunday {week_end}")
+        self.week_range_label.config(text=f"Saturday {week_start} through Friday {week_end}")
         if not self.project_id:
             self.weekly_summary.config(text="Select one project to review and commit weekly payroll.")
             return
@@ -7009,7 +7692,7 @@ class PayrollTab(BaseTab):
 
     def grant_cash_advance(self):
         if not self.require_project():return
-        employees=self.db.all("SELECT * FROM employees WHERE project_id=? AND active=1 ORDER BY name",(self.project_id,)); banks={f"{b['bank_name']} â€” {b['account_name']} (â€¢â€¢{b['account_number'][-4:]})":b["id"] for b in self.db.all("SELECT * FROM bank_accounts WHERE active=1 ORDER BY bank_name,account_name")}
+        employees=self.db.all("SELECT * FROM employees WHERE project_id=? AND active=1 ORDER BY name",(self.project_id,)); banks={f"{b['bank_name']} - {b['account_name']} (..{b['account_number'][-4:]})":b["id"] for b in self.db.all("SELECT * FROM bank_accounts WHERE active=1 ORDER BY bank_name,account_name")}
         if not employees:messagebox.showinfo(APP_TITLE,"Add employees first.");return
         allocations={}
         for row in self.db.cash_allocation_rows(None,active_only=True):
@@ -7048,20 +7731,180 @@ class PayrollTab(BaseTab):
                     allocation["receiver_registry_id"] or None)
             if not head:return
             authorizing_head_id=allocation["receiver_head_id"] if allocation else head["id"]
-            reference=self.db._next_system_reference("CA","cash_advance_transactions","reference",advance_date)
+            reference=self.db._next_system_reference("CA","cash_advances","system_reference",advance_date)
             payment_method="Bank Transfer" if is_bank else "Cash"
+            recorded_at=local_timestamp()
             with self.db.conn:
                 cur=self.db.conn.execute("""INSERT INTO expenses(project_id,name,item,supplier,qty,unit,unit_price_cents,total_cents,area,trade,expense_date,due_date,invoice_no,notes,authorized_by_head_id,status,default_cash_allocation_id)
                     VALUES(?,?,?,?, '1','advance',?,?,?,?,?,?,?,?,?,'Paid',?)""",(self.project_id,f"CASH ADVANCE - {employee['name']}",f"CASH ADVANCE - {employee['name']}",employee["name"],amount,amount,"PAYROLL","Recoverable Employee Advance",advance_date,advance_date,reference,data["reason"],authorizing_head_id,allocation_id))
                 expense_id=cur.lastrowid
-                payment_id=self.db.conn.execute("""INSERT INTO payments(expense_id,amount_cents,payment_date,method,reference,notes,bank_account_id,authorized_by_head_id,cash_allocation_id,system_reference,transaction_time) VALUES(?,?,?,?,?,'Employee cash advance',?,?,?,?,?)""",(expense_id,amount,advance_date,payment_method,reference,bank_id,authorizing_head_id,allocation_id,reference,local_timestamp())).lastrowid
-                advance_id=self.db.conn.execute("""INSERT INTO cash_advances(project_id,employee_id,expense_id,original_cents,advance_date,reason,method,bank_account_id,authorized_by_head_id,cash_allocation_id,repayment_plan,weekly_deduction_cap_cents) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",(self.project_id,employee["id"],expense_id,amount,advance_date,data["reason"],data["method"],bank_id,authorizing_head_id,allocation_id,data["repayment_plan"],weekly_cap)).lastrowid
-                self.db.conn.execute("""INSERT INTO cash_advance_transactions(advance_id,txn_type,amount_cents,txn_date,method,bank_account_id,reference,notes,authorized_by_head_id) VALUES(?,'Advance',?,?,?,?,?,?,?)""",(advance_id,amount,advance_date,data["method"],bank_id,reference,data["reason"],authorizing_head_id))
+                payment_id=self.db.conn.execute("""INSERT INTO payments(expense_id,amount_cents,payment_date,method,reference,notes,bank_account_id,authorized_by_head_id,cash_allocation_id,system_reference,transaction_time) VALUES(?,?,?,?,?,'Employee cash advance',?,?,?,?,?)""",(expense_id,amount,advance_date,payment_method,reference,bank_id,authorizing_head_id,allocation_id,reference,recorded_at)).lastrowid
+                advance_id=self.db.conn.execute("""INSERT INTO cash_advances(project_id,employee_id,expense_id,original_cents,advance_date,reason,method,bank_account_id,authorized_by_head_id,cash_allocation_id,repayment_plan,weekly_deduction_cap_cents,system_reference,recorded_at_local) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(self.project_id,employee["id"],expense_id,amount,advance_date,data["reason"],data["method"],bank_id,authorizing_head_id,allocation_id,data["repayment_plan"],weekly_cap,reference,recorded_at)).lastrowid
+                self.db.conn.execute("""INSERT INTO cash_advance_transactions(advance_id,txn_type,amount_cents,txn_date,method,bank_account_id,reference,notes,authorized_by_head_id,recorded_at_local) VALUES(?,'Advance',?,?,?,?,?,?,?,?)""",(advance_id,amount,advance_date,data["method"],bank_id,reference,data["reason"],authorizing_head_id,recorded_at))
                 if allocation_id:self.db.register_allocation_payment(allocation_id,payment_id,expense_id,amount,advance_date,authorizing_head_id)
                 if data["repayment_plan"]=="Salary Deduction":
-                    self.db.conn.execute("""INSERT INTO cash_advance_transactions(advance_id,txn_type,amount_cents,txn_date,method,reference,notes,authorized_by_head_id,posted) VALUES(?,'Salary Deduction',?,?,'Salary Deduction',?,?,?,0)""",(advance_id,amount,advance_date,reference,"Scheduled at grant"+(f"; weekly cap {money(weekly_cap)}" if weekly_cap else "; deduct up to available net pay"),authorizing_head_id))
+                    self.db.conn.execute("""INSERT INTO cash_advance_transactions(advance_id,txn_type,amount_cents,txn_date,method,reference,notes,authorized_by_head_id,posted,recorded_at_local) VALUES(?,'Salary Deduction',?,?,'Salary Deduction',?,?,?,0,?)""",(advance_id,amount,advance_date,reference,"Scheduled at grant"+(f"; weekly cap {money(weekly_cap)}" if weekly_cap else "; deduct up to available net pay"),authorizing_head_id,recorded_at))
             self.db.audit(self.project_id,"CASH_ADVANCE_GRANTED",f"{reference}: {money(amount)} to {employee['name']} from {allocation['reference'] if allocation else data['bank']}; repayment {data['repayment_plan']}; authorized by {head['name']}"); self.app.refresh_all()
         except (ValueError,sqlite3.Error) as exc:messagebox.showerror(APP_TITLE,str(exc))
+
+    def grant_cash_advance_batch(self):
+        if not self.require_project(): return
+        employees = self.db.all(
+            "SELECT * FROM employees WHERE project_id=? AND active=1 ORDER BY name",
+            (self.project_id,),
+        )
+        if not employees:
+            messagebox.showinfo(APP_TITLE, "Add employees first."); return
+        banks = {
+            f"{row['bank_name']} - {row['account_name']} (..{row['account_number'][-4:]})": row["id"]
+            for row in self.db.all(
+                "SELECT * FROM bank_accounts WHERE active=1 ORDER BY bank_name,account_name")
+        }
+        allocations = {}
+        for row in self.db.cash_allocation_rows(None, active_only=True):
+            balance = self.db.allocation_balance(row["id"])
+            if balance <= 0: continue
+            holder = row["holder"] or row["supplier"] or "Unassigned"
+            allocations[
+                f"{row['reference']} | {row['allocation_type']} | {holder} | {money(balance)} remaining"
+            ] = row
+        if not allocations and not banks:
+            messagebox.showinfo(
+                APP_TITLE,
+                "Create an active petty-cash/direct-procurement allocation or enroll a funded bank first.")
+            return
+        win = CashAdvanceBatchDialog(self, employees, banks, allocations)
+        self.wait_window(win)
+        if not win.result: return
+        data = win.result
+        try:
+            advance_date = valid_date(data["date"], True)
+            total = sum(row["amount_cents"] for row in data["entries"])
+            is_bank = data["method"] == "Bank Transfer"
+            bank_id = banks.get(data["bank"]) if is_bank else None
+            allocation = allocations.get(data["allocation"]) if not is_bank else None
+            allocation_id = allocation["id"] if allocation else None
+            if is_bank:
+                self.db.validate_payment_source(self.project_id, total, "Bank Transfer", bank_id)
+            else:
+                self.db.validate_cash_allocation_payment(self.project_id, allocation_id, total)
+                if allocation["allocation_type"] == "Direct Procurement" and not messagebox.askyesno(
+                    APP_TITLE,
+                    f"Use Direct Procurement {allocation['reference']} for this employee-advance batch?\n\n"
+                    "This remains traceable, but petty cash is normally the clearer source.",
+                    parent=self,
+                ):
+                    return
+            _deposited, _committed, remaining = self.db.project_commitment_budget(self.project_id)
+            if total > remaining:
+                raise ValueError(
+                    f"Batch exceeds the project's uncommitted budget of {money(remaining)}.")
+            source_name = data["bank"] if is_bank else allocation["reference"]
+            employee_preview = ", ".join(row["employee"] for row in data["entries"][:5])
+            if len(data["entries"]) > 5: employee_preview += f" and {len(data['entries']) - 5} more"
+            if is_bank:
+                head = self.app.authorize(
+                    "Grant batch employee cash advances",
+                    f"{len(data['entries'])} employees; {money(total)} via {source_name}; "
+                    f"effective {advance_date}. {employee_preview}")
+            else:
+                head = self.app.authorize_registered_head(
+                    "Release batch employee cash advances",
+                    f"{len(data['entries'])} employees; {money(total)} from {source_name}; "
+                    f"effective {advance_date}. {employee_preview}",
+                    allocation["receiver_registry_id"] or None)
+            if not head: return
+            authorizing_head_id = allocation["receiver_head_id"] if allocation else head["id"]
+            recorded_at = local_timestamp()
+            batch_ref = self.db._next_system_reference(
+                "CAB", "cash_advance_batches", "batch_ref", advance_date)
+            payment_method = "Bank Transfer" if is_bank else "Cash"
+            with self.db.conn:
+                batch_id = self.db.conn.execute(
+                    """INSERT INTO cash_advance_batches(
+                       project_id,batch_ref,advance_date,funding_method,bank_account_id,
+                       cash_allocation_id,total_cents,entry_count,authorized_by_head_id,
+                       recorded_at_local,notes) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (self.project_id, batch_ref, advance_date, data["method"], bank_id,
+                     allocation_id, total, len(data["entries"]), authorizing_head_id,
+                     recorded_at, f"Employees: {employee_preview}"),
+                ).lastrowid
+                for item in data["entries"]:
+                    employee = self.db.one("SELECT * FROM employees WHERE id=?", (item["employee_id"],))
+                    reference = self.db._next_system_reference(
+                        "CA", "cash_advances", "system_reference", advance_date)
+                    expense_id = self.db.conn.execute(
+                        """INSERT INTO expenses(project_id,name,item,supplier,qty,unit,
+                           unit_price_cents,total_cents,area,trade,expense_date,due_date,
+                           invoice_no,notes,authorized_by_head_id,status,default_cash_allocation_id)
+                           VALUES(?,?,?,?, '1','advance',?,?,?,?,?,?,?,?,?,'Paid',?)""",
+                        (self.project_id, f"CASH ADVANCE - {employee['name']}",
+                         f"CASH ADVANCE - {employee['name']}", employee["name"],
+                         item["amount_cents"], item["amount_cents"], "PAYROLL",
+                         "Recoverable Employee Advance", advance_date, advance_date,
+                         reference, f"{item['reason']}; batch {batch_ref}",
+                         authorizing_head_id, allocation_id),
+                    ).lastrowid
+                    payment_id = self.db.conn.execute(
+                        """INSERT INTO payments(expense_id,amount_cents,payment_date,method,
+                           reference,notes,bank_account_id,authorized_by_head_id,
+                           cash_allocation_id,system_reference,transaction_time)
+                           VALUES(?,?,?,?,?,'Employee cash advance batch',?,?,?,?,?)""",
+                        (expense_id, item["amount_cents"], advance_date, payment_method,
+                         reference, bank_id, authorizing_head_id, allocation_id,
+                         reference, recorded_at),
+                    ).lastrowid
+                    advance_id = self.db.conn.execute(
+                        """INSERT INTO cash_advances(project_id,employee_id,expense_id,
+                           original_cents,advance_date,reason,method,bank_account_id,
+                           authorized_by_head_id,cash_allocation_id,repayment_plan,
+                           weekly_deduction_cap_cents,batch_id,system_reference,recorded_at_local)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (self.project_id, employee["id"], expense_id, item["amount_cents"],
+                         advance_date, item["reason"], data["method"], bank_id,
+                         authorizing_head_id, allocation_id, item["repayment_plan"],
+                         item["weekly_cap_cents"], batch_id, reference, recorded_at),
+                    ).lastrowid
+                    self.db.conn.execute(
+                        """INSERT INTO cash_advance_transactions(advance_id,txn_type,
+                           amount_cents,txn_date,method,bank_account_id,reference,notes,
+                           authorized_by_head_id,recorded_at_local)
+                           VALUES(?,'Advance',?,?,?,?,?,?,?,?)""",
+                        (advance_id, item["amount_cents"], advance_date, data["method"],
+                         bank_id, reference, f"{item['reason']}; batch {batch_ref}",
+                         authorizing_head_id, recorded_at),
+                    )
+                    if allocation_id:
+                        self.db.register_allocation_payment(
+                            allocation_id, payment_id, expense_id, item["amount_cents"],
+                            advance_date, authorizing_head_id)
+                    if item["repayment_plan"] == "Salary Deduction":
+                        cap_note = (f"; weekly cap {money(item['weekly_cap_cents'])}"
+                                    if item["weekly_cap_cents"] else
+                                    "; deduct up to available net pay")
+                        self.db.conn.execute(
+                            """INSERT INTO cash_advance_transactions(advance_id,txn_type,
+                               amount_cents,txn_date,method,reference,notes,
+                               authorized_by_head_id,posted,recorded_at_local)
+                               VALUES(?,'Salary Deduction',?,?,'Salary Deduction',?,?,?,0,?)""",
+                            (advance_id, item["amount_cents"], advance_date, reference,
+                             f"Scheduled in {batch_ref}{cap_note}", authorizing_head_id,
+                             recorded_at),
+                        )
+                self.db.conn.execute(
+                    """INSERT INTO audit_log(project_id,action,details,created_at)
+                       VALUES(?,'CASH_ADVANCE_BATCH_GRANTED',?,?)""",
+                    (self.project_id,
+                     f"{batch_ref}: {len(data['entries'])} advances totaling {money(total)} "
+                     f"from {source_name}; authorized by {head['name']}", recorded_at),
+                )
+            messagebox.showinfo(
+                APP_TITLE,
+                f"Cash-advance batch {batch_ref} committed.\n\n"
+                f"Employees: {len(data['entries'])}\nTotal: {money(total)}")
+            self.app.refresh_all(); self.lists.select(4)
+        except (ValueError, sqlite3.Error) as exc:
+            messagebox.showerror(APP_TITLE, str(exc), parent=self)
 
     def record_recovery(self):
         if not self.require_project():return
@@ -7069,8 +7912,8 @@ class PayrollTab(BaseTab):
             FROM cash_advances a JOIN employees e ON e.id=a.employee_id WHERE a.project_id=? AND a.voided=0 ORDER BY e.name,a.advance_date""",(self.project_id,))
         active=[r for r in rows if r["outstanding"]>0]
         if not active:messagebox.showinfo(APP_TITLE,"There are no outstanding employee advances.");return
-        advances={f"{r['employee']} â€” {r['advance_date']} â€” balance {money(r['outstanding'])} [#{r['id']}]":r for r in active}
-        banks={f"{b['bank_name']} â€” {b['account_name']} (â€¢â€¢{b['account_number'][-4:]})":b["id"] for b in self.db.all("SELECT * FROM bank_accounts WHERE active=1 ORDER BY bank_name,account_name")}
+        advances={f"{r['employee']} - {r['advance_date']} - balance {money(r['outstanding'])} [#{r['id']}]":r for r in active}
+        banks={f"{b['bank_name']} - {b['account_name']} (..{b['account_number'][-4:]})":b["id"] for b in self.db.all("SELECT * FROM bank_accounts WHERE active=1 ORDER BY bank_name,account_name")}
         win=CashAdvanceRecoveryDialog(self,advances,banks); self.wait_window(win)
         data=win.result
         if not data:return
@@ -7084,7 +7927,7 @@ class PayrollTab(BaseTab):
                 pending=self.db.one("""SELECT COALESCE(SUM(t.amount_cents),0) total FROM cash_advance_transactions t JOIN cash_advances a ON a.id=t.advance_id WHERE a.employee_id=? AND t.txn_type='Salary Deduction' AND t.posted=0 AND t.voided=0""",(advance["employee_id"],))["total"]
                 if amount>advance["outstanding"]-pending:raise ValueError(f"Salary deduction exceeds the unscheduled advance balance of {money(max(0,advance['outstanding']-pending))}.")
                 posted=0
-            head=self.app.authorize("Record cash-advance recovery",f"{advance['employee']} â€” {money(amount)} via {data['method']}")
+            head=self.app.authorize("Record cash-advance recovery",f"{advance['employee']} - {money(amount)} via {data['method']}")
             if not head:return
             with self.db.conn:
                 surrender_reference = (self.db._next_system_reference(
@@ -7159,11 +8002,18 @@ class PayrollTab(BaseTab):
                 r["closure_ref"] or "—",workflow))
         batches=self.db.all(f"""SELECT b.*,COUNT(a.id) attendance_count,COALESCE(h.name,'Legacy / not recorded') head FROM payroll_batches b LEFT JOIN attendance a ON a.payroll_batch_id=b.id LEFT JOIN project_heads h ON h.id=b.authorized_by_head_id WHERE 1=1{batch_project_filter} GROUP BY b.id ORDER BY b.created_at DESC,b.id DESC""",employee_params)
         for b in batches:self.batches.insert("","end",iid=b["id"],values=(b["batch_ref"],b["period_start"],b["period_end"],b["attendance_count"],money(b["gross_cents"]),money(b["deduction_cents"]),money(b["net_cents"]),b["head"],b["created_at"]))
-        advances=self.db.all(f"""SELECT a.*,e.name employee,COALESCE((SELECT SUM(t.amount_cents) FROM cash_advance_transactions t WHERE t.advance_id=a.id AND t.posted=1 AND t.voided=0 AND t.txn_type<>'Advance'),0) recovered FROM cash_advances a JOIN employees e ON e.id=a.employee_id WHERE a.voided=0{advance_project_filter} ORDER BY a.advance_date DESC,a.id DESC""",employee_params)
+        advances=self.db.all(f"""SELECT a.*,e.name employee,COALESCE(b.batch_ref,'Individual') batch_ref,
+            COALESCE((SELECT SUM(t.amount_cents) FROM cash_advance_transactions t WHERE t.advance_id=a.id AND t.posted=1 AND t.voided=0 AND t.txn_type<>'Advance'),0) recovered
+            FROM cash_advances a JOIN employees e ON e.id=a.employee_id
+            LEFT JOIN cash_advance_batches b ON b.id=a.batch_id
+            WHERE a.voided=0{advance_project_filter} ORDER BY a.advance_date DESC,a.id DESC""",employee_params)
         advanced=recovered_total=0
         for a in advances:
             net=max(0,a["original_cents"]-a["recovered"]); status="Settled" if net==0 else "Partially Recovered" if a["recovered"] else "Outstanding"; advanced+=a["original_cents"];recovered_total+=a["recovered"]
-            self.advances.insert("","end",iid=a["id"],values=(a["advance_date"],a["employee"],money(a["original_cents"]),money(a["recovered"]),money(net),a["method"],a["repayment_plan"],status,a["reason"]))
+            self.advances.insert("","end",iid=a["id"],values=(a["advance_date"],a["batch_ref"],
+                a["system_reference"] or f"CA-LEGACY-{a['id']:06d}",a["employee"],
+                money(a["original_cents"]),money(a["recovered"]),money(net),a["method"],
+                a["repayment_plan"],status,a["reason"]))
         txns=self.db.all(f"""SELECT t.*,a.original_cents,e.name employee,COALESCE(h.name,'Legacy / not recorded') head FROM cash_advance_transactions t JOIN cash_advances a ON a.id=t.advance_id JOIN employees e ON e.id=a.employee_id LEFT JOIN project_heads h ON h.id=t.authorized_by_head_id WHERE a.voided=0 AND t.voided=0{advance_project_filter} ORDER BY t.txn_date,t.id""",employee_params);balances={}
         for t in txns:
             balances.setdefault(t["advance_id"],0);balances[t["advance_id"]]+=t["amount_cents"] if t["txn_type"]=="Advance" else (-t["amount_cents"] if t["posted"] else 0)
