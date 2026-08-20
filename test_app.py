@@ -1,16 +1,55 @@
 import tempfile
 import unittest
 import sqlite3
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
 import app as app_module
 from app import (Database, PayrollTab, cents, hash_pin, money, resolve_db_path,
                  verify_pin, payroll_week_bounds, write_expense_ledger_pdf,
-                 write_simple_pdf)
+                 write_simple_pdf, read_expense_import_form,
+                 write_expense_import_form, write_expense_import_xlsx)
 
 
 class ContractorTrackerTests(unittest.TestCase):
+    def test_expense_import_form_round_trip_preserves_metadata_and_rows(self):
+        with tempfile.TemporaryDirectory() as folder:
+            form_path = Path(folder) / "expense-import.csv"
+            write_expense_import_form(form_path, "DRF-20260819-120000")
+            text = form_path.read_text(encoding="utf-8-sig")
+            text = text.replace("Declared Batch Total (required),\n", "Declared Batch Total (required),1250.00\n")
+            text = text.replace("Example: PROJECT OASIS", "PROJECT OASIS", 1)
+            form_path.write_text(text, encoding="utf-8-sig")
+            metadata, rows = read_expense_import_form(form_path)
+            self.assertEqual(metadata["draft_reference"], "DRF-20260819-120000")
+            self.assertEqual(metadata["declared_total"], "1250.00")
+            self.assertEqual(rows[0]["project"], "PROJECT OASIS")
+            self.assertEqual(rows[0]["item"], "Example item")
+            self.assertGreater(rows[0]["source_row"], 0)
+
+    def test_excel_expense_form_contains_dropdowns_and_google_sheets_reference_lists(self):
+        with tempfile.TemporaryDirectory() as folder:
+            form_path = Path(folder) / "expense-import.xlsx"
+            write_expense_import_xlsx(form_path, "DRF-20260819-130000", {
+                "projects": ["PROJECT OASIS [#1]"], "suppliers": ["Supplier One"],
+                "phases": ["Foundation"], "categories": ["MATERIALS"],
+                "statuses": ["Paid", "Partially Paid", "Unpaid"],
+                "methods": ["Cash", "Bank Transfer"], "banks": ["PBCOM - Main"],
+                "allocations": ["PC-20260819-0001 | Petty Cash | Head | 10,000.00 remaining"],
+            })
+            with zipfile.ZipFile(form_path) as archive:
+                sheet = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
+                workbook = archive.read("xl/workbook.xml").decode("utf-8")
+                references = archive.read("xl/worksheets/sheet2.xml").decode("utf-8")
+            self.assertIn("dataValidations", sheet)
+            self.assertIn("CashAllocationOptions", sheet)
+            self.assertIn('state="hidden"', workbook)
+            self.assertIn("PC-20260819-0001", references)
+            metadata, rows = read_expense_import_form(form_path)
+            self.assertEqual(metadata["draft_reference"], "DRF-20260819-130000")
+            self.assertEqual(rows, [])
+
     def test_upgrade_creates_both_legacy_and_v120_backups(self):
         with tempfile.TemporaryDirectory() as folder:
             database_path = Path(folder) / "legacy.db"

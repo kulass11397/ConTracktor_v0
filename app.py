@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import calendar
 import base64
+import csv
 import hashlib
+import io
 import os
+import re
 import secrets
 import shutil
 import sqlite3
@@ -17,6 +20,9 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import zipfile
+import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape as xml_escape
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -481,6 +487,408 @@ def valid_date(value: str, required: bool = False) -> str:
     except ValueError as exc:
         raise ValueError("Dates must use YYYY-MM-DD format.") from exc
     return value
+
+
+def flash_required_widgets(window, widgets, *, pulses: int = 3):
+    """Highlight required ttk input boxes without closing their form.
+
+    The original widget styles are restored after a short red pulse.  Keeping
+    this behavior in one helper makes validation consistent across dialogs.
+    """
+    widgets = [widget for widget in widgets if widget is not None and widget.winfo_exists()]
+    if not widgets:
+        try:
+            window.bell()
+        except tk.TclError:
+            pass
+        return
+    original = {}
+    for widget in widgets:
+        try:
+            original[widget] = widget.cget("style")
+            required_style = (
+                "Required.TCombobox" if isinstance(widget, ttk.Combobox)
+                else "Required.TEntry"
+            )
+            widget.configure(style=required_style)
+        except tk.TclError:
+            original[widget] = None
+
+    def pulse(step=0):
+        on = step % 2 == 0
+        for widget in widgets:
+            try:
+                widget.configure(style=(
+                    ("Required.TCombobox" if isinstance(widget, ttk.Combobox)
+                     else "Required.TEntry") if on else original.get(widget, "")
+                ))
+            except tk.TclError:
+                pass
+        if step < pulses * 2 - 1:
+            window.after(145, lambda: pulse(step + 1))
+        else:
+            for widget in widgets:
+                try:
+                    widget.configure(style=original.get(widget, ""))
+                except tk.TclError:
+                    pass
+
+    try:
+        widgets[0].focus_set()
+        window.bell()
+    except tk.TclError:
+        pass
+    pulse()
+
+
+def flash_missing_fields(window, variables, widgets, required):
+    """Flash empty required fields and return True when any are missing."""
+    missing = [key for key in required if not variables[key].get().strip()]
+    if missing:
+        flash_required_widgets(window, [widgets.get(key) for key in missing])
+        return True
+    return False
+
+
+def flash_invalid_standard_fields(window, variables, widgets):
+    """Validate common date and numeric fields without dismissing a form.
+
+    Form-specific business rules are still enforced by their callers.  This
+    catches malformed values at the reusable dialog layer so the user can
+    correct them in place instead of having to reopen the window.
+    """
+    date_keys = {
+        "date", "deadline", "start_date", "target_date", "expense_date",
+        "due_date", "payment_date", "txn_date", "advance_date",
+    }
+    money_keys = {
+        "amount", "contract_value", "unit_price", "rate", "daily_rate",
+        "initial_payment", "weekly_cap",
+    }
+    decimal_keys = {"qty", "quantity", "standard_hours"}
+    positive_keys = {"amount", "rate", "daily_rate", "standard_hours", "qty", "quantity"}
+    invalid = []
+    messages = []
+    for key, variable in variables.items():
+        value = variable.get().strip()
+        if not value:
+            continue
+        try:
+            if key in date_keys or key.endswith("_date"):
+                valid_date(value, True)
+            elif key in money_keys:
+                parsed = cents(value)
+                if key in positive_keys and parsed <= 0:
+                    raise ValueError(f"{key.replace('_', ' ').title()} must be greater than zero.")
+            elif key in decimal_keys:
+                parsed = qty_decimal(value)
+                if key in positive_keys and parsed <= 0:
+                    raise ValueError(f"{key.replace('_', ' ').title()} must be greater than zero.")
+        except ValueError as exc:
+            invalid.append(key)
+            messages.append(str(exc))
+    if invalid:
+        flash_required_widgets(window, [widgets.get(key) for key in invalid])
+        messagebox.showerror(APP_TITLE, messages[0], parent=window)
+        return True
+    return False
+
+
+EXPENSE_IMPORT_HEADERS = (
+    ("project", "Project*"),
+    ("item", "Item Name / Description*"),
+    ("dimensions", "Size / Dimensions*"),
+    ("supplier", "Supplier*"),
+    ("qty", "Quantity*"),
+    ("unit_price", "Unit Price*"),
+    ("phase", "Phase*"),
+    ("area", "Area / Category*"),
+    ("status", "Payment State*"),
+    ("initial_payment", "Paid Amount"),
+    ("payment_method", "Payment Method*"),
+    ("bank", "Bank for Transfer"),
+    ("cash_allocation", "Cash Allocation Reference"),
+    ("expense_date", "Expense Date*"),
+    ("notes", "Notes"),
+    ("source_reference", "Source Reference"),
+)
+
+
+def _normalized_import_header(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def write_expense_import_form(path, draft_reference):
+    """Write a Google-Sheets/Excel-ready CSV expense form."""
+    with Path(path).open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["CONTRACTOR EXPENSE BATCH IMPORT FORM"])
+        writer.writerow(["Draft Reference", draft_reference])
+        writer.writerow(["Declared Batch Total (required)", ""])
+        writer.writerow([
+            "Instructions",
+            "Fill every * field. Use one project per form. Do not change header names. "
+            "The complete form is rejected if any row is invalid or the declared total does not reconcile.",
+        ])
+        writer.writerow([])
+        writer.writerow([label for _key, label in EXPENSE_IMPORT_HEADERS])
+        writer.writerow([
+            "Example: PROJECT OASIS", "Example item", "N/A", "Example supplier", "1",
+            "0.00", "Example phase", "MATERIALS", "Unpaid", "0.00", "Cash", "", "",
+            date.today().isoformat(), "Delete this example row before import", "",
+        ])
+
+
+def _xlsx_inline_cell(reference, value, style=0):
+    value = xml_escape(str(value or ""))
+    style_attr = f' s="{style}"' if style else ""
+    return f'<c r="{reference}" t="inlineStr"{style_attr}><is><t>{value}</t></is></c>'
+
+
+def write_expense_import_xlsx(path, draft_reference, reference_lists):
+    """Create a dependency-free Excel workbook with database-backed dropdowns."""
+    headers = [label for _key, label in EXPENSE_IMPORT_HEADERS] + ["Calculated Row Total"]
+    column_letters = [chr(65 + index) for index in range(len(headers))]
+    rows = [
+        '<row r="1" ht="28">' + _xlsx_inline_cell("A1", "CONTRACTOR EXPENSE BATCH IMPORT FORM", 1) + '</row>',
+        '<row r="2">' + _xlsx_inline_cell("A2", "Draft Reference", 2)
+        + _xlsx_inline_cell("B2", draft_reference, 4) + '</row>',
+        '<row r="3">' + _xlsx_inline_cell("A3", "Declared Batch Total (required)", 2)
+        + '<c r="B3" s="5"/></row>',
+        '<row r="4" ht="34">' + _xlsx_inline_cell(
+            "A4",
+            "Fill every * field and use one project per workbook. The complete form is rejected when any row is invalid or the declared total does not match.",
+            4,
+        ) + '</row>',
+        '<row r="6" ht="32">' + ''.join(
+            _xlsx_inline_cell(f"{letter}6", header, 3)
+            for letter, header in zip(column_letters, headers)
+        ) + '</row>',
+    ]
+    for row_number in range(7, 507):
+        cells = []
+        for index, letter in enumerate(column_letters[:-1]):
+            style = 5 if index in {4, 5, 9} else 4
+            cells.append(_xlsx_inline_cell(f"{letter}{row_number}", "", style))
+        cells.append(
+            f'<c r="Q{row_number}" s="5"><f>IF(OR(E{row_number}="",F{row_number}=""),"",E{row_number}*F{row_number})</f></c>'
+        )
+        rows.append(f'<row r="{row_number}">' + ''.join(cells) + '</row>')
+
+    list_order = [
+        ("projects", "Projects"), ("suppliers", "Suppliers"), ("phases", "Phases"),
+        ("categories", "Categories"), ("statuses", "Payment States"),
+        ("methods", "Payment Methods"), ("banks", "Banks"),
+        ("allocations", "Cash Allocations"),
+    ]
+    reference_rows = []
+    max_length = max((len(reference_lists.get(key, [])) for key, _title in list_order), default=0)
+    reference_rows.append(
+        '<row r="1">' + ''.join(
+            _xlsx_inline_cell(f"{chr(65 + index)}1", title, 3)
+            for index, (_key, title) in enumerate(list_order)
+        ) + '</row>'
+    )
+    for offset in range(max_length):
+        row_number = offset + 2
+        cells = []
+        for index, (key, _title) in enumerate(list_order):
+            values = reference_lists.get(key, [])
+            if offset < len(values):
+                cells.append(_xlsx_inline_cell(f"{chr(65 + index)}{row_number}", values[offset]))
+        reference_rows.append(f'<row r="{row_number}">' + ''.join(cells) + '</row>')
+
+    validation_map = [
+        ("A7:A506", 0), ("D7:D506", 1), ("G7:G506", 2), ("H7:H506", 3),
+        ("I7:I506", 4), ("K7:K506", 5), ("L7:L506", 6), ("M7:M506", 7),
+    ]
+    range_names = (
+        "ProjectOptions", "SupplierOptions", "PhaseOptions", "CategoryOptions",
+        "PaymentStateOptions", "PaymentMethodOptions", "BankOptions", "CashAllocationOptions",
+    )
+    validations = []
+    for target, list_index in validation_map:
+        key, _title = list_order[list_index]
+        count = max(1, len(reference_lists.get(key, [])))
+        letter = chr(65 + list_index)
+        formula = range_names[list_index]
+        validations.append(
+            f'<dataValidation type="list" allowBlank="0" showErrorMessage="1" '
+            f'errorStyle="stop" errorTitle="Invalid selection" '
+            f'error="Choose a value from this workbook dropdown." sqref="{target}">'
+            f'<formula1>{formula}</formula1></dataValidation>'
+        )
+    validations.append(
+        '<dataValidation type="date" operator="between" allowBlank="0" showErrorMessage="1" '
+        'errorStyle="stop" errorTitle="Invalid date" error="Enter a valid expense date." sqref="N7:N506">'
+        '<formula1>DATE(2000,1,1)</formula1><formula2>DATE(2100,12,31)</formula2></dataValidation>'
+    )
+
+    sheet_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetViews><sheetView workbookViewId="0"><pane ySplit="6" topLeftCell="A7" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>
+<cols>{''.join(f'<col min="{i+1}" max="{i+1}" width="{width}" customWidth="1"/>' for i, width in enumerate([24,30,18,24,12,14,20,20,18,15,18,30,36,15,30,20,18]))}</cols>
+<sheetData>{''.join(rows)}</sheetData>
+<autoFilter ref="A6:Q506"/>
+<mergeCells count="2"><mergeCell ref="A1:Q1"/><mergeCell ref="A4:Q4"/></mergeCells>
+<dataValidations count="{len(validations)}">{''.join(validations)}</dataValidations>
+<pageMargins left="0.25" right="0.25" top="0.5" bottom="0.5" header="0.2" footer="0.2"/>
+</worksheet>'''
+    reference_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetData>{''.join(reference_rows)}</sheetData>
+</worksheet>'''
+    styles_xml = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<numFmts count="2"><numFmt numFmtId="164" formatCode="#,##0.00"/><numFmt numFmtId="165" formatCode="yyyy-mm-dd"/></numFmts>
+<fonts count="3"><font><sz val="10"/><name val="Segoe UI"/></font><font><b/><sz val="16"/><color rgb="FF0F1B2D"/><name val="Segoe UI"/></font><font><b/><sz val="10"/><color rgb="FFFFFFFF"/><name val="Segoe UI"/></font></fonts>
+<fills count="5"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF0F1B2D"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFFFF4CC"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFF8FAFC"/><bgColor indexed="64"/></patternFill></fill></fills>
+<borders count="2"><border/><border><left style="thin"><color rgb="FFCBD5E1"/></left><right style="thin"><color rgb="FFCBD5E1"/></right><top style="thin"><color rgb="FFCBD5E1"/></top><bottom style="thin"><color rgb="FFCBD5E1"/></bottom></border></borders>
+<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+<cellXfs count="6"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/><xf numFmtId="0" fontId="0" fillId="4" borderId="0" xfId="0"/><xf numFmtId="0" fontId="2" fillId="2" borderId="1" xfId="0" applyAlignment="1"><alignment wrapText="1" horizontal="center" vertical="center"/></xf><xf numFmtId="0" fontId="0" fillId="4" borderId="1" xfId="0" applyAlignment="1"><alignment wrapText="1" vertical="center"/></xf><xf numFmtId="164" fontId="0" fillId="3" borderId="1" xfId="0" applyNumberFormat="1"/></cellXfs>
+<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
+</styleSheet>'''
+    defined_names = ''.join(
+        f'<definedName name="{range_names[index]}">\'Reference Lists\'!${chr(65 + index)}$2:${chr(65 + index)}${max(1, len(reference_lists.get(key, []))) + 1}</definedName>'
+        for index, (key, _title) in enumerate(list_order)
+    )
+    workbook_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<bookViews><workbookView xWindow="0" yWindow="0" windowWidth="24000" windowHeight="14000"/></bookViews>
+<sheets><sheet name="Expense Form" sheetId="1" r:id="rId1"/><sheet name="Reference Lists" sheetId="2" state="hidden" r:id="rId2"/></sheets>
+<definedNames>{defined_names}</definedNames>
+<calcPr calcId="191029" calcMode="auto" fullCalcOnLoad="1" forceFullCalc="1"/>
+</workbook>'''
+    workbook_rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>
+<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>'''
+    root_rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>'''
+    content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+<Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+</Types>'''
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", root_rels)
+        archive.writestr("xl/workbook.xml", workbook_xml)
+        archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        archive.writestr("xl/styles.xml", styles_xml)
+        archive.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+        archive.writestr("xl/worksheets/sheet2.xml", reference_xml)
+
+
+def _xlsx_cell_value(cell, shared_strings):
+    namespace = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    cell_type = cell.attrib.get("t", "")
+    value = cell.find(namespace + "v")
+    if cell_type == "inlineStr":
+        return "".join(node.text or "" for node in cell.findall(".//" + namespace + "t"))
+    if value is None:
+        return ""
+    raw = value.text or ""
+    if cell_type == "s":
+        try:
+            return shared_strings[int(raw)]
+        except (ValueError, IndexError):
+            return raw
+    return raw
+
+
+def _read_xlsx_rows(path):
+    """Read displayed cell values from the first worksheet without dependencies."""
+    main_ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    rel_ns = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+    package_rel_ns = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+    with zipfile.ZipFile(path) as archive:
+        shared_strings = []
+        if "xl/sharedStrings.xml" in archive.namelist():
+            root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+            for item in root.findall(main_ns + "si"):
+                shared_strings.append("".join(node.text or "" for node in item.findall(".//" + main_ns + "t")))
+        workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+        first_sheet = workbook.find(".//" + main_ns + "sheet")
+        if first_sheet is None:
+            raise ValueError("The workbook has no worksheet.")
+        relation_id = first_sheet.attrib.get(rel_ns + "id")
+        relations = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+        target = None
+        for relation in relations.findall(package_rel_ns + "Relationship"):
+            if relation.attrib.get("Id") == relation_id:
+                target = relation.attrib.get("Target")
+                break
+        if not target:
+            raise ValueError("The first worksheet could not be read.")
+        sheet_path = target.lstrip("/")
+        if not sheet_path.startswith("xl/"):
+            sheet_path = "xl/" + sheet_path
+        sheet = ET.fromstring(archive.read(sheet_path))
+        rows = []
+        for row in sheet.findall(".//" + main_ns + "row"):
+            values = {}
+            for cell in row.findall(main_ns + "c"):
+                reference = cell.attrib.get("r", "A1")
+                letters = re.match(r"[A-Z]+", reference.upper()).group(0)
+                column = 0
+                for letter in letters:
+                    column = column * 26 + ord(letter) - 64
+                values[column - 1] = _xlsx_cell_value(cell, shared_strings)
+            width = max(values, default=-1) + 1
+            rows.append([values.get(index, "") for index in range(width)])
+        return rows
+
+
+def read_expense_import_form(path):
+    """Return draft metadata and populated expense rows from CSV or XLSX."""
+    suffix = Path(path).suffix.lower()
+    if suffix == ".csv":
+        with Path(path).open("r", newline="", encoding="utf-8-sig") as handle:
+            rows = list(csv.reader(handle))
+    elif suffix == ".xlsx":
+        try:
+            rows = _read_xlsx_rows(path)
+        except (KeyError, zipfile.BadZipFile, ET.ParseError) as exc:
+            raise ValueError("The selected XLSX file is damaged or is not a valid workbook.") from exc
+    else:
+        raise ValueError("Choose a .csv or .xlsx expense import form.")
+    metadata = {}
+    header_index = None
+    expected = {_normalized_import_header(label): key for key, label in EXPENSE_IMPORT_HEADERS}
+    column_keys = {}
+    for index, row in enumerate(rows):
+        if row:
+            first = _normalized_import_header(row[0])
+            if first == "draftreference" and len(row) > 1:
+                metadata["draft_reference"] = str(row[1]).strip()
+            elif first == "declaredbatchtotalrequired" and len(row) > 1:
+                metadata["declared_total"] = str(row[1]).strip()
+        normalized = [_normalized_import_header(value) for value in row]
+        matches = sum(value in expected for value in normalized)
+        if matches >= 8 and "itemnamedescription" in normalized:
+            header_index = index
+            column_keys = {col: expected[value] for col, value in enumerate(normalized) if value in expected}
+            break
+    if header_index is None:
+        raise ValueError("The form headers were not found. Generate a fresh import form and keep its headers unchanged.")
+    data_rows = []
+    for row_number, row in enumerate(rows[header_index + 1:], header_index + 2):
+        values = {key: (str(row[col]).strip() if col < len(row) else "") for col, key in column_keys.items()}
+        if any(values.values()):
+            values["source_row"] = row_number
+            data_rows.append(values)
+    metadata.setdefault("draft_reference", "")
+    metadata.setdefault("declared_total", "")
+    return metadata, data_rows
 
 
 def employee_daily_rate(employee) -> int:
@@ -2685,7 +3093,8 @@ def center_toplevel(window):
 
 
 class FormDialog(tk.Toplevel):
-    def __init__(self, parent, title: str, fields: list[tuple], initial: dict | None = None):
+    def __init__(self, parent, title: str, fields: list[tuple], initial: dict | None = None,
+                 required_keys=()):
         super().__init__(parent)
         self.title(title)
         two_columns = len(fields) >= 7
@@ -2693,6 +3102,7 @@ class FormDialog(tk.Toplevel):
         self.result = None
         self.vars = {}
         self.widgets = {}
+        self.required_keys = tuple(required_keys)
         initial = initial or {}
         body = ttk.Frame(self, padding=20)
         body.grid(sticky="nsew")
@@ -2704,7 +3114,8 @@ class FormDialog(tk.Toplevel):
             row = index // 2 if two_columns else index
             pair = index % 2 if two_columns else 0
             label_column, input_column = pair * 2, pair * 2 + 1
-            ttk.Label(body, text=label).grid(
+            display_label = label + (" *" if key in self.required_keys and not label.endswith("*") else "")
+            ttk.Label(body, text=display_label).grid(
                 row=row, column=label_column, sticky="w",
                 padx=((0 if pair == 0 else 18), 8), pady=6,
             )
@@ -2736,12 +3147,16 @@ class FormDialog(tk.Toplevel):
         self.focus_force()
 
     def save(self):
+        if flash_missing_fields(self, self.vars, self.widgets, self.required_keys):
+            return
+        if flash_invalid_standard_fields(self, self.vars, self.widgets):
+            return
         self.result = {key: var.get().strip() for key, var in self.vars.items()}
         self.destroy()
 
 
-def dialog(parent, title, fields, initial=None):
-    win = FormDialog(parent, title, fields, initial)
+def dialog(parent, title, fields, initial=None, required_keys=()):
+    win = FormDialog(parent, title, fields, initial, required_keys)
     parent.wait_window(win)
     return win.result
 
@@ -2754,15 +3169,16 @@ class HeadEditorDialog(tk.Toplevel):
         self.resizable(False, False)
         self.result = None
         self.vars = {key: tk.StringVar() for key in ("name", "position", "pin", "confirm")}
+        self.widgets = {}
         body = ttk.Frame(self, padding=20); body.pack(fill="both", expand=True)
         ttk.Label(body, text="Project head", style="DialogTitle.TLabel").grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
         labels = [("name", "Full name", False), ("position", "Position", False),
                   ("pin", "Private PIN", True), ("confirm", "Confirm PIN", True)]
         for row, (key, label, secret) in enumerate(labels, 1):
-            ttk.Label(body, text=label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=5)
-            ttk.Entry(body, textvariable=self.vars[key], show="*" if secret else "", width=34).grid(
-                row=row, column=1, pady=5)
+            ttk.Label(body, text=label + " *").grid(row=row, column=0, sticky="w", padx=(0, 12), pady=5)
+            widget = ttk.Entry(body, textvariable=self.vars[key], show="*" if secret else "", width=34)
+            widget.grid(row=row, column=1, pady=5); self.widgets[key] = widget
         ttk.Label(body, text="PINs are hashed and are never displayed again.", style="Muted.TLabel").grid(
             row=5, column=0, columnspan=2, sticky="w", pady=(6, 12))
         buttons = ttk.Frame(body); buttons.grid(row=6, column=0, columnspan=2, sticky="e")
@@ -2772,9 +3188,10 @@ class HeadEditorDialog(tk.Toplevel):
 
     def save(self):
         values = {key: var.get().strip() for key, var in self.vars.items()}
-        if not values["name"] or not values["position"]:
-            messagebox.showerror(APP_TITLE, "Name and position are required.", parent=self); return
+        if flash_missing_fields(self, self.vars, self.widgets, ("name", "position", "pin", "confirm")):
+            return
         if values["pin"] != values["confirm"]:
+            flash_required_widgets(self, [self.widgets["pin"], self.widgets["confirm"]])
             messagebox.showerror(APP_TITLE, "The PIN confirmation does not match.", parent=self); return
         try:
             hash_pin(values["pin"])
@@ -2798,6 +3215,7 @@ class ProjectHeadEditDialog(tk.Toplevel):
             "new_pin": tk.StringVar(),
             "confirm_pin": tk.StringVar(),
         }
+        self.widgets = {}
         body = ttk.Frame(self, padding=22); body.pack(fill="both", expand=True)
         ttk.Label(body, text="Edit project head", style="DialogTitle.TLabel").grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
@@ -2812,9 +3230,11 @@ class ProjectHeadEditDialog(tk.Toplevel):
             ("confirm_pin", "Confirm new PIN", True),
         )
         for row, (key, label, secret) in enumerate(fields, 2):
-            ttk.Label(body, text=label).grid(row=row, column=0, sticky="w", padx=(0, 14), pady=5)
-            ttk.Entry(body, textvariable=self.vars[key], show="*" if secret else "", width=36).grid(
-                row=row, column=1, sticky="ew", pady=5)
+            required = key in {"name", "position", "current_pin"}
+            ttk.Label(body, text=label + (" *" if required else "")).grid(
+                row=row, column=0, sticky="w", padx=(0, 14), pady=5)
+            widget = ttk.Entry(body, textvariable=self.vars[key], show="*" if secret else "", width=36)
+            widget.grid(row=row, column=1, sticky="ew", pady=5); self.widgets[key] = widget
         buttons = ttk.Frame(body); buttons.grid(row=7, column=0, columnspan=2, sticky="e", pady=(14, 0))
         ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="right")
         ttk.Button(buttons, text="Save Changes", style="Primary.TButton",
@@ -2823,11 +3243,10 @@ class ProjectHeadEditDialog(tk.Toplevel):
 
     def save(self):
         values = {key: var.get().strip() for key, var in self.vars.items()}
-        if not values["name"] or not values["position"] or not values["current_pin"]:
-            messagebox.showerror(
-                APP_TITLE, "Name, position and current PIN are required.", parent=self)
+        if flash_missing_fields(self, self.vars, self.widgets, ("name", "position", "current_pin")):
             return
         if values["new_pin"] != values["confirm_pin"]:
+            flash_required_widgets(self, [self.widgets["new_pin"], self.widgets["confirm_pin"]])
             messagebox.showerror(APP_TITLE, "The new PIN confirmation does not match.", parent=self)
             return
         if values["new_pin"]:
@@ -2894,6 +3313,7 @@ class HeadRegistryDialog(tk.Toplevel):
         values = dialog(
             self, "Add Project Head",
             [("name", "Full name"), ("position", "Position")],
+            required_keys=("name", "position"),
         )
         if not values:
             return
@@ -3084,6 +3504,7 @@ class ProjectDialog(tk.Toplevel):
         self.registry_lookup = {}
         self.vars = {key: tk.StringVar() for key in
                      ("name", "client", "contract_value", "start_date", "target_date", "address", "notes")}
+        self.widgets = {}
         self.vars["start_date"].set(date.today().isoformat())
         body = ttk.Frame(self, padding=22); body.pack(fill="both", expand=True)
         ttk.Label(body, text="Create a new project", style="DialogTitle.TLabel").pack(anchor="w")
@@ -3097,9 +3518,10 @@ class ProjectDialog(tk.Toplevel):
         for index, (key, label) in enumerate(specs):
             row, col = divmod(index, 2)
             cell = ttk.Frame(fields); cell.grid(row=row, column=col, sticky="ew", padx=(0 if col == 0 else 8, 8 if col == 0 else 0), pady=5)
-            ttk.Label(cell, text=label).pack(anchor="w")
+            ttk.Label(cell, text=label + (" *" if key == "name" else "")).pack(anchor="w")
             entry_frame = ttk.Frame(cell); entry_frame.pack(fill="x", pady=(3, 0))
-            ttk.Entry(entry_frame, textvariable=self.vars[key]).pack(side="left", fill="x", expand=True)
+            widget = ttk.Entry(entry_frame, textvariable=self.vars[key])
+            widget.pack(side="left", fill="x", expand=True); self.widgets[key] = widget
             if key in {"start_date", "target_date"}:
                 ttk.Button(entry_frame, text="📅", width=3, command=lambda current=self.vars[key]: self.open_date_picker(current)).pack(side="right", padx=(6, 0))
         fields.columnconfigure(0, weight=1); fields.columnconfigure(1, weight=1)
@@ -3170,12 +3592,18 @@ class ProjectDialog(tk.Toplevel):
 
     def save(self):
         values = {key: var.get().strip() for key, var in self.vars.items()}
+        if flash_missing_fields(self, self.vars, self.widgets, ("name",)):
+            return
         try:
-            if not values["name"]: raise ValueError("Project name is required.")
             cents(values["contract_value"])
             valid_date(values["start_date"]); valid_date(values["target_date"])
             if not self.head_ids: raise ValueError("Select at least one registered project head.")
         except ValueError as exc:
+            message = str(exc).lower()
+            if "date" in message:
+                flash_required_widgets(self, [self.widgets["start_date"], self.widgets["target_date"]])
+            elif "number" in message or "amount" in message:
+                flash_required_widgets(self, [self.widgets["contract_value"]])
             messagebox.showerror(APP_TITLE, str(exc), parent=self); return
         values["head_ids"] = list(self.head_ids); self.result = values; self.destroy()
 
@@ -4149,7 +4577,7 @@ class ProjectsTab(BaseTab):
         row = self.db.one("SELECT * FROM projects WHERE id=?", (self.project_id,))
         initial = dict(row)
         initial["contract_value"] = money(row["contract_value_cents"])
-        data = dialog(self, "Edit Project", self.FIELDS, initial)
+        data = dialog(self, "Edit Project", self.FIELDS, initial, required_keys=("name",))
         if not data:
             return
         try:
@@ -4277,7 +4705,7 @@ class ProgressTab(BaseTab):
     def add_phase(self):
         if not self.require_project():
             return
-        data = dialog(self, "Add Phase", [("name", "Phase name")])
+        data = dialog(self, "Add Phase", [("name", "Phase name")], required_keys=("name",))
         if data and data["name"]:
             order = self.db.one("SELECT COALESCE(MAX(sort_order),0)+1 n FROM phases WHERE project_id=?",
                                 (self.project_id,))["n"]
@@ -4303,7 +4731,7 @@ class ProgressTab(BaseTab):
         return dialog(self, "Task", [
             ("phase", "Phase", phases), ("milestone", "Milestone"),
             ("name", "Task"), ("deadline", "Deadline (YYYY-MM-DD)"),
-        ], initial)
+        ], initial, required_keys=("phase", "name"))
 
     def add_task(self):
         if not self.require_project():
@@ -4425,7 +4853,10 @@ class LegacyExpensesTab(BaseTab):
         fields = []
         for spec in self.BASE_FIELDS:
             fields.append((spec[0], spec[1], [""] + list(self.phase_map())) if spec[0] == "phase" else spec)
-        return dialog(self, "Expense", fields, initial)
+        return dialog(
+            self, "Expense", fields, initial,
+            required_keys=("name", "qty", "unit_price", "expense_date"),
+        )
 
     def save_values(self, data, expense_id=None, authorized_head_id=None):
         if not data["name"]:
@@ -4511,7 +4942,8 @@ class LegacyExpensesTab(BaseTab):
             ("payment_date", "Payment date (YYYY-MM-DD)"),
             ("method", "Method", ["Cash", "Bank Transfer", "Check", "Card", "Other"]),
             ("reference", "Reference"), ("notes", "Notes"),
-        ], {"amount": money(balance), "payment_date": date.today().isoformat()})
+        ], {"amount": money(balance), "payment_date": date.today().isoformat()},
+           required_keys=("amount", "payment_date", "method"))
         if data:
             try:
                 amount = cents(data["amount"])
@@ -4576,12 +5008,90 @@ class LegacyExpensesTab(BaseTab):
         )
 
 
+class ExpenseImportReviewDialog(tk.Toplevel):
+    """Review a complete import form; invalid rows are never silently skipped."""
+    def __init__(self, parent, filename, metadata, reviews):
+        super().__init__(parent)
+        self.title("Review Expense Import")
+        self.geometry("1000x620")
+        self.minsize(820, 500)
+        self.result = False
+        self.reviews = reviews
+        body = ttk.Frame(self, padding=18); body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Review expense import", style="DialogTitle.TLabel").pack(anchor="w")
+        ttk.Label(
+            body,
+            text=f"{Path(filename).name}  |  Draft {metadata.get('draft_reference') or 'not supplied'}",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(2, 10))
+        valid = [review for review in reviews if review.get("item")]
+        invalid = [review for review in reviews if not review.get("item")]
+        calculated = sum(review["item"]["total_cents"] for review in valid)
+        try:
+            declared = cents(metadata.get("declared_total", ""))
+            declared_error = "" if metadata.get("declared_total", "").strip() else "Enter the declared batch total in the form."
+        except ValueError:
+            declared, declared_error = 0, "The declared batch total is not a valid amount."
+        reconciled = not declared_error and declared == calculated
+        summary_color = GREEN if not invalid and reconciled and reviews else RED
+        self.summary = ttk.Label(
+            body,
+            text=(f"Rows: {len(reviews)}  |  Ready: {len(valid)}  |  Needs correction: {len(invalid)}  |  "
+                  f"Declared: {money(declared)}  |  Calculated: {money(calculated)}"),
+            foreground=summary_color, style="Section.TLabel",
+        )
+        self.summary.pack(anchor="w", pady=(0, 8))
+        if declared_error or (not reconciled and not declared_error):
+            message = declared_error or (
+                f"Declared total differs from the valid-row total by {money(abs(declared - calculated))}."
+            )
+            ttk.Label(body, text=message, foreground=RED).pack(anchor="w", pady=(0, 8))
+        columns = [
+            ("row", "Source row", 78), ("project", "Project", 145),
+            ("item", "Item / description", 220), ("total", "Total", 95),
+            ("status", "Review status", 115), ("message", "Validation message", 310),
+        ]
+        tree = make_tree(body, columns)
+        for index, review in enumerate(reviews):
+            item = review.get("item")
+            source = review.get("source", {})
+            tree.insert("", "end", iid=str(index), values=(
+                source.get("source_row", ""),
+                item["project_name"] if item else source.get("project", ""),
+                item["item"] if item else source.get("item", ""),
+                money(item["total_cents"]) if item else "—",
+                "Ready" if item else "Needs correction",
+                review.get("error", "Ready to stage"),
+            ), tags=("ready" if item else "invalid",))
+        tree.tag_configure("ready", foreground="#047857")
+        tree.tag_configure("invalid", foreground="#B91C1C", background="#FEF2F2")
+        footer = ttk.Frame(body); footer.pack(fill="x", pady=(12, 0))
+        ttk.Label(
+            footer,
+            text="No row is imported unless the complete form passes review.",
+            style="Muted.TLabel",
+        ).pack(side="left")
+        ttk.Button(footer, text="Cancel", command=self.destroy).pack(side="right")
+        stage = ttk.Button(
+            footer, text="Stage Complete Form", style="Primary.TButton", command=self.accept,
+        )
+        stage.pack(side="right", padx=(0, 8))
+        if invalid or not reconciled or not reviews:
+            stage.configure(state="disabled")
+        self.transient(parent); self.grab_set(); self.bind("<Escape>", lambda _e: self.destroy())
+
+    def accept(self):
+        self.result = True
+        self.destroy()
+
+
 class BulkExpenseDialog(tk.Toplevel):
     """Stages multiple expense items before project-head authorization."""
     def __init__(self, parent, db, initial_project_id=None):
         super().__init__(parent)
         self.title("Bulk Expense Entry"); self.geometry("1120x720"); self.minsize(980, 650)
         self.db, self.result, self.items = db, None, []
+        self.import_metadata = {}
         projects = db.all("SELECT id,name FROM projects ORDER BY name")
         self.projects = {f"{row['name']} [#{row['id']}]": row["id"] for row in projects}
         self.context_project_id = initial_project_id or (projects[0]["id"] if projects else None)
@@ -4613,14 +5123,14 @@ class BulkExpenseDialog(tk.Toplevel):
         self.budget_label = ttk.Label(funding, style="Muted.TLabel")
         self.budget_label.pack(anchor="e")
         form = ttk.Frame(body); form.pack(fill="x", pady=(12, 8))
-        specs = [("project", "Project"), ("item", "Item name / description"),
-                 ("dimensions", "Size / dimensions"), ("supplier", "Supplier"), ("qty", "Quantity"),
-                 ("unit", "Unit"), ("unit_price", "Unit price"), ("phase", "Phase"),
-                 ("area", "Area / category"), ("status", "Payment state"),
+        specs = [("project", "Project *"), ("item", "Item name / description *"),
+                 ("dimensions", "Size / dimensions *"), ("supplier", "Supplier *"), ("qty", "Quantity *"),
+                 ("unit_price", "Unit price *"), ("phase", "Phase *"),
+                 ("area", "Area / category *"), ("status", "Payment state *"),
                  ("initial_payment", "Paid amount if Partially Paid"),
-                 ("payment_method", "Payment method"), ("bank", "Bank for transfer"),
+                 ("payment_method", "Payment method *"), ("bank", "Bank for transfer"),
                  ("cash_allocation", "Cash allocation reference"),
-                 ("expense_date", "Expense date"), ("notes", "Notes (optional)")]
+                 ("expense_date", "Expense date *"), ("notes", "Notes (optional)")]
         self.widgets = {}
         for index, (key, label) in enumerate(specs):
             row, col = divmod(index, 4)
@@ -4660,6 +5170,8 @@ class BulkExpenseDialog(tk.Toplevel):
         actions = ttk.Frame(body); actions.pack(fill="x", pady=(4, 6))
         ttk.Button(actions, text="+ Add Expense Item", style="Primary.TButton", command=self.add_item).pack(side="left")
         ttk.Button(actions, text="Remove Selected", style="Secondary.TButton", command=self.remove_item).pack(side="left", padx=6)
+        ttk.Button(actions, text="Create Import Form", command=self.create_import_form).pack(side="left", padx=(2, 6))
+        ttk.Button(actions, text="Import Filled Form", command=self.import_filled_form).pack(side="left", padx=(0, 6))
         self.count_label = ttk.Label(actions, text="0 items", style="Muted.TLabel")
         self.count_label.pack(side="left")
         self.commit_button = ttk.Button(
@@ -4767,8 +5279,11 @@ class BulkExpenseDialog(tk.Toplevel):
     def supplier_selected(self, _event=None):
         if self.vars["supplier"].get() != "+ Add Supplier...": return
         project_id = self.current_project_id()
-        data = dialog(self, "Add Supplier", [("company", "Company name"),
-            ("contact", "Contact person"), ("phone", "Contact number")]) if project_id else None
+        data = dialog(
+            self, "Add Supplier", [("company", "Company name"),
+            ("contact", "Contact person"), ("phone", "Contact number")],
+            required_keys=("company", "contact", "phone"),
+        ) if project_id else None
         if not data or not data["company"]:
             self.vars["supplier"].set(""); return
         self.db.execute("""INSERT INTO contacts(project_id,name,role,company,phone,email,address,notes)
@@ -4790,88 +5305,252 @@ class BulkExpenseDialog(tk.Toplevel):
         self.db.execute("INSERT OR IGNORE INTO expense_categories(name) VALUES(?)", (value,))
         self.refresh_categories(); self.vars["area"].set(value)
 
-    def add_item(self):
+    def _project_label(self, value):
+        wanted = str(value or "").strip().casefold()
+        for label in self.projects:
+            if wanted in {label.casefold(), label.split(" [#")[0].casefold()}:
+                return label
+        return ""
+
+    @staticmethod
+    def _excel_date_text(value):
+        value = str(value or "").strip()
+        if re.fullmatch(r"\d+(?:\.0+)?", value):
+            serial = int(float(value))
+            if 20000 <= serial <= 80000:
+                return (date(1899, 12, 30) + timedelta(days=serial)).isoformat()
+        return value
+
+    def _build_item(self, values, staged_items):
+        values = {key: str(value or "").strip() for key, value in values.items()}
+        if not self.db.one("SELECT 1 FROM bank_accounts WHERE active=1 LIMIT 1"):
+            raise ValueError("Enroll a bank account in Remittances before adding expenses.")
+        project_label = self._project_label(values.get("project"))
+        project_id = self.projects.get(project_label)
+        if not project_id:
+            raise ValueError("Project does not match an existing project.")
+        _deposited, _paid, remaining = self.db.project_budget(project_id)
+        if remaining <= 0:
+            raise ValueError("This project has no remaining deposited budget.")
+        quantity = qty_decimal(values.get("qty", ""))
+        unit_price = cents(values.get("unit_price", ""))
+        if quantity <= 0 or unit_price < 0:
+            raise ValueError("Quantity must be positive and price cannot be negative.")
+        total = int((quantity * unit_price).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+        phases = {row["name"].casefold(): row["name"] for row in self.db.all(
+            "SELECT name FROM phases WHERE project_id=? ORDER BY sort_order,id", (project_id,)
+        )}
+        phase = phases.get(values.get("phase", "").casefold())
+        if not phase:
+            raise ValueError("Phase does not match a phase for the selected project.")
+        categories = {row["name"].casefold(): row["name"] for row in self.db.all(
+            "SELECT name FROM expense_categories ORDER BY name COLLATE NOCASE"
+        )}
+        area = categories.get(values.get("area", "").casefold())
+        if not area:
+            raise ValueError("Area / category does not match an existing category.")
+        suppliers = {
+            row["supplier"].casefold(): row["supplier"] for row in self.db.all(
+                """SELECT DISTINCT CASE WHEN TRIM(company)<>'' THEN company ELSE name END supplier
+                   FROM contacts WHERE LOWER(role)='supplier' ORDER BY supplier COLLATE NOCASE"""
+            ) if row["supplier"]
+        }
+        supplier = suppliers.get(values.get("supplier", "").casefold())
+        if not supplier:
+            raise ValueError("Supplier does not match an existing supplier. Add it in Contacts first.")
+        status_lookup = {
+            "paid": "Paid", "partially paid": "Partially Paid", "partial": "Partially Paid",
+            "unpaid": "Unpaid",
+        }
+        status = status_lookup.get(values.get("status", "").casefold())
+        if not status:
+            raise ValueError("Payment State must be Paid, Partially Paid, or Unpaid.")
+        entered_initial = cents(values.get("initial_payment", ""))
+        if status == "Paid":
+            payment_amount = total
+        elif status == "Partially Paid":
+            payment_amount = entered_initial
+            if payment_amount <= 0 or payment_amount >= total:
+                raise ValueError("Partially Paid requires a paid amount above zero and below the row total.")
+        else:
+            payment_amount = 0
+            if entered_initial:
+                raise ValueError("Paid Amount must be blank or zero for an Unpaid item.")
+        payment_method_lookup = {"cash": "Cash", "bank transfer": "Bank Transfer", "bank": "Bank Transfer"}
+        payment_method = payment_method_lookup.get(values.get("payment_method", "").casefold())
+        if not payment_method:
+            raise ValueError("Payment Method must be Cash or Bank Transfer.")
+        bank_account_id = None
+        cash_allocation_id = None
+        if payment_amount > 0 and "bank" in payment_method.lower():
+            wanted_bank = values.get("bank", "").casefold()
+            bank_label = next((label for label in self.banks if label.casefold() == wanted_bank), "")
+            if not bank_label:
+                raise ValueError("Select an exact enrolled bank label for the transfer.")
+            bank_account_id = self.banks[bank_label]
+        elif payment_amount > 0:
+            allocation_options = self.db.active_allocation_options(project_id)
+            wanted_allocation = values.get("cash_allocation", "").casefold()
+            allocation_label = next(
+                (label for label in allocation_options
+                 if label.casefold() == wanted_allocation or label.split(" | ", 1)[0].casefold() == wanted_allocation),
+                "",
+            )
+            if not allocation_label:
+                raise ValueError("Select an active Petty Cash or Direct Procurement reference for paid cash.")
+            values["cash_allocation"] = allocation_label
+            cash_allocation_id = allocation_options[allocation_label]
+        _commit_deposit, _committed, commitment_remaining = self.db.project_commitment_budget(project_id)
+        staged_commitments = sum(x["total_cents"] for x in staged_items if x["project_id"] == project_id)
+        if staged_commitments + total > commitment_remaining:
+            raise ValueError("This row would exceed the project's uncommitted deposited budget.")
+        staged_payments = sum(x["payment_amount_cents"] for x in staged_items if x["project_id"] == project_id)
+        if staged_payments + payment_amount > remaining:
+            raise ValueError("Staged payments exceed this project's remaining deposited budget.")
+        if payment_amount > 0 and bank_account_id:
+            staged_bank = sum(x["payment_amount_cents"] for x in staged_items
+                              if x.get("bank_account_id") == bank_account_id)
+            if staged_bank + payment_amount > self.db.bank_balance(bank_account_id):
+                raise ValueError("Staged transfers exceed the selected bank balance.")
+        elif payment_amount > 0:
+            self.db.validate_cash_allocation_payment(project_id, cash_allocation_id, payment_amount)
+            staged_allocation = sum(x["payment_amount_cents"] for x in staged_items
+                                    if x.get("cash_allocation_id") == cash_allocation_id)
+            if staged_allocation + payment_amount > self.db.allocation_balance(cash_allocation_id):
+                raise ValueError("Staged cash payments exceed the selected allocation balance.")
+        expense_date = self._excel_date_text(values.get("expense_date", ""))
+        valid_date(expense_date, True)
+        source_reference = values.get("source_reference", "")
+        item = dict(values)
+        item.update(
+            name=values["item"], item=values["item"], project=project_label,
+            project_id=project_id, project_name=project_label.split(" [#")[0],
+            dimensions=values["dimensions"], supplier=supplier, qty=str(quantity), unit="item",
+            unit_price_cents=unit_price, total_cents=total, phase=phase, area=area,
+            trade="", status=status, initial_payment=values.get("initial_payment", ""),
+            payment_amount_cents=payment_amount, payment_method=payment_method,
+            bank_account_id=bank_account_id, cash_allocation_id=cash_allocation_id,
+            expense_date=expense_date, due_date="", invoice_no=source_reference,
+            notes=values.get("notes", ""),
+        )
+        return item
+
+    def create_import_form(self):
+        draft_reference = "DRF-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+        suggested = f"ConTracktor_Expense_Import_{draft_reference}.xlsx"
+        path = filedialog.asksaveasfilename(
+            parent=self, title="Create Expense Import Form", initialfile=suggested,
+            defaultextension=".xlsx", filetypes=[("Excel / Google Sheets form", "*.xlsx")],
+        )
+        if not path:
+            return
         try:
-            if not self.db.one("SELECT 1 FROM bank_accounts WHERE active=1 LIMIT 1"):
-                raise ValueError("Enroll a bank account in Remittances before adding expenses.")
-            project_id = self.current_project_id()
-            if not project_id: raise ValueError("Select a project.")
-            _deposited, _paid, remaining = self.db.project_budget(project_id)
-            if remaining <= 0: raise ValueError("This project has no remaining deposited budget.")
-            required = {
-                "item": "Item name / description", "dimensions": "Size / dimensions",
-                "supplier": "Supplier", "qty": "Quantity", "unit": "Unit",
-                "unit_price": "Unit price", "phase": "Phase", "area": "Area / category",
-                "status": "Payment state", "expense_date": "Expense date",
+            suppliers = [row["supplier"] for row in self.db.all(
+                """SELECT DISTINCT CASE WHEN TRIM(company)<>'' THEN company ELSE name END supplier
+                   FROM contacts WHERE LOWER(role)='supplier' ORDER BY supplier COLLATE NOCASE"""
+            ) if row["supplier"]]
+            phases = [row["name"] for row in self.db.all(
+                "SELECT DISTINCT name FROM phases ORDER BY name COLLATE NOCASE"
+            ) if row["name"]]
+            categories = [row["name"] for row in self.db.all(
+                "SELECT name FROM expense_categories ORDER BY name COLLATE NOCASE"
+            )]
+            allocations = list(self.db.active_allocation_options(None))
+            reference_lists = {
+                "projects": list(self.projects), "suppliers": suppliers, "phases": phases,
+                "categories": categories, "statuses": ["Paid", "Partially Paid", "Unpaid"],
+                "methods": ["Cash", "Bank Transfer"], "banks": list(self.banks),
+                "allocations": allocations,
             }
-            missing = [label for key, label in required.items() if not self.vars[key].get().strip()]
-            if missing:
-                raise ValueError("Required field(s): " + ", ".join(missing) + ".")
-            quantity = qty_decimal(self.vars["qty"].get()); unit_price = cents(self.vars["unit_price"].get())
-            if quantity <= 0 or unit_price < 0: raise ValueError("Quantity must be positive and price cannot be negative.")
-            total = int((quantity * unit_price).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
-            _commit_deposit, _committed, commitment_remaining = self.db.project_commitment_budget(project_id)
-            staged_commitments = sum(
-                x["total_cents"] for x in self.items if x["project_id"] == project_id
+            write_expense_import_xlsx(path, draft_reference, reference_lists)
+            messagebox.showinfo(
+                APP_TITLE,
+                "The dropdown-enabled form was created. Open it in Excel or upload it to Google Sheets. "
+                "After completing it, download it as Microsoft Excel (.xlsx) and import that file here.\n\n"
+                "Dropdowns are a snapshot of current local records; generate a fresh form whenever "
+                "projects, suppliers, banks, petty cash, or direct-procurement references change.",
+                parent=self,
             )
-            if staged_commitments + total > commitment_remaining:
-                raise ValueError("This expense would exceed the project's uncommitted deposited budget.")
-            status = self.vars["status"].get() or "Unpaid"
-            entered_initial = cents(self.vars["initial_payment"].get())
-            if status == "Paid":
-                payment_amount = total
-            elif status == "Partially Paid":
-                payment_amount = entered_initial
-                if payment_amount <= 0 or payment_amount >= total:
-                    raise ValueError("A Partially Paid item requires an initial payment greater than zero and below its total.")
-            else:
-                payment_amount = 0
-                if entered_initial:
-                    raise ValueError("Choose Partially Paid when an initial partial payment is entered.")
-            staged_payments = sum(
-                x["payment_amount_cents"] for x in self.items if x["project_id"] == project_id
+        except OSError as exc:
+            messagebox.showerror(APP_TITLE, f"The import form could not be saved:\n{exc}", parent=self)
+
+    def import_filled_form(self):
+        if self.items:
+            messagebox.showinfo(
+                APP_TITLE,
+                "Commit or remove the currently staged items before importing a filled form.",
+                parent=self,
             )
-            if staged_payments + payment_amount > remaining:
-                raise ValueError("Staged payments exceed this project's remaining deposited budget.")
-            payment_method = self.vars["payment_method"].get() or "Cash"
-            if payment_amount > 0 and not self.vars["payment_method"].get().strip():
-                raise ValueError("Select Cash or Bank Transfer for the amount being paid.")
-            bank_account_id = (
-                self.banks.get(self.vars["bank"].get())
-                if payment_amount > 0 and "bank" in payment_method.lower() else None
+            return
+        path = filedialog.askopenfilename(
+            parent=self, title="Import Filled Expense Form",
+            filetypes=[("Expense forms", "*.csv *.xlsx"), ("CSV", "*.csv"), ("Excel workbook", "*.xlsx")],
+        )
+        if not path:
+            return
+        try:
+            metadata, rows = read_expense_import_form(path)
+            reviews, staged = [], []
+            project_ids = set()
+            required = (
+                "project", "item", "dimensions", "supplier", "qty", "unit_price",
+                "phase", "area", "status", "payment_method", "expense_date",
             )
-            cash_allocation_id = (
-                self.allocation_options.get(self.vars["cash_allocation"].get())
-                if "bank" not in payment_method.lower() else None
-            )
-            if payment_amount > 0:
-                if "bank" in payment_method.lower():
-                    if not bank_account_id:
-                        raise ValueError("Select the bank account used for this payment.")
-                    staged_bank = sum(x["payment_amount_cents"] for x in self.items
-                        if x["payment_amount_cents"] > 0 and x.get("bank_account_id") == bank_account_id)
-                    if staged_bank + payment_amount > self.db.bank_balance(bank_account_id):
-                        raise ValueError("Staged bank-transfer payments exceed the selected bank balance.")
-                else:
-                    self.db.validate_cash_allocation_payment(project_id, cash_allocation_id, payment_amount)
-                    staged_allocation = sum(x["payment_amount_cents"] for x in self.items
-                        if x["payment_amount_cents"] > 0 and x.get("cash_allocation_id") == cash_allocation_id)
-                    if staged_allocation + payment_amount > self.db.allocation_balance(cash_allocation_id):
-                        raise ValueError("Staged cash payments exceed the selected cash allocation balance.")
-            item = {key: var.get().strip() for key, var in self.vars.items()}
-            item["name"] = item["item"]
-            item["trade"] = ""
-            item["due_date"] = ""
-            item["invoice_no"] = ""
-            item.update(project_id=project_id, project_name=self.vars["project"].get().split(" [#")[0],
-                        qty=str(quantity), unit_price_cents=unit_price, total_cents=total, status=status,
-                        payment_amount_cents=payment_amount,
-                        payment_method=payment_method, bank_account_id=bank_account_id,
-                        cash_allocation_id=cash_allocation_id)
-            valid_date(item["expense_date"], True); valid_date(item["due_date"])
+            for source in rows:
+                missing = [dict(EXPENSE_IMPORT_HEADERS)[key].rstrip("*") for key in required
+                           if not source.get(key, "").strip()]
+                if missing:
+                    reviews.append({
+                        "source": source, "item": None,
+                        "error": "Missing required field(s): " + ", ".join(missing),
+                    })
+                    continue
+                try:
+                    item = self._build_item(source, staged)
+                    item["import_draft_reference"] = metadata.get("draft_reference", "")
+                    item["import_source_file"] = Path(path).name
+                    item["import_source_row"] = source.get("source_row", "")
+                    staged.append(item); project_ids.add(item["project_id"])
+                    reviews.append({"source": source, "item": item, "error": ""})
+                except ValueError as exc:
+                    reviews.append({"source": source, "item": None, "error": str(exc)})
+            if len(project_ids) > 1:
+                reviews = [
+                    {**review, "item": None,
+                     "error": "Use one project per import form so it produces one auditable batch reference."}
+                    for review in reviews
+                ]
+            review_window = ExpenseImportReviewDialog(self, path, metadata, reviews)
+            self.wait_window(review_window)
+            if not review_window.result:
+                return
+            self.items = staged
+            self.import_metadata = {
+                "draft_reference": metadata.get("draft_reference", ""),
+                "source_file": Path(path).name,
+            }
+            if staged:
+                label = next(label for label, project_id in self.projects.items()
+                             if project_id == staged[0]["project_id"])
+                self.vars["project"].set(label)
+                self.widgets["project"].configure(state="disabled")
+            self.redraw_items()
+        except (OSError, ValueError) as exc:
+            messagebox.showerror(APP_TITLE, str(exc), parent=self)
+
+    def add_item(self):
+        required = (
+            "project", "item", "dimensions", "supplier", "qty", "unit_price",
+            "phase", "area", "status", "payment_method", "expense_date",
+        )
+        if flash_missing_fields(self, self.vars, self.widgets, required):
+            return
+        try:
+            values = {key: var.get().strip() for key, var in self.vars.items()}
+            item = self._build_item(values, self.items)
             self.items.append(item); self.redraw_items()
             self.widgets["project"].configure(state="disabled")
-            for key in ("name", "item", "dimensions", "qty", "unit", "unit_price", "initial_payment",
+            for key in ("name", "item", "dimensions", "qty", "unit_price", "initial_payment",
                         "trade", "due_date", "invoice_no", "notes"):
                 self.vars[key].set("1" if key == "qty" else "")
         except ValueError as exc:
@@ -5508,6 +6187,7 @@ class ExpensesTab(BaseTab):
              ("deposit_date", "Deposit date"), ("notes", "Notes")],
             {"_amount": money(amount), "bank": next(iter(banks), ""),
              "deposit_date": date.today().isoformat()},
+            required_keys=("bank", "deposit_date"),
         )
         if not data:
             return
@@ -5806,11 +6486,25 @@ class ExpensesTab(BaseTab):
                     batch_reference = self.db._next_system_reference(
                         "EB", "expense_batches", "reference", committed_at[:10]
                     )
+                    import_reference = next(
+                        (item.get("import_draft_reference", "") for item in items
+                         if item.get("import_draft_reference")), "",
+                    )
+                    import_file = next(
+                        (item.get("import_source_file", "") for item in items
+                         if item.get("import_source_file")), "",
+                    )
+                    batch_notes = f"{len(items)} expense item(s)"
+                    if import_reference or import_file:
+                        batch_notes += (
+                            f" | Imported draft {import_reference or 'unreferenced'}"
+                            f" | Source {import_file or 'not recorded'}"
+                        )
                     batch_id = self.db.conn.execute(
                         """INSERT INTO expense_batches(reference,project_id,committed_at,
                            authorized_by_head_id,notes) VALUES(?,?,?,?,?)""",
                         (batch_reference, project_id, committed_at, approvals[project_id]["id"],
-                         f"{len(items)} expense item(s)"),
+                         batch_notes),
                     ).lastrowid
                     for item in items:
                         cursor = self.db.conn.execute("""INSERT INTO expenses(project_id,name,item,dimensions,supplier,
@@ -5820,7 +6514,9 @@ class ExpensesTab(BaseTab):
                             (project_id, item["name"], item["item"], item["dimensions"], item["supplier"], item["qty"],
                              item["unit"], item["unit_price_cents"], item["total_cents"], phases.get(item["phase"]),
                              item["area"], item["trade"], item["expense_date"], item["due_date"], item["invoice_no"],
-                             item["notes"], approvals[project_id]["id"], item["status"],
+                             ((item["notes"] + " | " if item["notes"] else "") +
+                              (f"Import row {item.get('import_source_row')}" if item.get("import_source_row") else "")),
+                             approvals[project_id]["id"], item["status"],
                              item.get("cash_allocation_id"), batch_id))
                         if item["payment_amount_cents"] > 0:
                             bank_transfer = "bank" in item["payment_method"].lower()
@@ -6455,7 +7151,7 @@ class ContactsTab(BaseTab):
     def add(self):
         if not self.require_project():
             return
-        data = dialog(self, "Contact", self.FIELDS)
+        data = dialog(self, "Contact", self.FIELDS, required_keys=("name",))
         if data and data["name"]:
             self.db.execute(
                 """INSERT INTO contacts(project_id,name,role,company,phone,email,address,notes)
@@ -6468,7 +7164,7 @@ class ContactsTab(BaseTab):
         if not record_id:
             return
         row = self.db.one("SELECT * FROM contacts WHERE id=?", (record_id,))
-        data = dialog(self, "Contact", self.FIELDS, dict(row))
+        data = dialog(self, "Contact", self.FIELDS, dict(row), required_keys=("name",))
         if data:
             self.db.execute(
                 """UPDATE contacts SET name=?,role=?,company=?,phone=?,email=?,address=?,notes=? WHERE id=?""",
@@ -6766,6 +7462,7 @@ class EmployeeEditorDialog(tk.Toplevel):
             "employee_no", "pin", "name", "birthday", "contact_number",
             "position", "class", "daily_rate",
         )}
+        self.widgets = {}
         self.vars["class"].set(self.vars["class"].get() or "Labor")
         self.compliance = {
             key: tk.BooleanVar(value=bool(initial.get(key, 0))) for key in
@@ -6794,24 +7491,28 @@ class EmployeeEditorDialog(tk.Toplevel):
             row, column = divmod(index, 2)
             cell = ttk.Frame(form); cell.grid(row=row, column=column, sticky="ew",
                 padx=(0, 8) if column == 0 else (8, 0), pady=(0, 11))
-            ttk.Label(cell, text=label).pack(anchor="w")
+            required = key in {"employee_no", "name", "position", "class", "daily_rate"}
+            ttk.Label(cell, text=label + (" *" if required else "")).pack(anchor="w")
             if key == "class":
                 widget = ttk.Combobox(cell, textvariable=self.vars[key],
                                       values=["Skilled", "Labor"], state="readonly")
                 widget.pack(fill="x")
             elif key == "birthday":
                 line = ttk.Frame(cell); line.pack(fill="x")
-                ttk.Entry(line, textvariable=self.vars[key], state="readonly").pack(
-                    side="left", fill="x", expand=True)
+                widget = ttk.Entry(line, textvariable=self.vars[key], state="readonly")
+                widget.pack(side="left", fill="x", expand=True); self.widgets[key] = widget
                 ttk.Button(line, text="\U0001F4C5", width=3,
                            command=lambda: DatePickerPopup(
                                self, self.vars["birthday"], year_min=1900,
                                year_max=date.today().year)).pack(
                                side="left", padx=(4, 0))
             else:
-                ttk.Entry(cell, textvariable=self.vars[key],
-                          state="readonly" if key == "employee_no" else "normal",
-                          show="*" if key == "pin" else "").pack(fill="x")
+                widget = ttk.Entry(cell, textvariable=self.vars[key],
+                                   state="readonly" if key == "employee_no" else "normal",
+                                   show="*" if key == "pin" else "")
+                widget.pack(fill="x"); self.widgets[key] = widget
+            if key == "class":
+                self.widgets[key] = widget
 
         ttk.Label(form, text="Employment compliance documents",
                   style="Section.TLabel").grid(row=4, column=0, columnspan=2,
@@ -6876,17 +7577,24 @@ class EmployeeEditorDialog(tk.Toplevel):
 
     def save(self):
         values = {key: variable.get().strip() for key, variable in self.vars.items()}
+        if flash_missing_fields(
+                self, self.vars, self.widgets,
+                ("employee_no", "name", "position", "class", "daily_rate")):
+            return
         try:
-            if not values["employee_no"] or not values["name"]:
-                raise ValueError("Employee number and full name are required.")
             if values["pin"]:
                 hash_pin(values["pin"])
             valid_date(values["birthday"])
             if cents(values["daily_rate"]) <= 0:
                 raise ValueError("Daily rate must be greater than zero.")
-            if not values["position"]:
-                raise ValueError("Position is required.")
         except ValueError as exc:
+            message = str(exc).lower()
+            if "pin" in message:
+                flash_required_widgets(self, [self.widgets["pin"]])
+            elif "date" in message:
+                flash_required_widgets(self, [self.widgets["birthday"]])
+            else:
+                flash_required_widgets(self, [self.widgets["daily_rate"]])
             messagebox.showerror(APP_TITLE, str(exc), parent=self); return
         values.update({key: int(variable.get()) for key, variable in self.compliance.items()})
         values.update(photo_data=self.photo_data, photo_filename=self.photo_filename,
@@ -7062,13 +7770,15 @@ class CashAdvanceGrantDialog(tk.Toplevel):
             "reason":tk.StringVar(),"method":tk.StringVar(value="Cash Allocation"),
             "allocation":tk.StringVar(),"bank":tk.StringVar(),
             "repayment_plan":tk.StringVar(value="Salary Deduction"),"weekly_cap":tk.StringVar()}
+        self.widgets = {}
         specs=(("amount","Amount"),("date","Advance date"),("reason","Reason"),
             ("method","Funding source"),("allocation","Petty cash / direct procurement"),
             ("bank","Bank account"),("repayment_plan","Repayment method"),
             ("weekly_cap","Maximum weekly salary deduction (blank = available salary)"))
         for index,(key,label) in enumerate(specs):
             row,col=divmod(index,2); cell=ttk.Frame(form); cell.grid(row=row,column=col,sticky="ew",padx=(0 if col==0 else 8,8 if col==0 else 0),pady=4)
-            ttk.Label(cell,text=label).pack(anchor="w")
+            required = key in {"amount", "date", "reason", "method", "repayment_plan"}
+            ttk.Label(cell,text=label + (" *" if required else "")).pack(anchor="w")
             if key=="method": widget=ttk.Combobox(cell,textvariable=self.vars[key],values=["Cash Allocation","Bank Transfer"],state="readonly")
             elif key=="allocation": widget=ttk.Combobox(cell,textvariable=self.vars[key],values=list(allocations),state="readonly")
             elif key=="bank": widget=ttk.Combobox(cell,textvariable=self.vars[key],values=list(banks),state="readonly")
@@ -7083,6 +7793,7 @@ class CashAdvanceGrantDialog(tk.Toplevel):
                 values=["Salary Deduction","Cash Repayment","Bank Repayment","Manual / Mixed"],state="readonly")
             else: widget=ttk.Entry(cell,textvariable=self.vars[key])
             if key!="date": widget.pack(fill="x")
+            self.widgets[key] = widget
             form.columnconfigure(col,weight=1)
             if key=="bank": self.bank_widget=widget
             if key=="allocation": self.allocation_widget=widget
@@ -7105,6 +7816,29 @@ class CashAdvanceGrantDialog(tk.Toplevel):
     def save(self):
         selected=self.tree.selection()
         if not selected: messagebox.showerror(APP_TITLE,"Select an employee.",parent=self); return
+        required = ["amount", "date", "reason", "method", "repayment_plan"]
+        required.append("bank" if self.vars["method"].get() == "Bank Transfer" else "allocation")
+        if flash_missing_fields(self, self.vars, self.widgets, required):
+            return
+        try:
+            amount = cents(self.vars["amount"].get())
+            if amount <= 0:
+                raise ValueError("Amount must be greater than zero.")
+            valid_date(self.vars["date"].get(), True)
+            if (self.vars["repayment_plan"].get() == "Salary Deduction"
+                    and self.vars["weekly_cap"].get().strip()
+                    and cents(self.vars["weekly_cap"].get()) <= 0):
+                raise ValueError("The weekly deduction limit must be positive or left blank.")
+        except ValueError as exc:
+            message = str(exc).lower()
+            if "date" in message:
+                flash_required_widgets(self, [self.widgets["date"]])
+            elif "weekly" in message:
+                flash_required_widgets(self, [self.widgets["weekly_cap"]])
+            else:
+                flash_required_widgets(self, [self.widgets["amount"]])
+            messagebox.showerror(APP_TITLE, str(exc), parent=self)
+            return
         self.result={key:var.get().strip() for key,var in self.vars.items()}; self.result["employee_id"]=int(selected[0]); self.destroy()
 
 
@@ -7139,10 +7873,11 @@ class CashAdvanceBatchDialog(tk.Toplevel):
             "repayment_plan": tk.StringVar(value="Salary Deduction"),
             "weekly_cap": tk.StringVar(), "search": tk.StringVar(),
         }
-        ttk.Label(shared, text="Effective advance date").grid(row=0, column=0, sticky="w")
+        self.widgets = {}
+        ttk.Label(shared, text="Effective advance date *").grid(row=0, column=0, sticky="w")
         date_line = ttk.Frame(shared); date_line.grid(row=1, column=0, sticky="ew", padx=(0, 8))
-        ttk.Entry(date_line, textvariable=self.vars["date"], state="readonly").pack(
-            side="left", fill="x", expand=True)
+        date_widget = ttk.Entry(date_line, textvariable=self.vars["date"], state="readonly")
+        date_widget.pack(side="left", fill="x", expand=True); self.widgets["date"] = date_widget
         ttk.Button(date_line, text="Calendar", width=9,
                    command=lambda: DatePickerPopup(self, self.vars["date"])).pack(
                        side="left", padx=(4, 0))
@@ -7151,15 +7886,18 @@ class CashAdvanceBatchDialog(tk.Toplevel):
             shared, textvariable=self.vars["method"],
             values=["Cash Allocation", "Bank Transfer"], state="readonly")
         self.method_widget.grid(row=1, column=1, sticky="ew", padx=(0, 8))
+        self.widgets["method"] = self.method_widget
         ttk.Label(shared, text="Petty cash / direct procurement").grid(row=0, column=2, sticky="w")
         self.allocation_widget = ttk.Combobox(
             shared, textvariable=self.vars["allocation"],
             values=list(allocations), state="readonly")
         self.allocation_widget.grid(row=1, column=2, sticky="ew", padx=(0, 8))
+        self.widgets["allocation"] = self.allocation_widget
         ttk.Label(shared, text="Bank account").grid(row=0, column=3, sticky="w")
         self.bank_widget = ttk.Combobox(
             shared, textvariable=self.vars["bank"], values=list(banks), state="readonly")
         self.bank_widget.grid(row=1, column=3, sticky="ew")
+        self.widgets["bank"] = self.bank_widget
 
         entry_area = ttk.Panedwindow(body, orient="horizontal")
         entry_area.grid(row=3, column=0, sticky="nsew", pady=(10, 8))
@@ -7186,7 +7924,9 @@ class CashAdvanceBatchDialog(tk.Toplevel):
         )
         details_frame.columnconfigure(0, weight=1)
         for row_index, (key, label) in enumerate(detail_fields):
-            ttk.Label(details_frame, text=label).grid(row=row_index * 2, column=0, sticky="w")
+            required = key in {"amount", "reason", "repayment_plan"}
+            ttk.Label(details_frame, text=label + (" *" if required else "")).grid(
+                row=row_index * 2, column=0, sticky="w")
             if key == "repayment_plan":
                 widget = ttk.Combobox(
                     details_frame, textvariable=self.vars[key],
@@ -7195,6 +7935,7 @@ class CashAdvanceBatchDialog(tk.Toplevel):
             else:
                 widget = ttk.Entry(details_frame, textvariable=self.vars[key])
             widget.grid(row=row_index * 2 + 1, column=0, sticky="ew", pady=(0, 7))
+            self.widgets[key] = widget
             if key == "weekly_cap": self.cap_widget = widget
         detail_buttons = ttk.Frame(details_frame)
         detail_buttons.grid(row=8, column=0, sticky="ew", pady=(8, 0))
@@ -7254,6 +7995,8 @@ class CashAdvanceBatchDialog(tk.Toplevel):
         selected = self.employee_tree.selection()
         if not selected:
             messagebox.showerror(APP_TITLE, "Select at least one employee.", parent=self); return
+        if flash_missing_fields(self, self.vars, self.widgets, ("amount", "reason", "repayment_plan")):
+            return
         try:
             amount = cents(self.vars["amount"].get())
             if amount <= 0: raise ValueError("Enter a positive advance amount.")
@@ -7263,6 +8006,11 @@ class CashAdvanceBatchDialog(tk.Toplevel):
                 weekly_cap = cents(self.vars["weekly_cap"].get())
                 if weekly_cap <= 0: raise ValueError("Weekly deduction limit must be positive.")
         except ValueError as exc:
+            message = str(exc).lower()
+            flash_required_widgets(
+                self,
+                [self.widgets["weekly_cap"] if "weekly" in message else self.widgets["amount"]],
+            )
             messagebox.showerror(APP_TITLE, str(exc), parent=self); return
         for employee_id in selected:
             employee = self.employees[employee_id]
@@ -7293,9 +8041,14 @@ class CashAdvanceBatchDialog(tk.Toplevel):
     def save(self):
         if not self.staged:
             messagebox.showerror(APP_TITLE, "Stage at least one employee advance.", parent=self); return
+        required = ["date", "method"]
+        required.append("bank" if self.vars["method"].get() == "Bank Transfer" else "allocation")
+        if flash_missing_fields(self, self.vars, self.widgets, required):
+            return
         try:
             valid_date(self.vars["date"].get(), True)
         except ValueError as exc:
+            flash_required_widgets(self, [self.widgets["date"]])
             messagebox.showerror(APP_TITLE, str(exc), parent=self); return
         if self.vars["method"].get() == "Bank Transfer":
             if self.vars["bank"].get() not in self.banks:
@@ -7321,6 +8074,7 @@ class CashAdvanceRecoveryDialog(tk.Toplevel):
         self.vars={"advance":tk.StringVar(),"amount":tk.StringVar(),
             "txn_date":tk.StringVar(value=date.today().isoformat()),"method":tk.StringVar(),
             "bank":tk.StringVar(),"reference":tk.StringVar(),"notes":tk.StringVar()}
+        self.widgets={}
         specs=(("advance","Cash advance"),("amount","Amount"),("txn_date","Transaction date"),
             ("method","Recovery method"),("bank","Bank receiving repayment"),("reference","Reference"),("notes","Notes"))
         for index,(key,label) in enumerate(specs):
@@ -7339,6 +8093,7 @@ class CashAdvanceRecoveryDialog(tk.Toplevel):
             else:widget=ttk.Entry(cell,textvariable=self.vars[key])
             if key!="txn_date":widget.pack(fill="x")
             if key=="bank":self.bank_widget=widget
+            self.widgets[key]=widget
         self.plan_note=ttk.Label(body,text="",style="Muted.TLabel"); self.plan_note.pack(anchor="w",pady=(10,0))
         buttons=ttk.Frame(body); buttons.pack(fill="x",pady=(18,0))
         ttk.Button(buttons,text="Cancel",command=self.destroy).pack(side="right")
@@ -7359,6 +8114,20 @@ class CashAdvanceRecoveryDialog(tk.Toplevel):
         if advances:self.vars["advance"].set(next(iter(advances)))
         update_bank(); self.transient(parent); self.grab_set(); self.bind("<Escape>",lambda _e:self.destroy())
     def save(self):
+        required=["advance","amount","txn_date","method"]
+        if self.vars["method"].get()=="Bank Repayment": required.append("bank")
+        if flash_missing_fields(self,self.vars,self.widgets,required): return
+        try:
+            amount=cents(self.vars["amount"].get())
+            if amount<=0: raise ValueError("Amount must be greater than zero.")
+            valid_date(self.vars["txn_date"].get(),True)
+            selected=self.advances.get(self.vars["advance"].get())
+            if selected and amount>int(selected["outstanding"]):
+                raise ValueError("Recovery amount cannot exceed the outstanding advance.")
+        except ValueError as exc:
+            target="txn_date" if "date" in str(exc).lower() else "amount"
+            flash_required_widgets(self,[self.widgets[target]])
+            messagebox.showerror(APP_TITLE,str(exc),parent=self); return
         self.result={key:value.get().strip() for key,value in self.vars.items()}; self.destroy()
 
 
@@ -8059,7 +8828,8 @@ class LegacyRemittancesTab(BaseTab):
         if not self.require_project():
             return
         data = dialog(self, "Remittance Transaction", self.FIELDS,
-                      {"txn_date": date.today().isoformat()})
+                      {"txn_date": date.today().isoformat()},
+                      required_keys=("type", "amount", "txn_date", "purpose"))
         if data:
             try:
                 amount = cents(data["amount"])
@@ -8089,7 +8859,10 @@ class LegacyRemittancesTab(BaseTab):
         row = self.db.one("SELECT * FROM remittances WHERE id=?", (record_id,))
         initial = dict(row)
         initial["amount"] = money(row["amount_cents"])
-        data = dialog(self, "Edit Remittance Transaction", self.FIELDS, initial)
+        data = dialog(
+            self, "Edit Remittance Transaction", self.FIELDS, initial,
+            required_keys=("type", "amount", "txn_date", "purpose"),
+        )
         if data:
             try:
                 amount = cents(data["amount"])
@@ -8153,14 +8926,18 @@ class BankAccountDialog(tk.Toplevel):
         super().__init__(parent)
         self.title("Enroll Bank Account"); self.resizable(False, False); self.result = None
         self.vars = {key: tk.StringVar() for key in ("bank_name", "account_name", "account_number", "notes")}
+        self.widgets = {}
         body = ttk.Frame(self, padding=20); body.pack(fill="both", expand=True)
         ttk.Label(body, text="Enroll a shared bank account", style="DialogTitle.TLabel").grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
         specs = [("bank_name", "Bank name"), ("account_name", "Account name"),
                  ("account_number", "Account number / reference"), ("notes", "Notes")]
         for row, (key, label) in enumerate(specs, 1):
-            ttk.Label(body, text=label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=5)
-            ttk.Entry(body, textvariable=self.vars[key], width=40).grid(row=row, column=1, pady=5)
+            required = key in {"bank_name", "account_number"}
+            ttk.Label(body, text=label + (" *" if required else "")).grid(
+                row=row, column=0, sticky="w", padx=(0, 12), pady=5)
+            widget = ttk.Entry(body, textvariable=self.vars[key], width=40)
+            widget.grid(row=row, column=1, pady=5); self.widgets[key] = widget
         footer = ttk.Frame(body); footer.grid(row=5, column=0, columnspan=2, sticky="e", pady=(14, 0))
         ttk.Button(footer, text="Cancel", style="Secondary.TButton", command=self.destroy).pack(side="right", padx=(8, 0))
         ttk.Button(footer, text="Enroll Account", style="Primary.TButton", command=self.save).pack(side="right")
@@ -8168,8 +8945,8 @@ class BankAccountDialog(tk.Toplevel):
 
     def save(self):
         values = {key: var.get().strip() for key, var in self.vars.items()}
-        if not values["bank_name"] or not values["account_number"]:
-            messagebox.showerror(APP_TITLE, "Bank name and account number/reference are required.", parent=self); return
+        if flash_missing_fields(self, self.vars, self.widgets, ("bank_name", "account_number")):
+            return
         self.result = values; self.destroy()
 
 
@@ -8304,7 +9081,10 @@ class RemittancesTab(BaseTab):
             "transfer_date": date.today().isoformat(),
         }
         values.update(initial or {})
-        win = FormDialog(self, "Transfer Funds Between Bank Accounts", fields, values)
+        win = FormDialog(
+            self, "Transfer Funds Between Bank Accounts", fields, values,
+            required_keys=("from_bank", "to_bank", "amount", "transfer_date", "purpose"),
+        )
         self.wait_window(win)
         return win.result, banks
 
@@ -8366,7 +9146,10 @@ class RemittancesTab(BaseTab):
             ("purpose", "Purpose"), ("care_of", "C/O (team head)"),
             ("signature", "Signature / acknowledgement"), ("notes", "Notes")]
         values = {"txn_date": date.today().isoformat(), "type": "Deposit"}; values.update(initial or {})
-        win = FormDialog(self, "Bank Remittance Transaction", fields, values)
+        win = FormDialog(
+            self, "Bank Remittance Transaction", fields, values,
+            required_keys=("project", "type", "bank", "amount", "txn_date", "purpose"),
+        )
         last_project = {"value": values.get("project") or next(iter(projects), "")}
 
         def update_project_state(_event=None):
@@ -8881,7 +9664,10 @@ class CalendarTab(BaseTab):
     def add(self):
         if not self.require_project():
             return
-        data = dialog(self, "Calendar Event", self.FIELDS, {"event_date": date.today().isoformat()})
+        data = dialog(
+            self, "Calendar Event", self.FIELDS, {"event_date": date.today().isoformat()},
+            required_keys=("type", "title", "event_date"),
+        )
         if data:
             try:
                 if not data["title"]:
@@ -8901,7 +9687,10 @@ class CalendarTab(BaseTab):
         if not record_id:
             return
         row = self.db.one("SELECT * FROM calendar_events WHERE id=?", (record_id,))
-        data = dialog(self, "Calendar Event", self.FIELDS, dict(row))
+        data = dialog(
+            self, "Calendar Event", self.FIELDS, dict(row),
+            required_keys=("type", "title", "event_date"),
+        )
         if data:
             try:
                 self.db.execute(
@@ -8997,6 +9786,14 @@ class ContractorApp(tk.Tk):
                         font=("Segoe UI", 9, "bold"), relief="flat")
         style.map("Treeview", background=[("selected", NAVY_ACTIVE)], foreground=[("selected", WHITE)])
         style.configure("TProgressbar", background=ORANGE, troughcolor="#E5E7EB")
+        style.configure(
+            "Required.TEntry", fieldbackground="#FEE2E2", bordercolor="#DC2626",
+            lightcolor="#DC2626", darkcolor="#DC2626",
+        )
+        style.configure(
+            "Required.TCombobox", fieldbackground="#FEE2E2", bordercolor="#DC2626",
+            lightcolor="#DC2626", darkcolor="#DC2626", arrowcolor="#DC2626",
+        )
 
         shell = tk.Frame(self, bg=SURFACE); shell.pack(fill="both", expand=True)
         sidebar = tk.Frame(shell, bg=NAVY, width=225); sidebar.pack(side="left", fill="y"); sidebar.pack_propagate(False)
