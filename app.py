@@ -478,6 +478,24 @@ def qty_decimal(value: str) -> Decimal:
         raise ValueError("Quantity must be a non-negative number.") from exc
 
 
+def inventory_quantity_milli(value: str | Decimal, *, positive: bool = False) -> int:
+    """Store stock quantities to three decimal places without floating-point drift."""
+    try:
+        quantity = Decimal(str(value).replace(",", "").strip() or "0")
+    except InvalidOperation as exc:
+        raise ValueError("Enter a valid inventory quantity.") from exc
+    if quantity < 0 or (positive and quantity <= 0):
+        raise ValueError("Inventory quantity must be greater than zero." if positive
+                         else "Inventory quantity cannot be negative.")
+    return int((quantity * 1000).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def inventory_quantity(value_milli: int | None) -> str:
+    quantity = Decimal(value_milli or 0) / 1000
+    text = f"{quantity:,.3f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
 def valid_date(value: str, required: bool = False) -> str:
     value = value.strip()
     if not value and not required:
@@ -1207,6 +1225,44 @@ class Database:
             authorized_by_head_id INTEGER REFERENCES project_heads(id),
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS employee_project_assignments (
+            id INTEGER PRIMARY KEY,
+            employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            effective_from TEXT NOT NULL,
+            effective_to TEXT NOT NULL DEFAULT '',
+            position TEXT NOT NULL DEFAULT '',
+            daily_rate_cents INTEGER NOT NULL DEFAULT 0,
+            reason TEXT NOT NULL DEFAULT '',
+            authorized_by_head_id INTEGER REFERENCES project_heads(id),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS attendance_revisions (
+            id INTEGER PRIMARY KEY,
+            attendance_id INTEGER NOT NULL REFERENCES attendance(id) ON DELETE CASCADE,
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            old_clock_in TEXT NOT NULL, old_clock_out TEXT NOT NULL,
+            new_clock_in TEXT NOT NULL, new_clock_out TEXT NOT NULL,
+            old_gross_cents INTEGER NOT NULL DEFAULT 0,
+            new_gross_cents INTEGER NOT NULL DEFAULT 0,
+            payroll_batch_id INTEGER REFERENCES payroll_batches(id) ON DELETE SET NULL,
+            correction_reason TEXT NOT NULL,
+            authorized_by_head_id INTEGER REFERENCES project_heads(id),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS payroll_adjustments (
+            id INTEGER PRIMARY KEY,
+            employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            source_attendance_id INTEGER REFERENCES attendance(id) ON DELETE SET NULL,
+            source_payroll_batch_id INTEGER REFERENCES payroll_batches(id) ON DELETE SET NULL,
+            amount_cents INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'Pending',
+            applied_payroll_batch_id INTEGER REFERENCES payroll_batches(id) ON DELETE SET NULL,
+            authorized_by_head_id INTEGER REFERENCES project_heads(id),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
         CREATE TABLE IF NOT EXISTS remittances (
             id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
             type TEXT NOT NULL CHECK(type IN ('Deposit','Withdrawal')), amount_cents INTEGER NOT NULL,
@@ -1384,6 +1440,66 @@ class Database:
             event_time TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '',
             completed INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS project_completion_snapshots (
+            id INTEGER PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            completion_reference TEXT NOT NULL UNIQUE,
+            completion_date TEXT NOT NULL,
+            completion_time TEXT NOT NULL DEFAULT '',
+            completed_by_head_ids TEXT NOT NULL DEFAULT '',
+            completed_by_names TEXT NOT NULL DEFAULT '',
+            completion_notes TEXT NOT NULL DEFAULT '',
+            contract_value_cents INTEGER NOT NULL DEFAULT 0,
+            deposited_cents INTEGER NOT NULL DEFAULT 0,
+            active_expense_cents INTEGER NOT NULL DEFAULT 0,
+            paid_cents INTEGER NOT NULL DEFAULT 0,
+            outstanding_cents INTEGER NOT NULL DEFAULT 0,
+            budget_remaining_cents INTEGER NOT NULL DEFAULT 0,
+            task_count INTEGER NOT NULL DEFAULT 0,
+            completed_task_count INTEGER NOT NULL DEFAULT 0,
+            progress_percent INTEGER NOT NULL DEFAULT 0,
+            expense_count INTEGER NOT NULL DEFAULT 0,
+            payroll_batch_count INTEGER NOT NULL DEFAULT 0,
+            attendance_count INTEGER NOT NULL DEFAULT 0,
+            reactivated_at TEXT NOT NULL DEFAULT '',
+            reactivated_by_names TEXT NOT NULL DEFAULT '',
+            reactivation_notes TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS inventory_items (
+            id INTEGER PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            item_code TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            material_type TEXT NOT NULL CHECK(material_type IN ('Consumable','Non-Consumable')),
+            category TEXT NOT NULL DEFAULT '',
+            unit TEXT NOT NULL DEFAULT 'piece',
+            registered_quantity_milli INTEGER NOT NULL DEFAULT 0,
+            reorder_level_milli INTEGER NOT NULL DEFAULT 0,
+            condition_status TEXT NOT NULL DEFAULT 'Good',
+            notes TEXT NOT NULL DEFAULT '',
+            active INTEGER NOT NULL DEFAULT 1,
+            created_by_head_id INTEGER REFERENCES project_heads(id),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS inventory_transactions (
+            id INTEGER PRIMARY KEY,
+            reference TEXT NOT NULL UNIQUE,
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            item_id INTEGER NOT NULL REFERENCES inventory_items(id) ON DELETE CASCADE,
+            employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            transaction_type TEXT NOT NULL,
+            quantity_milli INTEGER NOT NULL CHECK(quantity_milli > 0),
+            transaction_date TEXT NOT NULL,
+            transaction_time TEXT NOT NULL DEFAULT '',
+            reason TEXT NOT NULL DEFAULT '',
+            condition_note TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            linked_transaction_id INTEGER REFERENCES inventory_transactions(id) ON DELETE SET NULL,
+            authorized_by_head_id INTEGER REFERENCES project_heads(id),
+            voided INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY, project_id INTEGER, action TEXT NOT NULL,
             details TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -1410,10 +1526,24 @@ class Database:
             ON bank_account_transfers(to_bank_account_id,transfer_date);
         CREATE INDEX IF NOT EXISTS idx_expense_batch_project ON expense_batches(project_id,committed_at);
         CREATE INDEX IF NOT EXISTS idx_expense_verify_item ON expense_verification_items(expense_id);
+        CREATE INDEX IF NOT EXISTS idx_project_completion_project
+            ON project_completion_snapshots(project_id,completion_date);
+        CREATE INDEX IF NOT EXISTS idx_inventory_item_project
+            ON inventory_items(project_id,material_type,active);
+        CREATE INDEX IF NOT EXISTS idx_inventory_transaction_item
+            ON inventory_transactions(item_id,transaction_date,id);
+        CREATE INDEX IF NOT EXISTS idx_inventory_transaction_employee
+            ON inventory_transactions(employee_id,transaction_date,id);
         """)
         self._ensure_column("expenses", "authorized_by_head_id", "INTEGER")
         self._ensure_column("expenses", "status", "TEXT NOT NULL DEFAULT 'Unpaid'")
         self._ensure_column("projects", "address", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("projects", "status", "TEXT NOT NULL DEFAULT 'Active'")
+        self._ensure_column("projects", "completed_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("projects", "completion_reference", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("projects", "completion_notes", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("projects", "completed_by_names", "TEXT NOT NULL DEFAULT ''")
+        self.conn.execute("UPDATE projects SET status='Active' WHERE TRIM(COALESCE(status,''))='' ")
         self._ensure_column("payments", "bank_account_id", "INTEGER")
         self._ensure_column("payments", "authorized_by_head_id", "INTEGER")
         self._ensure_column("payments", "cash_allocation_id", "INTEGER")
@@ -1436,6 +1566,8 @@ class Database:
         self._ensure_column("employees", "photo_data", "BLOB")
         self._ensure_column("employees", "photo_filename", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("employees", "photo_mime", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("employees", "archived_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("employees", "archive_reason", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("attendance", "regular_hours", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("attendance", "lunch_hours", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("attendance", "overtime_hours", "TEXT NOT NULL DEFAULT ''")
@@ -1446,6 +1578,49 @@ class Database:
         self._ensure_column("attendance", "authorized_by_head_id", "INTEGER")
         self._ensure_column("attendance", "payroll_batch_id", "INTEGER")
         self._ensure_column("attendance", "closure_batch_id", "INTEGER")
+        self._ensure_column("attendance", "project_id", "INTEGER")
+        self._ensure_column("attendance", "revision_count", "INTEGER NOT NULL DEFAULT 0")
+        self.conn.execute(
+            """UPDATE attendance SET project_id=(SELECT project_id FROM employees e
+               WHERE e.id=attendance.employee_id) WHERE project_id IS NULL"""
+        )
+        self.conn.execute(
+            """INSERT INTO employee_project_assignments(
+               employee_id,project_id,effective_from,position,daily_rate_cents,reason)
+               SELECT e.id,e.project_id,COALESCE(NULLIF(MIN(SUBSTR(a.clock_in,1,10)),''),
+                      SUBSTR(CURRENT_TIMESTAMP,1,10)),e.position,
+                      CASE WHEN e.daily_rate_cents>0 THEN e.daily_rate_cents
+                           WHEN LOWER(TRIM(e.pay_basis))='hourly' THEN e.rate_cents*8
+                           ELSE e.rate_cents END,'Migrated current assignment'
+               FROM employees e LEFT JOIN attendance a ON a.employee_id=e.id
+               WHERE NOT EXISTS (SELECT 1 FROM employee_project_assignments x
+                                 WHERE x.employee_id=e.id)
+               GROUP BY e.id"""
+        )
+        self.conn.execute(
+            """UPDATE employee_project_assignments SET effective_to=COALESCE(
+                 NULLIF((SELECT archived_at FROM employees e
+                         WHERE e.id=employee_project_assignments.employee_id),''),
+                 SUBSTR(CURRENT_TIMESTAMP,1,10))
+               WHERE effective_to='' AND EXISTS (SELECT 1 FROM employees e
+                 WHERE e.id=employee_project_assignments.employee_id AND e.active=0)"""
+        )
+        self.conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_employee_current_assignment
+               ON employee_project_assignments(employee_id) WHERE effective_to=''"""
+        )
+        self.conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_attendance_project_date
+               ON attendance(project_id,clock_in)"""
+        )
+        self.conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_attendance_revision_record
+               ON attendance_revisions(attendance_id,created_at)"""
+        )
+        self.conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_payroll_adjustment_pending
+               ON payroll_adjustments(project_id,status,employee_id)"""
+        )
         self._ensure_column("remittances", "authorized_by_head_id", "INTEGER")
         self._ensure_column("remittances", "authorized_by_registry_id", "INTEGER")
         self._ensure_column("remittances", "bank_account_id", "INTEGER")
@@ -1474,6 +1649,7 @@ class Database:
         self._ensure_column("cash_advances", "recorded_at_local", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("cash_advance_transactions", "recorded_at_local", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("payroll_batches", "week_schedule", "TEXT NOT NULL DEFAULT 'Legacy / Stored Period'")
+        self._ensure_column("payroll_batches", "adjustment_cents", "INTEGER NOT NULL DEFAULT 0")
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_cash_advance_batch ON cash_advances(batch_id)"
         )
@@ -2819,13 +2995,243 @@ class Database:
             if require_cash_allocation:
                 self.validate_cash_allocation_payment(project_id, cash_allocation_id, amount_cents)
 
+    def employee_daily_rate_at(self, employee_id: int, work_date: str) -> int:
+        assignment = self.one(
+            """SELECT daily_rate_cents FROM employee_project_assignments
+               WHERE employee_id=? AND effective_from<=?
+                 AND (effective_to='' OR effective_to>=?)
+               ORDER BY effective_from DESC,id DESC LIMIT 1""",
+            (employee_id, work_date, work_date),
+        )
+        if assignment and assignment["daily_rate_cents"] > 0:
+            return assignment["daily_rate_cents"]
+        employee = self.one("SELECT * FROM employees WHERE id=?", (employee_id,))
+        if not employee:
+            raise ValueError("The selected employee no longer exists.")
+        return employee_daily_rate(employee)
+
+    def archive_employee(self, employee_id: int, reason: str,
+                         authorized_by_head_id: int) -> None:
+        employee = self.one("SELECT * FROM employees WHERE id=?", (employee_id,))
+        if not employee or not employee["active"]:
+            raise ValueError("Select an active employee to archive.")
+        if self.one("SELECT 1 FROM attendance WHERE employee_id=? AND clock_out=''", (employee_id,)):
+            raise ValueError("Clock the employee out before archiving their profile.")
+        head = self.one(
+            "SELECT id,name FROM project_heads WHERE id=? AND project_id=? AND active=1",
+            (authorized_by_head_id, employee["project_id"]),
+        )
+        if not head:
+            raise ValueError("An active project head from the employee's project must authorize archiving.")
+        archived_at = local_timestamp()
+        with self.conn:
+            self.conn.execute(
+                "UPDATE employees SET active=0,archived_at=?,archive_reason=? WHERE id=?",
+                (archived_at, reason.strip(), employee_id),
+            )
+            self.conn.execute(
+                "UPDATE employee_project_assignments SET effective_to=? WHERE employee_id=? AND effective_to=''",
+                (archived_at[:10], employee_id),
+            )
+            self.conn.execute(
+                "INSERT INTO audit_log(project_id,action,details) VALUES(?,?,?)",
+                (employee["project_id"], "EMPLOYEE_ARCHIVED",
+                 f"{employee['name']} [{employee['employee_no']}]: {reason}; authorized by {head['name']}"),
+            )
+
+    def transfer_employee(self, employee_id: int, destination_project_id: int,
+                          effective_date: str, reason: str, position: str,
+                          daily_rate_cents: int, source_head_id: int,
+                          destination_head_id: int) -> None:
+        effective_date = valid_date(effective_date, True)
+        employee = self.one("SELECT * FROM employees WHERE id=?", (employee_id,))
+        destination = self.one("SELECT id,name,status FROM projects WHERE id=?", (destination_project_id,))
+        if not employee or not employee["active"]:
+            raise ValueError("Select an active employee to transfer.")
+        if not destination or destination_project_id == employee["project_id"]:
+            raise ValueError("Select a different destination project.")
+        if destination["status"] == "Completed":
+            raise ValueError("Employees cannot be transferred into a completed project.")
+        if daily_rate_cents <= 0:
+            raise ValueError("The daily rate must be greater than zero.")
+        if self.one("SELECT 1 FROM attendance WHERE employee_id=? AND clock_out=''", (employee_id,)):
+            raise ValueError("Clock the employee out before transferring them.")
+        source_head = self.one(
+            "SELECT id,name FROM project_heads WHERE id=? AND project_id=? AND active=1",
+            (source_head_id, employee["project_id"]),
+        )
+        destination_head = self.one(
+            "SELECT id,name FROM project_heads WHERE id=? AND project_id=? AND active=1",
+            (destination_head_id, destination_project_id),
+        )
+        if not source_head or not destination_head:
+            raise ValueError("Both source and destination project heads must authorize the transfer.")
+        try:
+            with self.conn:
+                self.conn.execute(
+                    "UPDATE employee_project_assignments SET effective_to=? WHERE employee_id=? AND effective_to=''",
+                    (effective_date, employee_id),
+                )
+                self.conn.execute(
+                    """INSERT INTO employee_project_assignments(employee_id,project_id,
+                       effective_from,position,daily_rate_cents,reason,authorized_by_head_id)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (employee_id, destination_project_id, effective_date, position.strip(),
+                     daily_rate_cents, reason.strip(), destination_head_id),
+                )
+                self.conn.execute(
+                    """UPDATE employees SET project_id=?,position=?,pay_basis='Daily',
+                       rate_cents=?,daily_rate_cents=? WHERE id=?""",
+                    (destination_project_id, position.strip(), daily_rate_cents,
+                     daily_rate_cents, employee_id),
+                )
+                details = (f"{employee['name']} [{employee['employee_no']}] transferred to "
+                           f"{destination['name']} effective {effective_date}: {reason}; "
+                           f"source approval {source_head['name']}; destination approval {destination_head['name']}")
+                self.conn.execute("INSERT INTO audit_log(project_id,action,details) VALUES(?,?,?)",
+                                  (employee["project_id"], "EMPLOYEE_TRANSFERRED_OUT", details))
+                self.conn.execute("INSERT INTO audit_log(project_id,action,details) VALUES(?,?,?)",
+                                  (destination_project_id, "EMPLOYEE_TRANSFERRED_IN", details))
+        except sqlite3.IntegrityError as exc:
+            if "employees.project_id, employees.employee_no" in str(exc):
+                raise ValueError("That employee number is already used in the destination project.") from exc
+            raise
+
+    def reactivate_employee(self, employee_id: int, destination_project_id: int,
+                            effective_date: str, reason: str, position: str,
+                            daily_rate_cents: int, authorized_by_head_id: int) -> None:
+        effective_date = valid_date(effective_date, True)
+        employee = self.one("SELECT * FROM employees WHERE id=?", (employee_id,))
+        destination = self.one("SELECT id,name,status FROM projects WHERE id=?", (destination_project_id,))
+        if not employee or employee["active"]:
+            raise ValueError("Select an archived employee to reactivate.")
+        if not destination or daily_rate_cents <= 0:
+            raise ValueError("Select a destination project and enter a positive daily rate.")
+        if destination["status"] == "Completed":
+            raise ValueError("Employees cannot be reactivated into a completed project.")
+        head = self.one(
+            "SELECT id,name FROM project_heads WHERE id=? AND project_id=? AND active=1",
+            (authorized_by_head_id, destination_project_id),
+        )
+        if not head:
+            raise ValueError("An active destination-project head must authorize reactivation.")
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO employee_project_assignments(employee_id,project_id,effective_from,
+                   position,daily_rate_cents,reason,authorized_by_head_id) VALUES(?,?,?,?,?,?,?)""",
+                (employee_id, destination_project_id, effective_date, position.strip(),
+                 daily_rate_cents, reason.strip(), authorized_by_head_id),
+            )
+            self.conn.execute(
+                """UPDATE employees SET active=1,project_id=?,position=?,pay_basis='Daily',
+                   rate_cents=?,daily_rate_cents=?,archived_at='',archive_reason='' WHERE id=?""",
+                (destination_project_id, position.strip(), daily_rate_cents,
+                 daily_rate_cents, employee_id),
+            )
+            self.conn.execute("INSERT INTO audit_log(project_id,action,details) VALUES(?,?,?)",
+                (destination_project_id, "EMPLOYEE_REACTIVATED",
+                 f"{employee['name']} [{employee['employee_no']}] reactivated in {destination['name']} "
+                 f"effective {effective_date}: {reason}; authorized by {head['name']}"))
+
+    def revise_attendance(self, attendance_id: int, new_clock_in: datetime,
+                          new_clock_out: datetime, correction_reason: str,
+                          authorized_by_head_id: int) -> dict:
+        row = self.one(
+            """SELECT a.*,e.name,e.employee_no,e.project_id current_project_id
+               FROM attendance a JOIN employees e ON e.id=a.employee_id WHERE a.id=?""",
+            (attendance_id,),
+        )
+        if not row or not row["clock_out"]:
+            raise ValueError("Only completed attendance can be corrected.")
+        reason = correction_reason.strip()
+        if not reason:
+            raise ValueError("Enter the reason for this attendance correction.")
+        project_id = row["project_id"] or row["current_project_id"]
+        head = self.one(
+            "SELECT id,name FROM project_heads WHERE id=? AND project_id=? AND active=1",
+            (authorized_by_head_id, project_id),
+        )
+        if not head:
+            raise ValueError("An active project head for this attendance project must authorize the correction.")
+        rate = self.employee_daily_rate_at(row["employee_id"], new_clock_in.date().isoformat())
+        result = compute_shift_pay(new_clock_in, new_clock_out, rate)
+        delta = result["gross_cents"] - row["gross_cents"]
+        batch = (self.one("SELECT * FROM payroll_batches WHERE id=?", (row["payroll_batch_id"],))
+                 if row["payroll_batch_id"] else None)
+        locked = False
+        if batch and batch["expense_id"]:
+            expense = self.one(
+                """SELECT e.*,COALESCE((SELECT SUM(amount_cents) FROM payments p
+                   WHERE p.expense_id=e.id AND p.accounting_excluded=0),0) paid_cents
+                   FROM expenses e WHERE e.id=?""", (batch["expense_id"],),
+            )
+            locked = bool(expense and (expense["paid_cents"] > 0 or
+                          (expense["verification_status"] or "Unverified") == "Verified"))
+        adjustment_id = None
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO attendance_revisions(attendance_id,project_id,old_clock_in,
+                   old_clock_out,new_clock_in,new_clock_out,old_gross_cents,new_gross_cents,
+                   payroll_batch_id,correction_reason,authorized_by_head_id)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (attendance_id, project_id, row["clock_in"], row["clock_out"],
+                 new_clock_in.isoformat(timespec="seconds"), new_clock_out.isoformat(timespec="seconds"),
+                 row["gross_cents"], result["gross_cents"], row["payroll_batch_id"],
+                 reason, authorized_by_head_id),
+            )
+            self.conn.execute(
+                """UPDATE attendance SET project_id=?,clock_in=?,clock_out=?,hours=?,lunch_hours=?,
+                   regular_hours=?,overtime_hours=?,regular_pay_cents=?,overtime_pay_cents=?,
+                   gross_cents=?,revision_count=revision_count+1 WHERE id=?""",
+                (project_id, new_clock_in.isoformat(timespec="seconds"),
+                 new_clock_out.isoformat(timespec="seconds"), result["hours"], result["lunch_hours"],
+                 result["regular_hours"], result["overtime_hours"], result["regular_pay_cents"],
+                 result["overtime_pay_cents"], result["gross_cents"], attendance_id),
+            )
+            if row["closure_batch_id"]:
+                self.conn.execute(
+                    """UPDATE attendance_closure_batches SET gross_cents=COALESCE((
+                       SELECT SUM(gross_cents) FROM attendance
+                       WHERE closure_batch_id=attendance_closure_batches.id),0) WHERE id=?""",
+                    (row["closure_batch_id"],),
+                )
+            if batch and delta:
+                if locked:
+                    adjustment_id = self.conn.execute(
+                        """INSERT INTO payroll_adjustments(employee_id,project_id,
+                           source_attendance_id,source_payroll_batch_id,amount_cents,reason,
+                           authorized_by_head_id) VALUES(?,?,?,?,?,?,?)""",
+                        (row["employee_id"], project_id, attendance_id, batch["id"], delta,
+                         reason, authorized_by_head_id),
+                    ).lastrowid
+                else:
+                    new_gross = batch["gross_cents"] + delta
+                    new_net = batch["net_cents"] + delta
+                    if new_net < 0:
+                        raise ValueError("The correction would make this payroll batch negative.")
+                    self.conn.execute("UPDATE payroll_batches SET gross_cents=?,net_cents=? WHERE id=?",
+                                      (new_gross, new_net, batch["id"]))
+                    self.conn.execute(
+                        """UPDATE expenses SET total_cents=?,unit_price_cents=?,status=CASE
+                           WHEN ?<=0 THEN 'Paid' ELSE 'Unpaid' END WHERE id=?""",
+                        (new_net, new_net, new_net, batch["expense_id"]),
+                    )
+            self.conn.execute("INSERT INTO audit_log(project_id,action,details) VALUES(?,?,?)",
+                (project_id, "ATTENDANCE_CORRECTED",
+                 f"Attendance #{attendance_id}, {row['name']} [{row['employee_no']}], "
+                 f"gross {money(row['gross_cents'])} to {money(result['gross_cents'])}, "
+                 f"reason: {reason}; authorized by {head['name']}"))
+        return {"attendance_id": attendance_id, "delta_cents": delta,
+                "locked_adjustment": bool(batch and locked and delta),
+                "adjustment_id": adjustment_id, **result}
+
     def closable_attendance_dates(self, project_id: int):
         """Return work dates that still need daily attendance closure."""
         return self.all(
             """SELECT SUBSTR(a.clock_in,1,10) work_date,COUNT(*) attendance_count,
                       COALESCE(SUM(a.gross_cents),0) gross_cents
                FROM attendance a JOIN employees e ON e.id=a.employee_id
-               WHERE e.project_id=? AND a.clock_out<>''
+               WHERE COALESCE(a.project_id,e.project_id)=? AND a.clock_out<>''
                  AND a.committed_expense_id IS NULL AND a.payroll_batch_id IS NULL
                  AND a.closure_batch_id IS NULL
                GROUP BY SUBSTR(a.clock_in,1,10) ORDER BY work_date""",
@@ -2839,7 +3245,7 @@ class Database:
         rows = self.all(
             """SELECT a.id,a.gross_cents FROM attendance a
                JOIN employees e ON e.id=a.employee_id
-               WHERE e.project_id=? AND SUBSTR(a.clock_in,1,10)=?
+               WHERE COALESCE(a.project_id,e.project_id)=? AND SUBSTR(a.clock_in,1,10)=?
                  AND a.clock_out<>'' AND a.committed_expense_id IS NULL
                  AND a.payroll_batch_id IS NULL AND a.closure_batch_id IS NULL
                ORDER BY a.id""", (project_id, work_date),
@@ -2886,15 +3292,16 @@ class Database:
                       COALESCE(SUM(CAST(NULLIF(a.overtime_hours,'') AS REAL)),0) overtime_hours_total,
                       COALESCE(SUM(a.gross_cents),0) gross_cents,
                       COALESCE(GROUP_CONCAT(DISTINCT cb.closure_ref),'') closure_references
-               FROM employees e JOIN projects p ON p.id=e.project_id
+               FROM employees e JOIN projects p ON p.id=?
                LEFT JOIN attendance a ON a.employee_id=e.id AND a.clock_out<>''
                     AND a.closure_batch_id IS NOT NULL AND a.payroll_batch_id IS NULL
                     AND a.committed_expense_id IS NULL
+                    AND COALESCE(a.project_id,e.project_id)=?
                     AND SUBSTR(a.clock_in,1,10) BETWEEN ? AND ?
                LEFT JOIN attendance_closure_batches cb ON cb.id=a.closure_batch_id
-               WHERE e.project_id=? AND e.active=1
+               WHERE (e.project_id=? AND e.active=1) OR a.id IS NOT NULL
                GROUP BY e.id ORDER BY e.name COLLATE NOCASE""",
-            (week_start, week_end, project_id),
+            (project_id, project_id, week_start, week_end, project_id),
         )
         result = []
         for employee in employees:
@@ -2903,10 +3310,16 @@ class Database:
                 for item in self.salary_deduction_plan(
                     employee["id"], employee["gross_cents"], week_end)
             )
+            adjustment = self.one(
+                """SELECT COALESCE(SUM(amount_cents),0) total FROM payroll_adjustments
+                   WHERE employee_id=? AND project_id=? AND status='Pending'""",
+                (employee["id"], project_id),
+            )["total"]
             row = dict(employee)
             row.update(week_start=week_start, week_end=week_end,
                        deduction_cents=deduction,
-                       net_cents=employee["gross_cents"] - deduction)
+                       adjustment_cents=adjustment,
+                       net_cents=employee["gross_cents"] - deduction + adjustment)
             result.append(row)
         return result
 
@@ -2923,16 +3336,19 @@ class Database:
                       COALESCE(SUM(a.regular_pay_cents),0) regular_pay_cents,
                       COALESCE(SUM(a.overtime_pay_cents),0) overtime_pay_cents,
                       COALESCE(SUM(a.gross_cents),0) gross_cents,
-                      COALESCE((SELECT SUM(t.amount_cents)
+                       COALESCE((SELECT SUM(t.amount_cents)
                         FROM cash_advance_transactions t
                         JOIN cash_advances ca ON ca.id=t.advance_id
                         WHERE t.payroll_batch_id=? AND ca.employee_id=e.id
                           AND t.txn_type='Salary Deduction' AND t.posted=1
-                          AND t.voided=0 AND ca.voided=0),0) deduction_cents
+                          AND t.voided=0 AND ca.voided=0),0) deduction_cents,
+                       COALESCE((SELECT SUM(pa.amount_cents) FROM payroll_adjustments pa
+                         WHERE pa.applied_payroll_batch_id=? AND pa.employee_id=e.id
+                           AND pa.status='Applied'),0) adjustment_cents
                FROM attendance a JOIN employees e ON e.id=a.employee_id
                WHERE a.payroll_batch_id=?
                GROUP BY e.id ORDER BY e.name COLLATE NOCASE""",
-            (batch_id, batch_id),
+            (batch_id, batch_id, batch_id),
         )
 
     def commit_weekly_payroll(self, project_id: int, week_value: str | date,
@@ -2942,7 +3358,7 @@ class Database:
         attendance = self.all(
             """SELECT a.*,e.id employee_id,e.name FROM attendance a
                JOIN employees e ON e.id=a.employee_id
-               WHERE e.project_id=? AND a.clock_out<>''
+               WHERE COALESCE(a.project_id,e.project_id)=? AND a.clock_out<>''
                  AND a.closure_batch_id IS NOT NULL AND a.payroll_batch_id IS NULL
                  AND a.committed_expense_id IS NULL
                  AND SUBSTR(a.clock_in,1,10) BETWEEN ? AND ?
@@ -2968,7 +3384,13 @@ class Database:
             )
         gross = sum(row["gross_cents"] for row in attendance)
         deduction_total = sum(item["amount_cents"] for item in deduction_plan)
-        net = gross - deduction_total
+        adjustment_rows = self.all(
+            f"""SELECT * FROM payroll_adjustments WHERE project_id=? AND status='Pending'
+               AND employee_id IN ({','.join('?' for _ in gross_by_employee)}) ORDER BY id""",
+            (project_id, *gross_by_employee),
+        )
+        adjustment_total = sum(row["amount_cents"] for row in adjustment_rows)
+        net = gross - deduction_total + adjustment_total
         _deposited, _committed, remaining = self.project_commitment_budget(project_id)
         if net > remaining:
             raise ValueError(
@@ -2987,15 +3409,16 @@ class Database:
                 (project_id, f"Weekly Payroll {week_start} to {week_end}",
                  "Daily-closed attendance payroll", "Payroll", net, net,
                  "PAYROLL", "Labor", commit_date, commit_date, reference,
-                 f"{len(attendance)} attendance record(s); salary deductions {money(deduction_total)}",
+                  f"{len(attendance)} attendance record(s); salary deductions {money(deduction_total)}; "
+                  f"attendance corrections {money(adjustment_total)}",
                  authorized_by_head_id, "Paid" if net <= 0 else "Unpaid"),
             ).lastrowid
             batch_id = self.conn.execute(
                 """INSERT INTO payroll_batches(project_id,batch_ref,period_start,
-                   period_end,gross_cents,deduction_cents,net_cents,expense_id,
-                   authorized_by_head_id,week_schedule) VALUES(?,?,?,?,?,?,?,?,?,'Saturday-Friday')""",
-                (project_id, reference, week_start, week_end, gross,
-                 deduction_total, net, expense_id, authorized_by_head_id),
+                   period_end,gross_cents,deduction_cents,adjustment_cents,net_cents,expense_id,
+                   authorized_by_head_id,week_schedule) VALUES(?,?,?,?,?,?,?,?,?,?,'Saturday-Friday')""",
+                 (project_id, reference, week_start, week_end, gross,
+                  deduction_total, adjustment_total, net, expense_id, authorized_by_head_id),
             ).lastrowid
             self.conn.executemany(
                 """UPDATE attendance SET committed_expense_id=?,payroll_batch_id=?
@@ -3006,17 +3429,25 @@ class Database:
                 self.post_salary_deduction_plan(
                     deduction_plan, batch_id, commit_date, authorized_by_head_id
                 )
+            if adjustment_rows:
+                self.conn.executemany(
+                    """UPDATE payroll_adjustments SET status='Applied',applied_payroll_batch_id=?
+                       WHERE id=?""",
+                    [(batch_id, row["id"]) for row in adjustment_rows],
+                )
             self.conn.execute(
                 "INSERT INTO audit_log(project_id,action,details) VALUES(?,?,?)",
                 (project_id, "WEEKLY_PAYROLL_COMMITTED",
                  f"{reference}: {week_start} to {week_end}, gross {money(gross)}, "
-                 f"deductions {money(deduction_total)}, net {money(net)}, "
+                  f"deductions {money(deduction_total)}, corrections {money(adjustment_total)}, "
+                  f"net {money(net)}, "
                  f"authorized by {head['name']}"),
             )
         return {"id": batch_id, "reference": reference,
                 "week_start": week_start, "week_end": week_end,
                 "attendance_count": len(attendance), "gross_cents": gross,
-                "deduction_cents": deduction_total, "net_cents": net,
+                "deduction_cents": deduction_total, "adjustment_cents": adjustment_total,
+                "net_cents": net,
                 "expense_id": expense_id}
 
     def create_project(self, values: dict) -> int:
@@ -3065,6 +3496,368 @@ class Database:
                 (project_id, "PROJECT_CREATED", values["name"]),
             )
         return project_id
+
+    def project_is_active(self, project_id: int | None) -> bool:
+        if not project_id:
+            return False
+        row = self.one("SELECT status FROM projects WHERE id=?", (project_id,))
+        return bool(row and (row["status"] or "Active") != "Completed")
+
+    def project_completion_metrics(self, project_id: int) -> dict:
+        project = self.one("SELECT * FROM projects WHERE id=?", (project_id,))
+        if not project:
+            raise ValueError("The selected project no longer exists.")
+        deposited, paid, _payment_balance = self.project_budget(project_id)
+        _dep, committed, budget_remaining = self.project_commitment_budget(project_id)
+        tasks = self.one(
+            """SELECT COUNT(*) total,COALESCE(SUM(t.completed),0) done
+               FROM tasks t JOIN phases p ON p.id=t.phase_id WHERE p.project_id=?""",
+            (project_id,),
+        )
+        task_count = tasks["total"]
+        completed_task_count = tasks["done"]
+        progress = round(completed_task_count * 100 / task_count) if task_count else 0
+        expense_count = self.one(
+            "SELECT COUNT(*) n FROM expenses WHERE project_id=? AND voided=0", (project_id,)
+        )["n"]
+        payroll_batch_count = self.one(
+            "SELECT COUNT(*) n FROM payroll_batches WHERE project_id=?", (project_id,)
+        )["n"]
+        attendance_count = self.one(
+            """SELECT COUNT(*) n FROM attendance a JOIN employees e ON e.id=a.employee_id
+               WHERE COALESCE(a.project_id,e.project_id)=?""", (project_id,)
+        )["n"]
+        return {
+            "contract_value_cents": project["contract_value_cents"],
+            "deposited_cents": deposited,
+            "active_expense_cents": committed,
+            "paid_cents": paid,
+            "outstanding_cents": max(0, committed - paid),
+            "budget_remaining_cents": budget_remaining,
+            "task_count": task_count,
+            "completed_task_count": completed_task_count,
+            "progress_percent": progress,
+            "expense_count": expense_count,
+            "payroll_batch_count": payroll_batch_count,
+            "attendance_count": attendance_count,
+        }
+
+    def project_completion_checks(self, project_id: int) -> dict:
+        """Return blockers that must be resolved and warnings retained in the closeout."""
+        open_attendance = self.one(
+            """SELECT COUNT(*) n FROM attendance a JOIN employees e ON e.id=a.employee_id
+               WHERE COALESCE(a.project_id,e.project_id)=? AND a.clock_out=''""", (project_id,)
+        )["n"]
+        uncommitted_attendance = self.one(
+            """SELECT COUNT(*) n FROM attendance a JOIN employees e ON e.id=a.employee_id
+               WHERE COALESCE(a.project_id,e.project_id)=? AND a.clock_out<>''
+                 AND a.payroll_batch_id IS NULL""", (project_id,)
+        )["n"]
+        metrics = self.project_completion_metrics(project_id)
+        unverified = self.one(
+            """SELECT COUNT(*) n FROM expenses WHERE project_id=? AND voided=0
+               AND COALESCE(verification_status,'Unverified')<>'Verified'""", (project_id,)
+        )["n"]
+        outstanding_advances = self.one(
+            """SELECT COALESCE(SUM(MAX(a.original_cents-COALESCE((SELECT SUM(t.amount_cents)
+                   FROM cash_advance_transactions t WHERE t.advance_id=a.id AND t.posted=1
+                   AND t.voided=0 AND t.txn_type<>'Advance'),0),0)),0) total
+               FROM cash_advances a WHERE a.project_id=? AND a.voided=0""", (project_id,)
+        )["total"]
+        return {
+            "blockers": [message for count, message in (
+                (open_attendance, f"{open_attendance} employee attendance record(s) are still clocked in."),
+                (uncommitted_attendance,
+                 f"{uncommitted_attendance} closed attendance record(s) have not been committed to weekly payroll."),
+            ) if count],
+            "warnings": [message for condition, message in (
+                (metrics["outstanding_cents"] > 0,
+                 f"Outstanding expense commitments: {money(metrics['outstanding_cents'])}."),
+                (metrics["completed_task_count"] < metrics["task_count"],
+                 f"Incomplete process tasks: {metrics['task_count']-metrics['completed_task_count']} of {metrics['task_count']}."),
+                (unverified > 0, f"Unverified active expenses: {unverified}."),
+                (outstanding_advances > 0,
+                 f"Outstanding employee cash advances: {money(outstanding_advances)}."),
+            ) if condition],
+            "metrics": metrics,
+        }
+
+    def complete_project(self, project_id: int, completion_date: str,
+                         notes: str, approving_heads) -> str:
+        project = self.one("SELECT * FROM projects WHERE id=?", (project_id,))
+        if not project:
+            raise ValueError("The selected project no longer exists.")
+        if not self.project_is_active(project_id):
+            raise ValueError("This project is already completed.")
+        completion_date = valid_date(completion_date, True)
+        checks = self.project_completion_checks(project_id)
+        if checks["blockers"]:
+            raise ValueError("Project completion is blocked:\n\n" + "\n".join(checks["blockers"]))
+        metrics = checks["metrics"]
+        reference = self._next_system_reference(
+            "CMP", "project_completion_snapshots", "completion_reference", completion_date
+        )
+        head_ids = ",".join(str(row["id"]) for row in approving_heads)
+        head_names = ", ".join(row["name"] for row in approving_heads)
+        completed_at = local_timestamp()
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO project_completion_snapshots(
+                   project_id,completion_reference,completion_date,completion_time,
+                   completed_by_head_ids,completed_by_names,completion_notes,
+                   contract_value_cents,deposited_cents,active_expense_cents,paid_cents,
+                   outstanding_cents,budget_remaining_cents,task_count,completed_task_count,
+                   progress_percent,expense_count,payroll_batch_count,attendance_count)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (project_id, reference, completion_date, completed_at, head_ids, head_names,
+                 notes.strip(), metrics["contract_value_cents"], metrics["deposited_cents"],
+                 metrics["active_expense_cents"], metrics["paid_cents"],
+                 metrics["outstanding_cents"], metrics["budget_remaining_cents"],
+                 metrics["task_count"], metrics["completed_task_count"],
+                 metrics["progress_percent"], metrics["expense_count"],
+                 metrics["payroll_batch_count"], metrics["attendance_count"]),
+            )
+            self.conn.execute(
+                """UPDATE projects SET status='Completed',completed_at=?,completion_reference=?,
+                   completion_notes=?,completed_by_names=? WHERE id=?""",
+                (completed_at, reference, notes.strip(), head_names, project_id),
+            )
+            self.conn.execute(
+                "INSERT INTO audit_log(project_id,action,details) VALUES(?,?,?)",
+                (project_id, "PROJECT_COMPLETED",
+                 f"{reference}; completion date {completion_date}; approved by {head_names}; {notes.strip()}"),
+            )
+        return reference
+
+    def reactivate_project(self, project_id: int, notes: str, approving_heads) -> None:
+        project = self.one("SELECT * FROM projects WHERE id=?", (project_id,))
+        if not project or (project["status"] or "Active") != "Completed":
+            raise ValueError("Only a completed project can be reactivated.")
+        if not notes.strip():
+            raise ValueError("Enter a reason for reactivating the project.")
+        head_names = ", ".join(row["name"] for row in approving_heads)
+        now = local_timestamp()
+        with self.conn:
+            self.conn.execute(
+                """UPDATE project_completion_snapshots SET reactivated_at=?,
+                   reactivated_by_names=?,reactivation_notes=?
+                   WHERE id=(SELECT id FROM project_completion_snapshots
+                             WHERE project_id=? AND reactivated_at='' ORDER BY id DESC LIMIT 1)""",
+                (now, head_names, notes.strip(), project_id),
+            )
+            self.conn.execute(
+                """UPDATE projects SET status='Active',completed_at='',completion_reference='',
+                   completion_notes='',completed_by_names='' WHERE id=?""", (project_id,)
+            )
+            self.conn.execute(
+                "INSERT INTO audit_log(project_id,action,details) VALUES(?,?,?)",
+                (project_id, "PROJECT_REACTIVATED", f"Approved by {head_names}; {notes.strip()}"),
+            )
+
+    def next_inventory_item_code(self, project_id: int) -> str:
+        sequence = self.one(
+            "SELECT COUNT(*) n FROM inventory_items WHERE project_id=?", (project_id,)
+        )["n"] + 1
+        code = f"INV-{project_id:03d}-{sequence:04d}"
+        while self.one("SELECT 1 FROM inventory_items WHERE item_code=?", (code,)):
+            sequence += 1
+            code = f"INV-{project_id:03d}-{sequence:04d}"
+        return code
+
+    def inventory_item_balance(self, item_id: int) -> dict:
+        item = self.one("SELECT * FROM inventory_items WHERE id=?", (item_id,))
+        if not item:
+            raise ValueError("The selected inventory item no longer exists.")
+        if item["material_type"] == "Consumable":
+            movement = self.one(
+                """SELECT COALESCE(SUM(CASE
+                       WHEN transaction_type IN ('Initial Stock','Restock') THEN quantity_milli
+                       WHEN transaction_type='Consume' THEN -quantity_milli ELSE 0 END),0) balance
+                   FROM inventory_transactions WHERE item_id=? AND voided=0""", (item_id,)
+            )["balance"]
+            on_hand = max(0, movement)
+            status = ("Out of Stock" if on_hand <= 0 else
+                      "Low Stock" if on_hand <= item["reorder_level_milli"] else "In Stock")
+            return {"on_hand_milli": on_hand, "borrowed_milli": 0,
+                    "available_milli": on_hand, "status": status}
+        borrowed = self.one(
+            """SELECT COALESCE(SUM(CASE WHEN transaction_type='Borrow' THEN quantity_milli
+                       WHEN transaction_type='Return' THEN -quantity_milli ELSE 0 END),0) total
+               FROM inventory_transactions WHERE item_id=? AND voided=0""", (item_id,)
+        )["total"]
+        borrowed = max(0, borrowed)
+        available = max(0, item["registered_quantity_milli"] - borrowed)
+        status = ("Available" if borrowed == 0 else
+                  "Borrowed" if available == 0 else "Partially Borrowed")
+        return {"on_hand_milli": item["registered_quantity_milli"],
+                "borrowed_milli": borrowed, "available_milli": available, "status": status}
+
+    def inventory_item_rows(self, project_id: int, include_inactive: bool = False) -> list[dict]:
+        clause = "" if include_inactive else " AND active=1"
+        rows = self.all(
+            f"""SELECT * FROM inventory_items WHERE project_id=?{clause}
+                ORDER BY material_type,name COLLATE NOCASE,item_code""", (project_id,)
+        )
+        result = []
+        for row in rows:
+            values = dict(row); values.update(self.inventory_item_balance(row["id"])); result.append(values)
+        return result
+
+    def active_inventory_loans(self, project_id: int) -> list[dict]:
+        rows = self.all(
+            """SELECT borrow.*,i.item_code,i.name item_name,i.unit,e.name employee,
+                   e.employee_no,COALESCE(SUM(ret.quantity_milli),0) returned_milli
+               FROM inventory_transactions borrow
+               JOIN inventory_items i ON i.id=borrow.item_id
+               JOIN employees e ON e.id=borrow.employee_id
+               LEFT JOIN inventory_transactions ret ON ret.linked_transaction_id=borrow.id
+                    AND ret.transaction_type='Return' AND ret.voided=0
+               WHERE borrow.project_id=? AND borrow.transaction_type='Borrow' AND borrow.voided=0
+               GROUP BY borrow.id HAVING borrow.quantity_milli-COALESCE(SUM(ret.quantity_milli),0)>0
+               ORDER BY borrow.transaction_date,borrow.id""", (project_id,)
+        )
+        result = []
+        for row in rows:
+            values = dict(row)
+            values["outstanding_milli"] = row["quantity_milli"] - row["returned_milli"]
+            result.append(values)
+        return result
+
+    def register_inventory_item(self, *, project_id: int, name: str, material_type: str,
+                                category: str, unit: str, opening_quantity_milli: int,
+                                reorder_level_milli: int, condition_status: str,
+                                notes: str, authorized_by_head_id: int,
+                                registration_date: str) -> dict:
+        if not self.project_is_active(project_id):
+            raise ValueError("Inventory cannot be changed for a completed project.")
+        if not name.strip() or not category.strip() or not unit.strip():
+            raise ValueError("Item name, category and unit are required.")
+        if material_type not in {"Consumable", "Non-Consumable"}:
+            raise ValueError("Select Consumable or Non-Consumable.")
+        if opening_quantity_milli <= 0:
+            raise ValueError("Opening quantity must be greater than zero.")
+        if material_type == "Non-Consumable" and opening_quantity_milli % 1000:
+            raise ValueError("Non-consumable tools must use a whole-number quantity.")
+        head = self.one(
+            "SELECT id,name FROM project_heads WHERE id=? AND project_id=? AND active=1",
+            (authorized_by_head_id, project_id),
+        )
+        if not head:
+            raise ValueError("An active project head must authorize inventory registration.")
+        registration_date = valid_date(registration_date, True)
+        item_code = self.next_inventory_item_code(project_id)
+        reference = self._next_system_reference(
+            "STK", "inventory_transactions", "reference", registration_date
+        )
+        with self.conn:
+            item_id = self.conn.execute(
+                """INSERT INTO inventory_items(project_id,item_code,name,material_type,category,
+                   unit,registered_quantity_milli,reorder_level_milli,condition_status,notes,
+                   created_by_head_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (project_id,item_code,name.strip(),material_type,category.strip(),unit.strip(),
+                 opening_quantity_milli,reorder_level_milli,condition_status.strip() or "Good",
+                 notes.strip(),authorized_by_head_id),
+            ).lastrowid
+            self.conn.execute(
+                """INSERT INTO inventory_transactions(reference,project_id,item_id,transaction_type,
+                   quantity_milli,transaction_date,transaction_time,reason,condition_note,notes,
+                   authorized_by_head_id) VALUES(?,?,?,'Initial Stock',?,?,?,?,?,?,?)""",
+                (reference,project_id,item_id,opening_quantity_milli,registration_date,
+                 local_timestamp(),"Inventory registration",condition_status.strip(),notes.strip(),
+                 authorized_by_head_id),
+            )
+            self.conn.execute(
+                "INSERT INTO audit_log(project_id,action,details) VALUES(?,?,?)",
+                (project_id,"INVENTORY_ITEM_REGISTERED",
+                 f"{item_code} {name.strip()} ({material_type}), {inventory_quantity(opening_quantity_milli)} {unit}; authorized by {head['name']}"),
+            )
+        return {"id": item_id, "item_code": item_code, "reference": reference}
+
+    def record_inventory_movement(self, *, item_id: int, transaction_type: str,
+                                  quantity_milli: int, transaction_date: str, reason: str,
+                                  notes: str, authorized_by_head_id: int,
+                                  employee_id: int | None = None,
+                                  condition_note: str = "",
+                                  linked_transaction_id: int | None = None) -> str:
+        item = self.one("SELECT * FROM inventory_items WHERE id=? AND active=1", (item_id,))
+        if not item:
+            raise ValueError("Select an active inventory item.")
+        project_id = item["project_id"]
+        if not self.project_is_active(project_id):
+            raise ValueError("Inventory cannot be changed for a completed project.")
+        if transaction_type not in {"Restock", "Consume", "Borrow", "Return"}:
+            raise ValueError("Select a valid inventory activity.")
+        if quantity_milli <= 0:
+            raise ValueError("Quantity must be greater than zero.")
+        if item["material_type"] == "Non-Consumable" and quantity_milli % 1000:
+            raise ValueError("Non-consumable tools must use a whole-number quantity.")
+        if transaction_type in {"Restock", "Consume"} and item["material_type"] != "Consumable":
+            raise ValueError("Restock and usage apply only to consumable materials.")
+        if transaction_type in {"Borrow", "Return"} and item["material_type"] != "Non-Consumable":
+            raise ValueError("Borrow and return apply only to non-consumable tools.")
+        if not reason.strip():
+            raise ValueError("Enter the purpose or reason for this inventory activity.")
+        head = self.one(
+            "SELECT id,name FROM project_heads WHERE id=? AND project_id=? AND active=1",
+            (authorized_by_head_id, project_id),
+        )
+        if not head:
+            raise ValueError("An active project head must authorize this inventory activity.")
+        employee = None
+        if transaction_type in {"Consume", "Borrow", "Return"}:
+            employee = self.one(
+                "SELECT id,name FROM employees WHERE id=? AND project_id=? AND active=1",
+                (employee_id, project_id),
+            )
+            if not employee:
+                raise ValueError("Select an active employee assigned to this project.")
+        balance = self.inventory_item_balance(item_id)
+        if transaction_type == "Consume" and quantity_milli > balance["on_hand_milli"]:
+            raise ValueError(
+                f"Only {inventory_quantity(balance['on_hand_milli'])} {item['unit']} is currently in stock."
+            )
+        if transaction_type == "Borrow" and quantity_milli > balance["available_milli"]:
+            raise ValueError(
+                f"Only {inventory_quantity(balance['available_milli'])} {item['unit']} is available to borrow."
+            )
+        if transaction_type == "Return":
+            loan = self.one(
+                """SELECT b.*,COALESCE(SUM(r.quantity_milli),0) returned_milli
+                   FROM inventory_transactions b LEFT JOIN inventory_transactions r
+                     ON r.linked_transaction_id=b.id AND r.transaction_type='Return' AND r.voided=0
+                   WHERE b.id=? AND b.item_id=? AND b.employee_id=? AND b.transaction_type='Borrow'
+                     AND b.voided=0 GROUP BY b.id""",
+                (linked_transaction_id,item_id,employee_id),
+            )
+            if not loan:
+                raise ValueError("Select an active borrowing record to return.")
+            outstanding = loan["quantity_milli"] - loan["returned_milli"]
+            if quantity_milli > outstanding:
+                raise ValueError(
+                    f"This borrowing record only has {inventory_quantity(outstanding)} {item['unit']} outstanding."
+                )
+        transaction_date = valid_date(transaction_date, True)
+        prefix = {"Restock":"RST","Consume":"USE","Borrow":"BRW","Return":"RTN"}[transaction_type]
+        reference = self._next_system_reference(
+            prefix,"inventory_transactions","reference",transaction_date
+        )
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO inventory_transactions(reference,project_id,item_id,employee_id,
+                   transaction_type,quantity_milli,transaction_date,transaction_time,reason,
+                   condition_note,notes,linked_transaction_id,authorized_by_head_id)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (reference,project_id,item_id,employee_id,transaction_type,quantity_milli,
+                 transaction_date,local_timestamp(),reason.strip(),condition_note.strip(),notes.strip(),
+                 linked_transaction_id,authorized_by_head_id),
+            )
+            employee_text = f" by {employee['name']}" if employee else ""
+            self.conn.execute(
+                "INSERT INTO audit_log(project_id,action,details) VALUES(?,?,?)",
+                (project_id,f"INVENTORY_{transaction_type.upper()}",
+                 f"{reference} {item['item_code']} {inventory_quantity(quantity_milli)} {item['unit']}{employee_text}; {reason.strip()}; authorized by {head['name']}"),
+            )
+        return reference
 
     def close(self):
         self.conn.close()
@@ -3881,6 +4674,12 @@ class BaseTab(ttk.Frame):
         if not self.project_id:
             messagebox.showinfo(APP_TITLE, "Create or select a project first.")
             return False
+        if not self.db.project_is_active(self.project_id):
+            messagebox.showinfo(
+                APP_TITLE,
+                "This project is completed and read-only. Open Completed Projects to review its records."
+            )
+            return False
         return True
 
     def selected_id(self, tree):
@@ -4070,6 +4869,7 @@ class ProjectChecklist(ttk.Frame):
     def set_projects(self, rows):
         previous = self.selected_ids()
         first_load = not self.projects
+        previously_all = bool(self.projects) and len(previous) == len(self.projects)
         self.projects = {row["id"]: row["name"] for row in rows}
         self.variables = {}
         self.menu.delete(0, "end")
@@ -4077,7 +4877,7 @@ class ProjectChecklist(ttk.Frame):
         self.menu.add_command(label="Clear selection", command=lambda: self._set_all(False))
         self.menu.add_separator()
         for project_id, name in self.projects.items():
-            selected = first_load or project_id in previous
+            selected = first_load or previously_all or project_id in previous
             variable = tk.BooleanVar(value=selected)
             self.variables[project_id] = variable
             self.menu.add_checkbutton(
@@ -4109,6 +4909,75 @@ class ProjectChecklist(ttk.Frame):
         else:
             text = f"{len(selected)} projects selected"
         self.label_var.set(text)
+
+    def display_text(self):
+        return self.label_var.get()
+
+
+class DynamicChecklist(ttk.Frame):
+    """Reusable checkbox dropdown whose values can be refreshed from SQLite."""
+    def __init__(self, parent, all_label, none_label, plural_label, command=None, width=0):
+        super().__init__(parent)
+        self.command = command
+        self.all_label = all_label
+        self.none_label = none_label
+        self.plural_label = plural_label
+        self.options = {}
+        self.variables = {}
+        self.label_var = tk.StringVar(value=all_label)
+        button_options = dict(
+            textvariable=self.label_var, relief="solid", bd=1,
+            bg=WHITE, fg=INK, padx=8, pady=3, anchor="w",
+        )
+        if width:
+            button_options["width"] = width
+        self.button = tk.Menubutton(self, **button_options)
+        self.menu = tk.Menu(self.button, tearoff=False)
+        self.button.configure(menu=self.menu)
+        self.button.pack(fill="x", expand=True)
+
+    def set_options(self, options):
+        """Set ``(key, label)`` pairs while retaining the user's selection."""
+        previous = set(self.selected())
+        first_load = not self.options
+        previously_all = bool(self.options) and len(previous) == len(self.options)
+        self.options = dict(options)
+        self.variables = {}
+        self.menu.delete(0, "end")
+        self.menu.add_command(label="Select all", command=lambda: self.set_all(True))
+        self.menu.add_command(label="Clear selection", command=lambda: self.set_all(False))
+        self.menu.add_separator()
+        for key, label in self.options.items():
+            variable = tk.BooleanVar(value=first_load or previously_all or key in previous)
+            self.variables[key] = variable
+            self.menu.add_checkbutton(label=label, variable=variable, command=self._changed)
+        self._update_label()
+
+    def selected(self):
+        return [key for key, variable in self.variables.items() if variable.get()]
+
+    def set_all(self, selected):
+        for variable in self.variables.values():
+            variable.set(selected)
+        self._changed()
+
+    def display_text(self):
+        selected = self.selected()
+        if not self.options or len(selected) == len(self.options):
+            return self.all_label
+        if not selected:
+            return self.none_label
+        if len(selected) == 1:
+            return self.options[selected[0]]
+        return f"{len(selected)} {self.plural_label} selected"
+
+    def _update_label(self):
+        self.label_var.set(self.display_text())
+
+    def _changed(self):
+        self._update_label()
+        if self.command:
+            self.command()
 
 
 class StatusChecklist(ttk.Frame):
@@ -4505,6 +5374,361 @@ def layout_metric_cards(parent, cards):
         card.grid(row=0, column=column, sticky="nsew", padx=(0, 8))
 
 
+class ProjectCompletionDialog(tk.Toplevel):
+    def __init__(self, parent, project, checks):
+        super().__init__(parent)
+        self.title("Complete Project")
+        self.geometry("700x560"); self.minsize(620, 500)
+        self.result = None
+        self.date_var = tk.StringVar(value=date.today().isoformat())
+        self.notes_var = tk.StringVar()
+        body = ttk.Frame(self, padding=22); body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Complete and archive this project", style="DialogTitle.TLabel").pack(anchor="w")
+        ttk.Label(body, text=project["name"], style="Section.TLabel").pack(anchor="w", pady=(5, 2))
+        ttk.Label(body, text=(
+            "Completion preserves every record and locks the project against new operational entries. "
+            "It remains available in Completed Projects."
+        ), style="Muted.TLabel", wraplength=640).pack(anchor="w", pady=(0, 14))
+        metrics = checks["metrics"]
+        summary = ttk.LabelFrame(body, text="Closeout snapshot", padding=12)
+        summary.pack(fill="x")
+        values = (
+            ("Contract value", money(metrics["contract_value_cents"])),
+            ("Deposited", money(metrics["deposited_cents"])),
+            ("Active expenses", money(metrics["active_expense_cents"])),
+            ("Payments recorded", money(metrics["paid_cents"])),
+            ("Outstanding", money(metrics["outstanding_cents"])),
+            ("Progress", f"{metrics['progress_percent']}%"),
+        )
+        for index, (label, value) in enumerate(values):
+            row, column = divmod(index, 3)
+            cell = ttk.Frame(summary); cell.grid(row=row, column=column, sticky="ew", padx=8, pady=5)
+            ttk.Label(cell, text=label, style="Muted.TLabel").pack(anchor="w")
+            ttk.Label(cell, text=value, style="Section.TLabel").pack(anchor="w")
+            summary.columnconfigure(column, weight=1)
+        if checks["warnings"]:
+            warning = ttk.LabelFrame(body, text="Items retained as closeout notes", padding=10)
+            warning.pack(fill="x", pady=(12, 0))
+            ttk.Label(warning, text="\n".join(f"• {item}" for item in checks["warnings"]),
+                      wraplength=620).pack(anchor="w")
+        form = ttk.Frame(body); form.pack(fill="x", pady=(14, 0)); form.columnconfigure(1, weight=1)
+        ttk.Label(form, text="Completion date *").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=5)
+        date_entry = ttk.Entry(form, textvariable=self.date_var, width=22)
+        date_entry.grid(row=0, column=1, sticky="w", pady=5)
+        ttk.Button(form, text="📅", width=3, command=lambda: DatePickerPopup(self, self.date_var)).grid(
+            row=0, column=2, sticky="w", padx=(6, 0), pady=5)
+        ttk.Label(form, text="Completion / turnover notes *").grid(
+            row=1, column=0, sticky="w", padx=(0, 10), pady=5)
+        notes_entry = ttk.Entry(form, textvariable=self.notes_var)
+        notes_entry.grid(row=1, column=1, columnspan=2, sticky="ew", pady=5)
+        self.widgets = {"completion_date": date_entry, "notes": notes_entry}
+        footer = ttk.Frame(body); footer.pack(fill="x", pady=(18, 0))
+        ttk.Button(footer, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(footer, text="Continue to All-Heads Approval", style="Primary.TButton",
+                   command=self.save).pack(side="right", padx=(0, 8))
+        self.transient(parent); self.grab_set(); self.bind("<Escape>", lambda _e: self.destroy())
+
+    def save(self):
+        if not self.date_var.get().strip() or not self.notes_var.get().strip():
+            missing = [widget for key, widget in self.widgets.items()
+                       if not (self.date_var.get() if key == "completion_date" else self.notes_var.get()).strip()]
+            flash_required_widgets(self, missing)
+            return
+        try:
+            completion_date = valid_date(self.date_var.get(), True)
+        except ValueError as exc:
+            flash_required_widgets(self, [self.widgets["completion_date"]])
+            messagebox.showerror(APP_TITLE, str(exc), parent=self); return
+        self.result = {"completion_date": completion_date, "notes": self.notes_var.get().strip()}
+        self.destroy()
+
+
+class CompletedProjectDetailsDialog(tk.Toplevel):
+    def __init__(self, parent, db, project_id):
+        super().__init__(parent)
+        self.db = db; self.project_id = project_id
+        self.title("Completed Project Record"); self.geometry("1240x760"); self.minsize(1000, 650)
+        project = db.one("SELECT * FROM projects WHERE id=?", (project_id,))
+        snapshot = db.one(
+            """SELECT * FROM project_completion_snapshots WHERE project_id=?
+               ORDER BY id DESC LIMIT 1""", (project_id,)
+        )
+        metrics = db.project_completion_metrics(project_id)
+        body = ttk.Frame(self, padding=18); body.pack(fill="both", expand=True)
+        ttk.Label(body, text=project["name"], style="DialogTitle.TLabel").pack(anchor="w")
+        ttk.Label(body, text=(
+            f"{project['client']}  |  {project['address'] or 'No address recorded'}  |  "
+            f"Completion ref. {project['completion_reference'] or 'Legacy completion'}"
+        ), style="Muted.TLabel").pack(anchor="w", pady=(2, 10))
+        notebook = ttk.Notebook(body); notebook.pack(fill="both", expand=True)
+        overview = ttk.Frame(notebook, padding=14); expenses_page = ttk.Frame(notebook, padding=8)
+        process_page = ttk.Frame(notebook, padding=8); inventory_page = ttk.Frame(notebook, padding=8)
+        finance_page = ttk.Frame(notebook, padding=8)
+        payroll_page = ttk.Frame(notebook, padding=8); people_page = ttk.Frame(notebook, padding=8)
+        audit_page = ttk.Frame(notebook, padding=8)
+        for page, label in ((overview,"Overview"),(expenses_page,"Expenses"),
+                            (process_page,"Phases & Processes"),(finance_page,"Remittances"),
+                            (inventory_page,"Inventory"),
+                            (payroll_page,"Payroll & Attendance"),(people_page,"People"),
+                            (audit_page,"Audit History")):
+            notebook.add(page, text=label)
+        self._build_overview(overview, project, snapshot, metrics)
+        self._build_expenses(expenses_page)
+        self._build_processes(process_page)
+        self._build_inventory(inventory_page)
+        self._build_remittances(finance_page)
+        self._build_payroll(payroll_page)
+        self._build_people(people_page)
+        self._build_audit(audit_page)
+        ttk.Button(body, text="Close", command=self.destroy).pack(anchor="e", pady=(10, 0))
+        self.transient(parent); self.grab_set()
+
+    @staticmethod
+    def _duration_text(start_value, end_value):
+        try:
+            days = (date.fromisoformat(end_value) - date.fromisoformat(start_value)).days + 1
+            return f"{max(0, days):,} calendar day(s)"
+        except (TypeError, ValueError):
+            return "Not available"
+
+    def _build_overview(self, page, project, snapshot, metrics):
+        completion_date = snapshot["completion_date"] if snapshot else (
+            project["completed_at"][:10] if project["completed_at"] else ""
+        )
+        ttk.Label(page, text="Project closeout summary", style="Section.TLabel").pack(anchor="w")
+        grid = ttk.Frame(page); grid.pack(fill="x", pady=(10, 18))
+        fields = (
+            ("Project", project["name"]), ("Client", project["client"]),
+            ("Address", project["address"] or "—"), ("Status", project["status"]),
+            ("Planned schedule", f"{project['start_date'] or '—'} to {project['target_date'] or '—'}"),
+            ("Actual duration", self._duration_text(project["start_date"], completion_date)),
+            ("Completed", completion_date or "—"),
+            ("Approved by", project["completed_by_names"] or "Legacy / not recorded"),
+            ("Contract value", money(metrics["contract_value_cents"])),
+            ("Deposited", money(metrics["deposited_cents"])),
+            ("Active expenses", money(metrics["active_expense_cents"])),
+            ("Payments recorded", money(metrics["paid_cents"])),
+            ("Outstanding", money(metrics["outstanding_cents"])),
+            ("Budget remaining", money(metrics["budget_remaining_cents"])),
+            ("Process completion", f"{metrics['completed_task_count']}/{metrics['task_count']} tasks — {metrics['progress_percent']}%"),
+        )
+        for index, (label, value) in enumerate(fields):
+            row, column = divmod(index, 3)
+            cell = tk.Frame(grid, bg=WHITE, highlightbackground="#D8DEE8", highlightthickness=1,
+                            padx=12, pady=9)
+            cell.grid(row=row, column=column, sticky="nsew", padx=4, pady=4)
+            tk.Label(cell, text=label.upper(), bg=WHITE, fg=MUTED,
+                     font=("Segoe UI", 8, "bold")).pack(anchor="w")
+            tk.Label(cell, text=str(value), bg=WHITE, fg=INK, wraplength=300,
+                     justify="left", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(4, 0))
+            grid.columnconfigure(column, weight=1, uniform="overview")
+        notes = snapshot["completion_notes"] if snapshot else project["completion_notes"]
+        ttk.Label(page, text="Completion / turnover notes", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(page, text=notes or "No completion notes recorded.", wraplength=1050,
+                  justify="left").pack(anchor="w", fill="x", pady=(5, 0))
+
+    def _build_expenses(self, page):
+        split = ttk.Panedwindow(page, orient="vertical"); split.pack(fill="both", expand=True)
+        expense_pane = ttk.Frame(split); payment_pane = ttk.Frame(split)
+        split.add(expense_pane, weight=3); split.add(payment_pane, weight=2)
+        ttk.Label(expense_pane, text="Complete expense ledger", style="Section.TLabel").pack(anchor="w")
+        tree = make_tree(expense_pane, [("date","Date",90),("batch","Batch Ref.",135),
+            ("status","Status",95),("verify","Verification",95),("name","Expense",180),
+            ("item","Item",170),("supplier","Supplier",130),("area","Area",105),
+            ("total","Total",95),("paid","Paid",95),("outstanding","Outstanding",100),
+            ("mop","MOP",110),("notes","Notes",220)])
+        rows = self.db.all("""SELECT e.*,COALESCE(b.reference,'Legacy') batch_ref,
+            COALESCE(SUM(CASE WHEN p.accounting_excluded=0 THEN p.amount_cents ELSE 0 END),0) paid,
+            COALESCE(GROUP_CONCAT(DISTINCT CASE WHEN p.accounting_excluded=0 THEN p.method END),'Not Paid') mop
+            FROM expenses e LEFT JOIN expense_batches b ON b.id=e.expense_batch_id
+            LEFT JOIN payments p ON p.expense_id=e.id WHERE e.project_id=?
+            GROUP BY e.id ORDER BY e.expense_date,e.id""", (self.project_id,))
+        for row in rows:
+            tree.insert("","end",iid=row["id"],values=(row["expense_date"],row["batch_ref"],
+                "Void" if row["voided"] else row["status"],row["verification_status"],row["name"],
+                row["item"],row["supplier"],row["area"],money(row["total_cents"]),money(row["paid"]),
+                money(max(0,row["total_cents"]-row["paid"])),row["mop"],row["notes"]))
+        ttk.Label(payment_pane, text="Every recorded expense payment", style="Section.TLabel").pack(
+            anchor="w", pady=(8, 0))
+        payments = make_tree(payment_pane, [("time","Date & Time",145),("expense","Expense",190),
+            ("amount","Amount",100),("method","MOP",110),("system","System Ref.",145),
+            ("user","User Ref.",130),("bank","Bank",150),("authorized","Authorized By",140),
+            ("notes","Notes",210)])
+        rows = self.db.all("""SELECT p.*,e.name expense_name,
+            COALESCE(b.bank_name||' '||COALESCE(b.account_name,b.account_number),'') bank,
+            COALESCE(h.name,'Legacy / not recorded') authorized FROM payments p
+            JOIN expenses e ON e.id=p.expense_id LEFT JOIN bank_accounts b ON b.id=p.bank_account_id
+            LEFT JOIN project_heads h ON h.id=p.authorized_by_head_id
+            WHERE e.project_id=? ORDER BY p.payment_date,p.id""", (self.project_id,))
+        for row in rows:
+            payments.insert("","end",iid=row["id"],values=(row["transaction_time"] or row["payment_date"],
+                row["expense_name"],money(row["amount_cents"]),row["method"],row["system_reference"] or "—",
+                row["reference"] or "—",row["bank"],row["authorized"],row["notes"]))
+
+    def _build_processes(self, page):
+        tree = make_tree(page, [("phase","Phase",170),("milestone","Milestone",170),
+            ("task","Task / Process",260),("deadline","Deadline",100),("status","Status",95),
+            ("completed","Completed At",145),("timing","Schedule Result",120)])
+        today = date.today().isoformat()
+        rows = self.db.all("""SELECT p.name phase,t.* FROM phases p LEFT JOIN tasks t ON t.phase_id=p.id
+            WHERE p.project_id=? ORDER BY p.sort_order,t.deadline,t.id""", (self.project_id,))
+        for index, row in enumerate(rows):
+            if row["id"] is None:
+                tree.insert("","end",iid=f"phase-{index}",values=(row["phase"],"—","No tasks recorded","—","—","—","—")); continue
+            timing = "Completed" if row["completed"] else ("Overdue" if row["deadline"] and row["deadline"] < today else "Open")
+            tree.insert("","end",iid=row["id"],values=(row["phase"],row["milestone"],row["name"],
+                row["deadline"] or "—","Completed" if row["completed"] else "Incomplete",
+                row["completed_at"] or "—",timing))
+
+    def _build_remittances(self, page):
+        tree = make_tree(page, [("time","Date & Time",145),("reference","Reference",145),
+            ("bank","Bank",160),("type","Type",90),("amount","Amount",105),
+            ("purpose","Purpose",220),("care","C/O",120),("status","Status",70)])
+        rows = self.db.all("""SELECT r.*,COALESCE(b.bank_name,'') bank_name,
+            COALESCE(b.account_name,b.account_number,'') account_name FROM remittances r
+            LEFT JOIN bank_accounts b ON b.id=r.bank_account_id WHERE r.project_id=?
+            ORDER BY r.txn_date,r.id""", (self.project_id,))
+        for row in rows:
+            tree.insert("","end",iid=row["id"],values=(row["transaction_time"] or row["txn_date"],
+                row["system_reference"] or f"Legacy #{row['id']}",
+                f"{row['bank_name']} {row['account_name']}".strip(),row["type"],money(row["amount_cents"]),
+                row["purpose"],row["care_of"],"VOID" if row["voided"] else "Active"))
+
+    def _build_inventory(self, page):
+        split = ttk.Panedwindow(page, orient="vertical"); split.pack(fill="both", expand=True)
+        stock_page = ttk.Frame(split); activity_page = ttk.Frame(split)
+        split.add(stock_page, weight=2); split.add(activity_page, weight=3)
+        ttk.Label(stock_page, text="Final material and tool register", style="Section.TLabel").pack(anchor="w")
+        stock = make_tree(stock_page, [("code","Item Code",125),("item","Material / Tool",180),
+            ("type","Type",120),("category","Category",125),("unit","Unit",70),
+            ("on_hand","Registered / On Hand",125),("available","Available",85),
+            ("borrowed","Borrowed",85),("status","Status",115),("notes","Notes",220)])
+        for row in self.db.inventory_item_rows(self.project_id, include_inactive=True):
+            stock.insert("","end",iid=row["id"],values=(row["item_code"],row["name"],row["material_type"],
+                row["category"],row["unit"],inventory_quantity(row["on_hand_milli"]),
+                inventory_quantity(row["available_milli"]),inventory_quantity(row["borrowed_milli"]),
+                row["status"],row["notes"]))
+        ttk.Label(activity_page, text="Inventory custody and usage history", style="Section.TLabel").pack(
+            anchor="w", pady=(8,0))
+        activity = make_tree(activity_page, [("time","Date & Time",145),("ref","Reference",145),
+            ("item","Material / Tool",170),("action","Activity",95),("quantity","Quantity",85),
+            ("unit","Unit",65),("employee","Employee",140),("reason","Reason",220),
+            ("authorized","Authorized By",130),("notes","Notes",200)])
+        rows = self.db.all("""SELECT t.*,i.name item_name,i.unit,COALESCE(e.name,'—') employee,
+            COALESCE(h.name,'Legacy / not recorded') authorized FROM inventory_transactions t
+            JOIN inventory_items i ON i.id=t.item_id LEFT JOIN employees e ON e.id=t.employee_id
+            LEFT JOIN project_heads h ON h.id=t.authorized_by_head_id
+            WHERE t.project_id=? ORDER BY t.transaction_date,t.id""", (self.project_id,))
+        for row in rows: activity.insert("","end",iid=row["id"],values=(
+            row["transaction_time"] or row["transaction_date"],row["reference"],row["item_name"],
+            row["transaction_type"],inventory_quantity(row["quantity_milli"]),row["unit"],
+            row["employee"],row["reason"],row["authorized"],row["notes"]))
+
+    def _build_payroll(self, page):
+        split = ttk.Panedwindow(page, orient="vertical"); split.pack(fill="both", expand=True)
+        payroll = ttk.Frame(split); attendance = ttk.Frame(split); split.add(payroll, weight=2); split.add(attendance, weight=3)
+        ttk.Label(payroll, text="Committed weekly payrolls", style="Section.TLabel").pack(anchor="w")
+        batches = make_tree(payroll, [("ref","Batch",155),("start","Period Start",95),("end","Period End",95),
+            ("gross","Gross",100),("deductions","Deductions",100),("adjustments","Corrections",100),
+            ("net","Net",100),("created","Committed",145)])
+        for row in self.db.all("SELECT * FROM payroll_batches WHERE project_id=? ORDER BY period_start,id",(self.project_id,)):
+            batches.insert("","end",iid=row["id"],values=(row["batch_ref"],row["period_start"],row["period_end"],
+                money(row["gross_cents"]),money(row["deduction_cents"]),money(row["adjustment_cents"]),
+                money(row["net_cents"]),row["created_at"]))
+        ttk.Label(attendance, text="Daily attendance history", style="Section.TLabel").pack(anchor="w", pady=(8,0))
+        logs = make_tree(attendance, [("employee","Employee",145),("in","Time In",145),("out","Time Out",145),
+            ("regular","Regular Hrs",80),("ot","OT Hrs",70),("gross","Gross",95),
+            ("source","Source",90),("corrections","Corrections",80)])
+        rows = self.db.all("""SELECT a.*,e.name FROM attendance a JOIN employees e ON e.id=a.employee_id
+            WHERE COALESCE(a.project_id,e.project_id)=? ORDER BY a.clock_in,a.id""",(self.project_id,))
+        for row in rows: logs.insert("","end",iid=row["id"],values=(row["name"],row["clock_in"].replace("T"," "),
+            row["clock_out"].replace("T"," "),row["regular_hours"],row["overtime_hours"],
+            money(row["gross_cents"]),row["source"],row["revision_count"]))
+
+    def _build_people(self, page):
+        tree = make_tree(page, [("type","Record Type",100),("name","Name",170),("role","Position / Role",160),
+            ("company","Company / Project",150),("phone","Contact",125),("email","Email",170),
+            ("status","Status",85)])
+        serial = 0
+        for row in self.db.all("SELECT name,position,active FROM project_heads WHERE project_id=? ORDER BY name",(self.project_id,)):
+            serial += 1; tree.insert("","end",iid=f"h-{serial}",values=("Project Head",row["name"],row["position"],"—","—","—","Active" if row["active"] else "Inactive"))
+        for row in self.db.all("""SELECT e.name,a.position,e.contact_number,e.active,
+            a.effective_from,a.effective_to FROM employee_project_assignments a
+            JOIN employees e ON e.id=a.employee_id WHERE a.project_id=?
+            ORDER BY e.name,a.effective_from""",(self.project_id,)):
+            assignment = f"Assigned {row['effective_from'] or '—'} to {row['effective_to'] or 'Current'}"
+            serial += 1; tree.insert("","end",iid=f"e-{serial}",values=("Employee",row["name"],
+                row["position"],assignment,row["contact_number"],"—",
+                "Historical" if row["effective_to"] else ("Active" if row["active"] else "Archived")))
+        for row in self.db.all("SELECT * FROM contacts WHERE project_id=? ORDER BY name",(self.project_id,)):
+            serial += 1; tree.insert("","end",iid=f"c-{serial}",values=("Contact",row["name"],row["role"],row["company"],row["phone"],row["email"],"Recorded"))
+
+    def _build_audit(self, page):
+        tree = make_tree(page, [("time","Date & Time",150),("action","Action",190),("details","Details",700)])
+        for row in self.db.all("SELECT * FROM audit_log WHERE project_id=? ORDER BY id DESC",(self.project_id,)):
+            tree.insert("","end",iid=row["id"],values=(row["created_at"],row["action"],row["details"]))
+
+
+class CompletedProjectsTab(BaseTab):
+    def __init__(self, app):
+        super().__init__(app)
+        header = ttk.Frame(self); header.pack(fill="x")
+        title = ttk.Frame(header); title.pack(side="left")
+        ttk.Label(title, text="Completed Projects", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(title, text="Permanent closeout records, durations, finances and process history.",
+                  style="Muted.TLabel").pack(anchor="w")
+        ttk.Button(header, text="Reactivate Project", command=self.reactivate).pack(side="right")
+        ttk.Button(header, text="View Full Project Record", style="Primary.TButton",
+                   command=self.open_selected).pack(side="right", padx=(0, 8))
+        self.tree = make_tree(self, [("ref","Completion Ref.",155),("project","Project",180),
+            ("client","Client",150),("start","Started",90),("completed","Completed",95),
+            ("duration","Duration",100),("progress","Progress",75),("contract","Contract",110),
+            ("deposited","Deposited",110),("expenses","Expenses",110),("outstanding","Outstanding",105),
+            ("approved","Approved By",180)])
+        self.tree.bind("<Double-1>", self.open_selected)
+
+    def open_selected(self, _event=None):
+        project_id = self.selected_id(self.tree)
+        if project_id:
+            win = CompletedProjectDetailsDialog(self, self.db, project_id); self.wait_window(win)
+
+    def reactivate(self):
+        project_id = self.selected_id(self.tree)
+        if not project_id: return
+        project = self.db.one("SELECT * FROM projects WHERE id=?", (project_id,))
+        data = dialog(self, "Reactivate Completed Project", [("reason","Reason for reactivation")],
+                      required_keys=("reason",))
+        if not data: return
+        approvals = self.app.authorize_all_heads(
+            project_id, "Reactivate completed project",
+            f"{project['name']} will return to active operations.\nReason: {data['reason']}",
+            allow_completed=True,
+        )
+        if not approvals: return
+        try:
+            self.db.reactivate_project(project_id, data["reason"], approvals)
+            self.app.load_projects(project_id); self.app.show_page("Dashboard")
+            messagebox.showinfo(APP_TITLE, f"{project['name']} is active again.", parent=self)
+        except (ValueError, sqlite3.Error) as exc:
+            messagebox.showerror(APP_TITLE, str(exc), parent=self)
+
+    def refresh(self):
+        self.tree.delete(*self.tree.get_children())
+        rows = self.db.all("""SELECT p.*,s.completion_date,s.progress_percent,
+            s.deposited_cents,s.active_expense_cents,s.outstanding_cents
+            FROM projects p LEFT JOIN project_completion_snapshots s
+              ON s.completion_reference=p.completion_reference
+            WHERE p.status='Completed' ORDER BY p.completed_at DESC,p.id DESC""")
+        for row in rows:
+            end = row["completion_date"] or (row["completed_at"][:10] if row["completed_at"] else "")
+            self.tree.insert("","end",iid=row["id"],values=(row["completion_reference"] or "Legacy",
+                row["name"],row["client"],row["start_date"] or "—",end or "—",
+                CompletedProjectDetailsDialog._duration_text(row["start_date"],end),
+                f"{row['progress_percent'] or 0}%",money(row["contract_value_cents"]),
+                money(row["deposited_cents"] or 0),money(row["active_expense_cents"] or 0),
+                money(row["outstanding_cents"] or 0),row["completed_by_names"] or "Legacy / not recorded"))
+
+
 class ProjectsTab(BaseTab):
     FIELDS = [
         ("name", "Project name"), ("client", "Client"), ("contract_value", "Contract value"),
@@ -4542,7 +5766,7 @@ class ProjectsTab(BaseTab):
         lower.add(projects, weight=3); lower.add(chart, weight=2); lower.add(events, weight=2)
         ttk.Label(projects, text="Projects", style="Section.TLabel").pack(anchor="w", pady=(0, 5))
         self.tree = make_tree(projects, [
-            ("name", "Project", 180), ("client", "Client", 145), ("contract", "Contract", 105),
+            ("name", "Project", 180), ("status", "Status", 85), ("client", "Client", 145), ("contract", "Contract", 105),
             ("payments", "Payments", 100), ("outstanding", "Outstanding", 105),
             ("budget", "Budget Remaining", 115),
         ])
@@ -4595,6 +5819,44 @@ class ProjectsTab(BaseTab):
         except (ValueError, sqlite3.Error) as exc:
             messagebox.showerror(APP_TITLE, str(exc))
 
+    def complete_project(self):
+        if not self.project_id:
+            messagebox.showinfo(APP_TITLE, "Select an active project first.", parent=self); return
+        project = self.db.one("SELECT * FROM projects WHERE id=?", (self.project_id,))
+        if not project or not self.db.project_is_active(self.project_id):
+            messagebox.showinfo(
+                APP_TITLE, "This project is already completed. Open Completed Projects to review it.",
+                parent=self,
+            ); return
+        checks = self.db.project_completion_checks(self.project_id)
+        if checks["blockers"]:
+            messagebox.showerror(
+                APP_TITLE, "Project completion is blocked:\n\n" + "\n".join(checks["blockers"]),
+                parent=self,
+            ); return
+        win = ProjectCompletionDialog(self, project, checks); self.wait_window(win)
+        if not win.result: return
+        approvals = self.app.authorize_all_heads(
+            self.project_id, "Complete and archive project",
+            f"{project['name']} will be locked against new entries and moved to Completed Projects.\n"
+            f"Completion date: {win.result['completion_date']}\n"
+            f"Notes: {win.result['notes']}",
+        )
+        if not approvals: return
+        try:
+            reference = self.db.complete_project(
+                self.project_id, win.result["completion_date"], win.result["notes"], approvals
+            )
+            completed_name = project["name"]
+            self.app.load_projects(None); self.app.show_page("Completed Projects")
+            messagebox.showinfo(
+                APP_TITLE,
+                f"{completed_name} is now completed and read-only.\n\nCompletion reference: {reference}",
+                parent=self,
+            )
+        except (ValueError, sqlite3.Error) as exc:
+            messagebox.showerror(APP_TITLE, str(exc), parent=self)
+
     def choose(self, _event=None):
         selected = self.tree.selection()
         if selected:
@@ -4604,7 +5866,8 @@ class ProjectsTab(BaseTab):
         self.tree.delete(*self.tree.get_children())
         self.events.delete(*self.events.get_children())
         project_rows = self.db.all("SELECT * FROM projects ORDER BY created_at DESC")
-        project_ids = [self.project_id] if self.project_id else [row["id"] for row in project_rows]
+        project_ids = ([self.project_id] if self.project_id else
+                       [row["id"] for row in project_rows if row["status"] != "Completed"])
         for row in project_rows:
             if row["id"] not in project_ids:
                 continue
@@ -4619,7 +5882,7 @@ class ProjectsTab(BaseTab):
                    WHERE e.project_id=? AND e.voided=0""", (row["id"],)
             )["total"]
             self.tree.insert("", "end", iid=row["id"], values=(
-                row["name"], row["client"], money(row["contract_value_cents"]),
+                row["name"], row["status"], row["client"], money(row["contract_value_cents"]),
                 money(payments), money(outstanding), money(budget),
             ))
         if project_ids:
@@ -4671,6 +5934,273 @@ class ProjectsTab(BaseTab):
             self.financial_chart.set_data()
 
 
+class InventoryTab(BaseTab):
+    MATERIAL_TYPES = ("Consumable", "Non-Consumable")
+
+    def __init__(self, app):
+        super().__init__(app)
+        header = ttk.Frame(self); header.pack(fill="x")
+        title = ttk.Frame(header); title.pack(side="left")
+        ttk.Label(title, text="Project Inventory", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(title, text="Consumable stock usage and employee-accountable tool borrowing.",
+                  style="Muted.TLabel").pack(anchor="w")
+        selector = ttk.Frame(header); selector.pack(side="right")
+        ttk.Label(selector, text="Inventory project").pack(side="left", padx=(0, 6))
+        self.project_var = tk.StringVar(); self.project_lookup = {}
+        self.project_combo = ttk.Combobox(selector, textvariable=self.project_var,
+                                          state="readonly", width=28)
+        self.project_combo.pack(side="left")
+        self.project_combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh())
+
+        actions = ttk.Frame(self); actions.pack(fill="x", pady=(12, 6))
+        self.action_buttons = []
+        for text_value, command, primary in (
+            ("+ Register Material / Tool", self.register_item, True),
+            ("Restock Consumable", self.restock, False),
+            ("Issue Consumable", self.consume, False),
+            ("Borrow Tool", self.borrow, False),
+            ("Return Tool", self.return_tool, False),
+        ):
+            button = ttk.Button(actions, text=text_value, command=command,
+                                style="Primary.TButton" if primary else "Secondary.TButton")
+            button.pack(side="left", padx=(0, 6)); self.action_buttons.append(button)
+
+        cards = ttk.Frame(self); cards.pack(fill="x", pady=(4, 8))
+        self.consumable_card, self.consumable_value = metric_card(cards, "Consumable Items", GREEN)
+        self.tool_card, self.tool_value = metric_card(cards, "Non-Consumable Units", INK)
+        self.available_card, self.available_value = metric_card(cards, "Tools Available", GREEN)
+        self.borrowed_card, self.borrowed_value = metric_card(cards, "Tools Borrowed", ORANGE)
+        self.low_card, self.low_value = metric_card(cards, "Low / Out of Stock", RED)
+        layout_metric_cards(cards, (self.consumable_card,self.tool_card,self.available_card,
+                                    self.borrowed_card,self.low_card))
+
+        filters = ttk.Frame(self); filters.pack(fill="x", pady=(2, 5))
+        self.type_filter = tk.StringVar(value="All Material Types")
+        self.search_var = tk.StringVar()
+        ttk.Label(filters, text="Type").pack(side="left")
+        type_combo = ttk.Combobox(filters, textvariable=self.type_filter, state="readonly",
+                                  values=["All Material Types", *self.MATERIAL_TYPES], width=22)
+        type_combo.pack(side="left", padx=(5, 12)); type_combo.bind("<<ComboboxSelected>>",lambda _e:self.refresh())
+        ttk.Label(filters, text="Search").pack(side="left")
+        search = ttk.Entry(filters, textvariable=self.search_var, width=38)
+        search.pack(side="left", fill="x", expand=True, padx=(5, 0))
+        search.bind("<KeyRelease>", lambda _e: self.refresh())
+
+        self.notebook = ttk.Notebook(self); self.notebook.pack(fill="both", expand=True, pady=(4, 0))
+        stock_page = ttk.Frame(self.notebook, padding=5)
+        activity_page = ttk.Frame(self.notebook, padding=5)
+        loans_page = ttk.Frame(self.notebook, padding=5)
+        self.notebook.add(stock_page, text="Inventory Stock")
+        self.notebook.add(activity_page, text="Activity Ledger")
+        self.notebook.add(loans_page, text="Active Borrowers")
+        self.stock_tree = make_tree(stock_page, [("code","Item Code",125),("name","Material / Tool",190),
+            ("type","Type",120),("category","Category",130),("unit","Unit",75),
+            ("total","Registered / On Hand",125),("available","Available",90),
+            ("borrowed","Borrowed",85),("reorder","Reorder Level",95),
+            ("status","Status",115),("condition","Condition",100),("notes","Notes",220)])
+        self.activity_tree = make_tree(activity_page, [("time","Date & Time",145),
+            ("ref","Reference",145),("code","Item Code",120),("item","Material / Tool",175),
+            ("action","Activity",100),("qty","Quantity",85),("unit","Unit",70),
+            ("employee","Employee",145),("reason","Purpose / Reason",220),
+            ("condition","Condition",110),("authorized","Authorized By",135),("notes","Notes",200)])
+        self.loan_tree = make_tree(loans_page, [("ref","Borrow Ref.",145),("date","Borrowed",95),
+            ("code","Item Code",120),("item","Tool",175),("employee","Responsible Employee",170),
+            ("borrowed","Borrowed",85),("returned","Returned",85),("outstanding","Outstanding",95),
+            ("unit","Unit",70),("purpose","Purpose",210),("condition","Condition Out",115)])
+
+    def requested_page_height(self):
+        return 1150
+
+    def selected_project_id(self):
+        return self.project_lookup.get(self.project_var.get())
+
+    def require_inventory_project(self):
+        project_id = self.selected_project_id()
+        if not project_id:
+            messagebox.showinfo(APP_TITLE, "Select an inventory project first.", parent=self); return None
+        if not self.db.project_is_active(project_id):
+            messagebox.showinfo(APP_TITLE,
+                "Completed-project inventory is read-only. Reactivate the project before recording stock activity.",
+                parent=self); return None
+        return project_id
+
+    def item_options(self, material_type):
+        project_id = self.selected_project_id()
+        rows = self.db.inventory_item_rows(project_id) if project_id else []
+        return {f"{row['item_code']} — {row['name']} — {inventory_quantity(row['available_milli'])} {row['unit']} available":row
+                for row in rows if row["material_type"] == material_type}
+
+    def employee_options(self, project_id):
+        return {f"{row['name']} [{row['employee_no']}]":row["id"] for row in self.db.all(
+            "SELECT id,name,employee_no FROM employees WHERE project_id=? AND active=1 ORDER BY name COLLATE NOCASE",
+            (project_id,))}
+
+    def register_item(self):
+        project_id = self.require_inventory_project()
+        if not project_id: return
+        data = dialog(self,"Register Inventory Material / Tool",[
+            ("name","Item name / description"),("material_type","Material type",list(self.MATERIAL_TYPES)),
+            ("category","Category"),("unit","Unit of measure"),("opening_quantity","Opening quantity"),
+            ("reorder_level","Low-stock / reorder level"),("condition","Opening condition"),
+            ("registration_date","Registration date"),("notes","Notes")],
+            {"material_type":"Consumable","unit":"piece","opening_quantity":"1",
+             "reorder_level":"0","condition":"Good","registration_date":date.today().isoformat()},
+            required_keys=("name","material_type","category","unit","opening_quantity",
+                           "reorder_level","condition","registration_date"))
+        if not data:return
+        try:
+            opening = inventory_quantity_milli(data["opening_quantity"], positive=True)
+            reorder = inventory_quantity_milli(data["reorder_level"])
+            valid_date(data["registration_date"], True)
+        except ValueError as exc:
+            messagebox.showerror(APP_TITLE,str(exc),parent=self);return
+        head = self.app.authorize_for_project(project_id,"Register inventory item",
+            f"{data['name']} — {data['material_type']} — {data['opening_quantity']} {data['unit']}")
+        if not head:return
+        try:
+            result=self.db.register_inventory_item(project_id=project_id,name=data["name"],
+                material_type=data["material_type"],category=data["category"],unit=data["unit"],
+                opening_quantity_milli=opening,reorder_level_milli=reorder,
+                condition_status=data["condition"],notes=data["notes"],
+                authorized_by_head_id=head["id"],registration_date=data["registration_date"])
+            self.app.refresh_all(); messagebox.showinfo(APP_TITLE,
+                f"Inventory item registered.\nItem code: {result['item_code']}\nStock reference: {result['reference']}",parent=self)
+        except (ValueError,sqlite3.Error) as exc:messagebox.showerror(APP_TITLE,str(exc),parent=self)
+
+    def restock(self):
+        project_id = self.require_inventory_project()
+        if not project_id:return
+        options=self.item_options("Consumable")
+        if not options:messagebox.showinfo(APP_TITLE,"Register a consumable material first.",parent=self);return
+        data=dialog(self,"Restock Consumable",[("item","Consumable",list(options)),
+            ("quantity","Restock quantity"),("transaction_date","Restock date"),
+            ("reason","Restock source / reason"),("notes","Notes")],
+            {"item":next(iter(options)),"transaction_date":date.today().isoformat()},
+            required_keys=("item","quantity","transaction_date","reason"))
+        if not data:return
+        self._commit_movement(project_id,options[data["item"]]["id"],"Restock",data,None,None)
+
+    def consume(self):
+        project_id=self.require_inventory_project()
+        if not project_id:return
+        options=self.item_options("Consumable"); employees=self.employee_options(project_id)
+        if not options:messagebox.showinfo(APP_TITLE,"Register a consumable material first.",parent=self);return
+        if not employees:messagebox.showinfo(APP_TITLE,"Add an active employee to this project first.",parent=self);return
+        data=dialog(self,"Issue / Use Consumable Material",[("item","Consumable",list(options)),
+            ("employee","Employee receiving material",list(employees)),("quantity","Quantity issued"),
+            ("transaction_date","Issue date"),("reason","Usage purpose / work area"),("notes","Notes")],
+            {"item":next(iter(options)),"employee":next(iter(employees)),
+             "transaction_date":date.today().isoformat()},
+            required_keys=("item","employee","quantity","transaction_date","reason"))
+        if not data:return
+        self._commit_movement(project_id,options[data["item"]]["id"],"Consume",data,
+                              employees[data["employee"]],None)
+
+    def borrow(self):
+        project_id=self.require_inventory_project()
+        if not project_id:return
+        options=self.item_options("Non-Consumable"); employees=self.employee_options(project_id)
+        if not options:messagebox.showinfo(APP_TITLE,"Register a non-consumable tool first.",parent=self);return
+        if not employees:messagebox.showinfo(APP_TITLE,"Add an active employee to this project first.",parent=self);return
+        data=dialog(self,"Borrow Non-Consumable Tool",[("item","Tool / equipment",list(options)),
+            ("employee","Responsible employee",list(employees)),("quantity","Quantity borrowed"),
+            ("transaction_date","Borrow date"),("reason","Purpose / work assignment"),
+            ("condition","Condition when released"),("notes","Notes")],
+            {"item":next(iter(options)),"employee":next(iter(employees)),"quantity":"1",
+             "transaction_date":date.today().isoformat(),"condition":"Good"},
+            required_keys=("item","employee","quantity","transaction_date","reason","condition"))
+        if not data:return
+        self._commit_movement(project_id,options[data["item"]]["id"],"Borrow",data,
+                              employees[data["employee"]],None)
+
+    def return_tool(self):
+        project_id=self.require_inventory_project()
+        if not project_id:return
+        loans=self.db.active_inventory_loans(project_id)
+        options={f"{row['reference']} — {row['item_name']} — {row['employee']} — {inventory_quantity(row['outstanding_milli'])} {row['unit']} due":row
+                 for row in loans}
+        if not options:messagebox.showinfo(APP_TITLE,"There are no borrowed tools awaiting return.",parent=self);return
+        data=dialog(self,"Return Borrowed Tool",[("loan","Active borrowing record",list(options)),
+            ("quantity","Quantity returned"),("transaction_date","Return date"),
+            ("reason","Return / handover reason"),("condition","Condition upon return"),
+            ("notes","Damage, loss or other notes")],
+            {"loan":next(iter(options)),"quantity":inventory_quantity(next(iter(options.values()))["outstanding_milli"]),
+             "transaction_date":date.today().isoformat(),"reason":"Returned to project inventory","condition":"Good"},
+            required_keys=("loan","quantity","transaction_date","reason","condition"))
+        if not data:return
+        loan=options[data["loan"]]
+        self._commit_movement(project_id,loan["item_id"],"Return",data,loan["employee_id"],loan["id"])
+
+    def _commit_movement(self, project_id, item_id, transaction_type, data, employee_id, linked_id):
+        try:
+            quantity=inventory_quantity_milli(data["quantity"],positive=True)
+            valid_date(data["transaction_date"],True)
+            item=self.db.one("SELECT * FROM inventory_items WHERE id=?",(item_id,))
+        except ValueError as exc:messagebox.showerror(APP_TITLE,str(exc),parent=self);return
+        employee=self.db.one("SELECT name FROM employees WHERE id=?",(employee_id,)) if employee_id else None
+        details=(f"{transaction_type} {inventory_quantity(quantity)} {item['unit']} of "
+                 f"{item['item_code']} {item['name']}" + (f" for {employee['name']}" if employee else "") +
+                 f". Purpose: {data['reason']}")
+        head=self.app.authorize_for_project(project_id,f"Authorize inventory {transaction_type.lower()}",details)
+        if not head:return
+        try:
+            reference=self.db.record_inventory_movement(item_id=item_id,transaction_type=transaction_type,
+                quantity_milli=quantity,transaction_date=data["transaction_date"],reason=data["reason"],
+                notes=data.get("notes",""),authorized_by_head_id=head["id"],employee_id=employee_id,
+                condition_note=data.get("condition",""),linked_transaction_id=linked_id)
+            self.app.refresh_all();messagebox.showinfo(APP_TITLE,
+                f"Inventory activity recorded.\nReference: {reference}",parent=self)
+        except (ValueError,sqlite3.Error) as exc:messagebox.showerror(APP_TITLE,str(exc),parent=self)
+
+    def refresh(self):
+        projects=self.db.all("SELECT id,name,status FROM projects ORDER BY name COLLATE NOCASE")
+        self.project_lookup={f"{'✓ ' if row['status']=='Completed' else ''}{row['name']} [#{row['id']}]":row["id"] for row in projects}
+        self.project_combo.configure(values=list(self.project_lookup))
+        valid_labels=set(self.project_lookup)
+        if self.project_var.get() not in valid_labels:
+            preferred=next((label for label,pid in self.project_lookup.items() if pid==self.app.project_id),"")
+            self.project_var.set(preferred or next(iter(self.project_lookup),""))
+        project_id=self.selected_project_id()
+        active=bool(project_id and self.db.project_is_active(project_id))
+        for button in self.action_buttons:button.configure(state="normal" if active else "disabled")
+        for tree in (self.stock_tree,self.activity_tree,self.loan_tree):tree.delete(*tree.get_children())
+        if not project_id:
+            for value in (self.consumable_value,self.tool_value,self.available_value,self.borrowed_value,self.low_value):value.config(text="—")
+            return
+        rows=self.db.inventory_item_rows(project_id)
+        search=self.search_var.get().strip().lower(); material_filter=self.type_filter.get()
+        displayed=[]
+        for row in rows:
+            haystack=" ".join(str(row.get(key,"")) for key in ("item_code","name","material_type","category","unit","status","condition_status","notes")).lower()
+            if search and search not in haystack:continue
+            if material_filter in self.MATERIAL_TYPES and row["material_type"]!=material_filter:continue
+            displayed.append(row)
+            self.stock_tree.insert("","end",iid=row["id"],values=(row["item_code"],row["name"],row["material_type"],
+                row["category"],row["unit"],inventory_quantity(row["on_hand_milli"]),
+                inventory_quantity(row["available_milli"]),inventory_quantity(row["borrowed_milli"]),
+                inventory_quantity(row["reorder_level_milli"]),row["status"],row["condition_status"],row["notes"]))
+        consumables=[row for row in rows if row["material_type"]=="Consumable"]
+        tools=[row for row in rows if row["material_type"]=="Non-Consumable"]
+        self.consumable_value.config(text=str(len(consumables)))
+        self.tool_value.config(text=inventory_quantity(sum(row["on_hand_milli"] for row in tools)))
+        self.available_value.config(text=inventory_quantity(sum(row["available_milli"] for row in tools)))
+        self.borrowed_value.config(text=inventory_quantity(sum(row["borrowed_milli"] for row in tools)))
+        self.low_value.config(text=str(sum(row["status"] in {"Low Stock","Out of Stock"} for row in consumables)))
+        activity=self.db.all("""SELECT t.*,i.item_code,i.name item_name,i.unit,
+            COALESCE(e.name,'—') employee,COALESCE(h.name,'Legacy / not recorded') authorized
+            FROM inventory_transactions t JOIN inventory_items i ON i.id=t.item_id
+            LEFT JOIN employees e ON e.id=t.employee_id LEFT JOIN project_heads h ON h.id=t.authorized_by_head_id
+            WHERE t.project_id=? ORDER BY t.transaction_date DESC,t.id DESC""",(project_id,))
+        for row in activity:self.activity_tree.insert("","end",iid=row["id"],values=(
+            row["transaction_time"] or row["transaction_date"],row["reference"],row["item_code"],
+            row["item_name"],row["transaction_type"],inventory_quantity(row["quantity_milli"]),
+            row["unit"],row["employee"],row["reason"],row["condition_note"],row["authorized"],row["notes"]))
+        for row in self.db.active_inventory_loans(project_id):self.loan_tree.insert("","end",iid=row["id"],values=(
+            row["reference"],row["transaction_date"],row["item_code"],row["item_name"],row["employee"],
+            inventory_quantity(row["quantity_milli"]),inventory_quantity(row["returned_milli"]),
+            inventory_quantity(row["outstanding_milli"]),row["unit"],row["reason"],row["condition_note"]))
+
+
 class ProgressTab(BaseTab):
     def __init__(self, app):
         super().__init__(app)
@@ -4715,6 +6245,8 @@ class ProgressTab(BaseTab):
             self.app.refresh_all()
 
     def remove_phase(self):
+        if not self.require_project():
+            return
         phase_id = self.phase_map().get(self.phase_var.get())
         if not phase_id:
             return
@@ -4753,6 +6285,8 @@ class ProgressTab(BaseTab):
             messagebox.showerror(APP_TITLE, str(exc))
 
     def edit_task(self):
+        if not self.require_project():
+            return
         task_id = self.selected_id(self.tree)
         if not task_id:
             return
@@ -4770,6 +6304,8 @@ class ProgressTab(BaseTab):
                 messagebox.showerror(APP_TITLE, str(exc))
 
     def toggle(self):
+        if not self.require_project():
+            return
         task_id = self.selected_id(self.tree)
         if task_id:
             self.db.execute(
@@ -5092,7 +6628,7 @@ class BulkExpenseDialog(tk.Toplevel):
         self.title("Bulk Expense Entry"); self.geometry("1120x720"); self.minsize(980, 650)
         self.db, self.result, self.items = db, None, []
         self.import_metadata = {}
-        projects = db.all("SELECT id,name FROM projects ORDER BY name")
+        projects = db.all("SELECT id,name FROM projects WHERE status<>'Completed' ORDER BY name")
         self.projects = {f"{row['name']} [#{row['id']}]": row["id"] for row in projects}
         self.context_project_id = initial_project_id or (projects[0]["id"] if projects else None)
         banks = db.all("SELECT * FROM bank_accounts WHERE active=1 ORDER BY bank_name,account_name")
@@ -5948,18 +7484,14 @@ class ExpensesTab(BaseTab):
         self.expense_notebook.add(self.ledger_page, text="Expense Ledger")
         self.expense_notebook.add(self.cash_page, text="Petty Cash & Direct Procurement")
         filters = ttk.Frame(self.ledger_page); filters.pack(fill="x")
-        self.project_filter = tk.StringVar(value="All Projects")
-        self.area_filter = tk.StringVar(value="All Areas")
-        self.supplier_filter = tk.StringVar(value="All Suppliers")
         self.filter_var = tk.StringVar()
         filter_definitions = (
-            ("Project", self.project_filter, 20), ("Status", None, 13),
-            ("Verification", None, 14), ("MOP", None, 15),
-            ("Area", self.area_filter, 16), ("Supplier", self.supplier_filter, 17),
+            ("Project", 20), ("Status", 13), ("Verification", 14), ("MOP", 15),
+            ("Area", 16), ("Supplier", 17),
         )
         for column in range(7):
             filters.columnconfigure(column, weight=1, uniform="expense_filters")
-        for index, (label, var, width) in enumerate(filter_definitions):
+        for index, (label, width) in enumerate(filter_definitions):
             group = ttk.Frame(filters); group.grid(
                 row=0, column=index, sticky="ew", padx=(0, 5), pady=(0, 3)
             )
@@ -5976,9 +7508,19 @@ class ExpensesTab(BaseTab):
                 self.mop_selector = PaymentMethodChecklist(group, command=self.refresh)
                 self.mop_selector.pack(fill="x")
                 continue
-            combo = ttk.Combobox(group, textvariable=var, state="readonly", width=width)
-            combo.pack(fill="x"); combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh())
-            setattr(self, f"{label.lower()}_combo", combo)
+            if label == "Project":
+                self.project_selector = ProjectChecklist(group, command=self.refresh)
+                self.project_selector.pack(fill="x")
+                continue
+            selector = DynamicChecklist(
+                group,
+                all_label=f"All {label}s",
+                none_label=f"No {label}s",
+                plural_label=label.lower() + "s",
+                command=self.refresh,
+            )
+            selector.pack(fill="x")
+            setattr(self, f"{label.lower()}_selector", selector)
         search_group = ttk.Frame(filters); search_group.grid(
             row=0, column=6, sticky="ew", pady=(0, 3)
         )
@@ -5989,14 +7531,13 @@ class ExpensesTab(BaseTab):
         today = date.today().isoformat()
         self.date_from_filter = tk.StringVar(value=today)
         self.date_to_filter = tk.StringVar(value=today)
-        self.funding_filter = tk.StringVar(value="All Funding Sources")
         self.funding_option_map = {}
         ttk.Label(date_filters, text="Funding source").pack(side="left")
-        self.funding_combo = ttk.Combobox(
-            date_filters, textvariable=self.funding_filter, state="readonly", width=28
+        self.funding_selector = DynamicChecklist(
+            date_filters, "All Funding Sources", "No Funding Sources", "funding sources",
+            command=self.refresh, width=28,
         )
-        self.funding_combo.pack(side="left", padx=(4, 12))
-        self.funding_combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh())
+        self.funding_selector.pack(side="left", fill="x", padx=(4, 12))
         ttk.Label(date_filters, text="Expense date").pack(side="left")
         for label, variable, boundary in (("From", self.date_from_filter, "from"),
                                            ("To", self.date_to_filter, "to")):
@@ -6405,6 +7946,10 @@ class ExpensesTab(BaseTab):
     def add(self):
         if not self.db.one("SELECT 1 FROM bank_accounts WHERE active=1 LIMIT 1"):
             messagebox.showerror(APP_TITLE, "Enroll a bank account in Remittances before adding expenses."); return
+        if not self.db.one("SELECT 1 FROM projects WHERE status<>'Completed' LIMIT 1"):
+            messagebox.showinfo(
+                APP_TITLE, "There are no active projects. Create or reactivate a project before adding expenses."
+            ); return
         win = BulkExpenseDialog(self, self.db, self.project_id); self.wait_window(win)
         if not win.result: return
         groups = {}
@@ -6752,6 +8297,18 @@ class ExpensesTab(BaseTab):
 
     def void(self):
         expense_id = self.selected_id(self.tree)
+        if expense_id:
+            project_row = self.db.one(
+                "SELECT p.status FROM expenses e JOIN projects p ON p.id=e.project_id WHERE e.id=?",
+                (expense_id,),
+            )
+            if project_row and project_row["status"] == "Completed":
+                messagebox.showinfo(
+                    APP_TITLE,
+                    "This expense belongs to a completed project and cannot be changed unless the project is reactivated.",
+                    parent=self,
+                )
+                return
         if expense_id and messagebox.askyesno(APP_TITLE, "Void or restore this expense? The audit history is retained."):
             self.db.execute(
                 """UPDATE expenses SET voided=CASE voided WHEN 1 THEN 0 ELSE 1 END,
@@ -6761,11 +8318,25 @@ class ExpensesTab(BaseTab):
 
     def filtered_rows(self):
         projects = self.project_options(); where, params = ["1=1"], []
-        project_id = projects.get(self.project_filter.get())
-        for value, all_value, sql in ((project_id, None, "e.project_id=?"),
-            (self.area_filter.get(), "All Areas", "e.area=?"),
-            (self.supplier_filter.get(), "All Suppliers", "e.supplier=?")):
-            if value and value != all_value: where.append(sql); params.append(value)
+        all_project_ids = list(projects.values())
+        project_ids = self.project_selector.selected_ids()
+        if not project_ids:
+            where.append("0=1")
+        elif len(project_ids) != len(all_project_ids):
+            placeholders = ",".join("?" for _ in project_ids)
+            where.append(f"e.project_id IN ({placeholders})")
+            params.extend(project_ids)
+        for selector, column in (
+            (self.area_selector, "e.area"),
+            (self.supplier_selector, "e.supplier"),
+        ):
+            selected = selector.selected()
+            if not selected:
+                where.append("0=1")
+            elif len(selected) != len(selector.options):
+                placeholders = ",".join("?" for _ in selected)
+                where.append(f"{column} IN ({placeholders})")
+                params.extend(selected)
         payment_total_sql = "COALESCE((SELECT SUM(px.amount_cents) FROM payments px WHERE px.expense_id=e.id AND px.accounting_excluded=0),0)"
         selected_statuses = self.status_selector.selected()
         if len(selected_statuses) != len(self.status_selector.OPTIONS):
@@ -6805,29 +8376,37 @@ class ExpensesTab(BaseTab):
                              " OR ".join(method_clauses) + "))")
             else:
                 where.append("0=1")
-        funding_kind, funding_value = self.funding_option_map.get(
-            self.funding_filter.get(), ("all", None)
-        )
-        if funding_kind == "head":
-            where.append("""EXISTS (SELECT 1 FROM payments fp
-                JOIN cash_allocations fa ON fa.id=fp.cash_allocation_id
-                JOIN project_heads fh ON fh.id=fa.custodian_head_id
-                WHERE fp.expense_id=e.id AND fh.registry_head_id=?)""")
-            params.append(funding_value)
-        elif funding_kind == "allocation":
-            where.append("""(e.default_cash_allocation_id=? OR EXISTS (
-                SELECT 1 FROM payments fp WHERE fp.expense_id=e.id AND fp.cash_allocation_id=?))""")
-            params.extend((funding_value, funding_value))
-        elif funding_kind == "direct_all":
-            where.append("""EXISTS (SELECT 1 FROM cash_allocations fa
-                WHERE fa.allocation_type='Direct Procurement' AND
-                (fa.id=e.default_cash_allocation_id OR EXISTS (
-                    SELECT 1 FROM payments fp WHERE fp.expense_id=e.id AND fp.cash_allocation_id=fa.id)))""")
-        elif funding_kind == "bank":
-            where.append("EXISTS (SELECT 1 FROM payments fp WHERE fp.expense_id=e.id AND fp.bank_account_id IS NOT NULL)")
-        elif funding_kind == "legacy":
-            where.append("""EXISTS (SELECT 1 FROM payments fp WHERE fp.expense_id=e.id
-                AND LOWER(TRIM(fp.method))='cash' AND fp.cash_allocation_id IS NULL)""")
+        selected_funding = self.funding_selector.selected()
+        if not selected_funding:
+            where.append("0=1")
+        elif len(selected_funding) != len(self.funding_selector.options):
+            funding_clauses, funding_params = [], []
+            for funding_label in selected_funding:
+                funding_kind, funding_value = self.funding_option_map.get(funding_label, ("", None))
+                if funding_kind == "head":
+                    funding_clauses.append("""EXISTS (SELECT 1 FROM payments fp
+                        JOIN cash_allocations fa ON fa.id=fp.cash_allocation_id
+                        JOIN project_heads fh ON fh.id=fa.custodian_head_id
+                        WHERE fp.expense_id=e.id AND fh.registry_head_id=?)""")
+                    funding_params.append(funding_value)
+                elif funding_kind == "allocation":
+                    funding_clauses.append("""(e.default_cash_allocation_id=? OR EXISTS (
+                        SELECT 1 FROM payments fp WHERE fp.expense_id=e.id AND fp.cash_allocation_id=?))""")
+                    funding_params.extend((funding_value, funding_value))
+                elif funding_kind == "direct_all":
+                    funding_clauses.append("""EXISTS (SELECT 1 FROM cash_allocations fa
+                        WHERE fa.allocation_type='Direct Procurement' AND
+                        (fa.id=e.default_cash_allocation_id OR EXISTS (
+                            SELECT 1 FROM payments fp WHERE fp.expense_id=e.id AND fp.cash_allocation_id=fa.id)))""")
+                elif funding_kind == "bank":
+                    funding_clauses.append(
+                        "EXISTS (SELECT 1 FROM payments fp WHERE fp.expense_id=e.id AND fp.bank_account_id IS NOT NULL)"
+                    )
+                elif funding_kind == "legacy":
+                    funding_clauses.append("""EXISTS (SELECT 1 FROM payments fp WHERE fp.expense_id=e.id
+                        AND LOWER(TRIM(fp.method))='cash' AND fp.cash_allocation_id IS NULL)""")
+            where.append(f"({' OR '.join(funding_clauses)})" if funding_clauses else "0=1")
+            params.extend(funding_params)
         # Build one searchable representation of the complete ledger row. This
         # includes visible columns, underlying expense details, every payment,
         # allocation/withdrawal reference, verification, batch and recovery data.
@@ -6952,18 +8531,18 @@ class ExpensesTab(BaseTab):
             FROM expenses e JOIN projects pr ON pr.id=e.project_id LEFT JOIN phases ph ON ph.id=e.phase_id
             LEFT JOIN project_heads h ON h.id=e.authorized_by_head_id
             LEFT JOIN payments pay ON pay.expense_id=e.id AND pay.accounting_excluded=0
-            WHERE {' AND '.join(where)} GROUP BY e.id ORDER BY e.expense_date DESC,e.id DESC""", tuple(params)), project_id
+            WHERE {' AND '.join(where)} GROUP BY e.id ORDER BY e.expense_date DESC,e.id DESC""", tuple(params)), project_ids
 
     def refresh(self):
-        projects = self.project_options(); self.project_combo.configure(values=["All Projects"] + list(projects))
-        if self.project_filter.get() not in self.project_combo["values"]: self.project_filter.set("All Projects")
+        projects = self.project_options()
+        self.project_selector.set_projects([
+            {"id": project_id, "name": label} for label, project_id in projects.items()
+        ])
         areas = [r["area"] for r in self.db.all("SELECT DISTINCT area FROM expenses WHERE area<>'' ORDER BY area COLLATE NOCASE")]
         suppliers = [r["supplier"] for r in self.db.all("SELECT DISTINCT supplier FROM expenses WHERE supplier<>'' ORDER BY supplier COLLATE NOCASE")]
-        self.area_combo.configure(values=["All Areas"] + areas); self.supplier_combo.configure(values=["All Suppliers"] + suppliers)
-        if self.area_filter.get() not in self.area_combo["values"]: self.area_filter.set("All Areas")
-        if self.supplier_filter.get() not in self.supplier_combo["values"]: self.supplier_filter.set("All Suppliers")
-        funding = {"All Funding Sources": ("all", None),
-                   "All Direct Procurements": ("direct_all", None),
+        self.area_selector.set_options((value, value) for value in areas)
+        self.supplier_selector.set_options((value, value) for value in suppliers)
+        funding = {"Direct Procurements": ("direct_all", None),
                    "Bank Transfers": ("bank", None),
                    "Legacy / Unlinked Cash": ("legacy", None)}
         for head in self.db.all(
@@ -6973,10 +8552,8 @@ class ExpensesTab(BaseTab):
         ):
             funding[f"Head: {head['name']}"] = ("head", head["id"])
         self.funding_option_map = funding
-        self.funding_combo.configure(values=list(funding))
-        if self.funding_filter.get() not in funding:
-            self.funding_filter.set("All Funding Sources")
-        self.tree.delete(*self.tree.get_children()); self.current_rows, project_id = self.filtered_rows()
+        self.funding_selector.set_options((label, label) for label in funding)
+        self.tree.delete(*self.tree.get_children()); self.current_rows, project_ids = self.filtered_rows()
         total = 0; filtered_payments = 0; filtered_outstanding = 0; verified_total = 0
         for row in self.current_rows:
             outstanding = max(0, row["total_cents"] - row["payment_total"])
@@ -7024,7 +8601,6 @@ class ExpensesTab(BaseTab):
             text=f"{money(unallocated)} | {money(surrendered)}",
             fg=GREEN if unallocated >= 0 else RED,
         )
-        project_ids = [project_id] if project_id else list(projects.values())
         deposited = sum(self.db.project_budget(pid)[0] for pid in project_ids)
         contract = sum(
             self.db.one("SELECT contract_value_cents FROM projects WHERE id=?", (pid,))["contract_value_cents"]
@@ -7049,7 +8625,7 @@ class ExpensesTab(BaseTab):
             text=(f"Reconciliation: deposited {money(deposited)} = all active expenses {money(committed)} + "
                   f"budget remaining {money(budget)}. {filter_note} Cash on-hand is shared across projects.")
         )
-        self._refresh_head_cash_breakdown(project_id)
+        self._refresh_head_cash_breakdown()
         self._refresh_cash_tab()
         visible_rows = self.tree.get_children()
         if visible_rows:
@@ -7058,7 +8634,7 @@ class ExpensesTab(BaseTab):
         self._ledger_size_changed()
 
     def export_pdf(self):
-        rows, project_id = self.filtered_rows()
+        rows, project_ids = self.filtered_rows()
         if not rows: messagebox.showinfo(APP_TITLE, "There are no filtered rows to export."); return
         destination = filedialog.asksaveasfilename(title="Export Filtered Expense Ledger",
             initialfile=f"expenses_{date.today():%Y%m%d}.pdf", defaultextension=".pdf",
@@ -7067,20 +8643,19 @@ class ExpensesTab(BaseTab):
         total = sum(max(0,row["total_cents"]-row["recovery_total"]) for row in rows if not row["voided"])
         _withdrawn, _cash_spent, cash = self.db.cash_summary()
         projects = self.project_options()
-        project_ids = [project_id] if project_id else list(projects.values())
         deposited = sum(self.db.project_budget(pid)[0] for pid in project_ids)
         contract = sum(self.db.one(
             "SELECT contract_value_cents FROM projects WHERE id=?", (pid,)
         )["contract_value_cents"] for pid in project_ids)
         committed = sum(self.db.project_commitment_budget(pid)[1] for pid in project_ids)
         applied_filters = [
-            ("Project", self.project_filter.get()),
+            ("Project", self.project_selector.display_text()),
             ("Status", self.status_selector.display_text()),
             ("Verification", self.verification_selector.display_text()),
             ("MOP", self.mop_selector.display_text()),
-            ("Funding source", self.funding_filter.get()),
-            ("Area", self.area_filter.get()),
-            ("Supplier", self.supplier_filter.get()),
+            ("Funding source", self.funding_selector.display_text()),
+            ("Area", self.area_selector.display_text()),
+            ("Supplier", self.supplier_selector.display_text()),
             ("Date from", self.date_from_filter.get() or "All dates"),
             ("Date to", self.date_to_filter.get() or "All dates"),
             ("Search", self.filter_var.get() or "(none)"),
@@ -7160,6 +8735,8 @@ class ContactsTab(BaseTab):
             self.app.refresh_all()
 
     def edit(self):
+        if not self.require_project():
+            return
         record_id = self.selected_id(self.tree)
         if not record_id:
             return
@@ -7173,6 +8750,8 @@ class ContactsTab(BaseTab):
             self.app.refresh_all()
 
     def delete(self):
+        if not self.require_project():
+            return
         record_id = self.selected_id(self.tree)
         if record_id and messagebox.askyesno(APP_TITLE, "Delete this contact?"):
             self.db.execute("DELETE FROM contacts WHERE id=?", (record_id,))
@@ -7606,7 +9185,8 @@ class EmployeeProfileDialog(tk.Toplevel):
     def __init__(self, parent, db, employee_id):
         super().__init__(parent); self.title("Employee Profile"); self.geometry("1000x700")
         self.minsize(900, 620)
-        employee = db.one("SELECT * FROM employees WHERE id=?", (employee_id,))
+        employee = db.one("""SELECT e.*,p.name project_name FROM employees e
+            JOIN projects p ON p.id=e.project_id WHERE e.id=?""", (employee_id,))
         daily = employee_daily_rate(employee)
         outstanding = db.one("""SELECT COALESCE(SUM(a.original_cents),0)-COALESCE(SUM(
             (SELECT SUM(t.amount_cents) FROM cash_advance_transactions t WHERE t.advance_id=a.id
@@ -7633,7 +9213,10 @@ class EmployeeProfileDialog(tk.Toplevel):
             ("Age", employee_age(employee["birthday"]) or "-"),
             ("Contact number", employee["contact_number"] or "-"),
             ("Daily rate", money(daily)), ("Hourly rate", money(int((Decimal(daily)/8).quantize(Decimal('1'), rounding=ROUND_HALF_UP)))),
-            ("Outstanding advances", money(max(0, outstanding)))]
+            ("Outstanding advances", money(max(0, outstanding))),
+            ("Current / last project", employee["project_name"]),
+            ("Employment status", "Active" if employee["active"] else "Archived"),
+            ("Archive notes", employee["archive_reason"] or "-")]
         for index, (label, value) in enumerate(details):
             row, pair = divmod(index, 3)
             card = ttk.Frame(info, padding=6); card.grid(row=row, column=pair, sticky="ew", padx=(0, 8), pady=3)
@@ -8131,13 +9714,102 @@ class CashAdvanceRecoveryDialog(tk.Toplevel):
         self.result={key:value.get().strip() for key,value in self.vars.items()}; self.destroy()
 
 
+class AttendanceEditDialog(tk.Toplevel):
+    def __init__(self, parent, attendance):
+        super().__init__(parent); self.title("Correct Attendance"); self.result=None
+        self.resizable(False,False)
+        body=ttk.Frame(self,padding=20); body.pack(fill="both",expand=True)
+        ttk.Label(body,text="Correct closed attendance",style="DialogTitle.TLabel").grid(
+            row=0,column=0,columnspan=3,sticky="w")
+        ttk.Label(body,text=(f"{attendance['name']} [{attendance['employee_no']}]\n"
+            f"Original: {attendance['clock_in'].replace('T',' ')} to {attendance['clock_out'].replace('T',' ')} | "
+            f"Gross {money(attendance['gross_cents'])}"),style="Muted.TLabel").grid(
+            row=1,column=0,columnspan=3,sticky="w",pady=(3,14))
+        original_in=datetime.fromisoformat(attendance["clock_in"])
+        original_out=datetime.fromisoformat(attendance["clock_out"])
+        self.vars={
+            "date":tk.StringVar(value=original_in.date().isoformat()),
+            "time_in":tk.StringVar(value=original_in.strftime("%H:%M")),
+            "time_out":tk.StringVar(value=original_out.strftime("%H:%M")),
+            "reason":tk.StringVar(),
+        }
+        self.widgets={}
+        for row_index,(key,label) in enumerate((("date","Work date"),("time_in","Time in (HH:MM)"),
+                                                ("time_out","Time out (HH:MM)"),("reason","Correction reason")),2):
+            ttk.Label(body,text=label).grid(row=row_index,column=0,sticky="w",pady=5,padx=(0,12))
+            entry=ttk.Entry(body,textvariable=self.vars[key],width=34)
+            entry.grid(row=row_index,column=1,sticky="ew",pady=5); self.widgets[key]=entry
+            if key=="date":
+                ttk.Button(body,text="\U0001F4C5",width=3,
+                           command=lambda:DatePickerPopup(self,self.vars["date"])).grid(
+                    row=row_index,column=2,padx=(5,0))
+        footer=ttk.Frame(body); footer.grid(row=6,column=0,columnspan=3,sticky="e",pady=(15,0))
+        ttk.Button(footer,text="Cancel",command=self.destroy).pack(side="right")
+        ttk.Button(footer,text="Continue to PIN Authorization",style="Primary.TButton",
+                   command=self.save).pack(side="right",padx=(0,8))
+        self.transient(parent); self.grab_set(); self.bind("<Escape>",lambda _e:self.destroy())
+    def save(self):
+        if flash_missing_fields(self,self.vars,self.widgets,["date","time_in","time_out","reason"]):return
+        try:
+            work_date=valid_date(self.vars["date"].get(),True)
+            time_in=datetime.strptime(self.vars["time_in"].get().strip(),"%H:%M").strftime("%H:%M:%S")
+            time_out=datetime.strptime(self.vars["time_out"].get().strip(),"%H:%M").strftime("%H:%M:%S")
+            started=datetime.fromisoformat(f"{work_date}T{time_in}")
+            ended=datetime.fromisoformat(f"{work_date}T{time_out}")
+            if ended<=started:raise ValueError("Time out must be later than time in.")
+        except ValueError as exc:
+            flash_required_widgets(self,[self.widgets["date"],self.widgets["time_in"],self.widgets["time_out"]])
+            messagebox.showerror(APP_TITLE,str(exc),parent=self);return
+        self.result={"started":started,"ended":ended,"reason":self.vars["reason"].get().strip()}
+        self.destroy()
+
+
+class WeeklyEmployeeDetailsDialog(tk.Toplevel):
+    def __init__(self,parent,employee_id,project_id,week_start,week_end):
+        super().__init__(parent); self.parent_tab=parent; self.db=parent.db
+        self.employee_id=employee_id; self.project_id=project_id
+        self.week_start=week_start; self.week_end=week_end
+        employee=self.db.one("SELECT employee_no,name FROM employees WHERE id=?",(employee_id,))
+        self.title("Weekly Attendance Details"); self.geometry("1050x620"); self.minsize(850,500)
+        body=ttk.Frame(self,padding=18); body.pack(fill="both",expand=True)
+        ttk.Label(body,text=f"{employee['name']} — daily attendance",style="DialogTitle.TLabel").pack(anchor="w")
+        ttk.Label(body,text=f"{employee['employee_no']} | {week_start} through {week_end}",style="Muted.TLabel").pack(anchor="w",pady=(2,8))
+        self.tree=make_tree(body,[("date","Date",90),("in","Time In",145),("out","Time Out",145),
+            ("regular","Regular",75),("ot","OT",65),("gross","Gross",95),("closure","Daily Close",135),
+            ("payroll","Payroll Batch",145),("revisions","Corrections",80)])
+        self.tree.bind("<Double-1>",self.edit_selected)
+        footer=ttk.Frame(body); footer.pack(fill="x",pady=(8,0))
+        ttk.Label(footer,text="Double-click a row to correct its time entry.",style="Muted.TLabel").pack(side="left")
+        ttk.Button(footer,text="Close",command=self.destroy).pack(side="right")
+        ttk.Button(footer,text="Edit Selected Attendance",style="Primary.TButton",command=self.edit_selected).pack(side="right",padx=8)
+        self.refresh(); self.transient(parent); self.grab_set()
+    def refresh(self):
+        self.tree.delete(*self.tree.get_children())
+        rows=self.db.all("""SELECT a.*,COALESCE(cb.closure_ref,'') closure_ref,
+            COALESCE(pb.batch_ref,'') payroll_ref FROM attendance a
+            JOIN employees e ON e.id=a.employee_id
+            LEFT JOIN attendance_closure_batches cb ON cb.id=a.closure_batch_id
+            LEFT JOIN payroll_batches pb ON pb.id=a.payroll_batch_id
+            WHERE a.employee_id=? AND COALESCE(a.project_id,e.project_id)=?
+              AND SUBSTR(a.clock_in,1,10) BETWEEN ? AND ? ORDER BY a.clock_in,a.id""",
+            (self.employee_id,self.project_id,self.week_start,self.week_end))
+        for row in rows:self.tree.insert("","end",iid=row["id"],values=(row["clock_in"][:10],
+            row["clock_in"].replace("T"," "),row["clock_out"].replace("T"," "),row["regular_hours"],
+            row["overtime_hours"],money(row["gross_cents"]),row["closure_ref"] or "—",
+            row["payroll_ref"] or "Not committed",row["revision_count"]))
+    def edit_selected(self,_event=None):
+        selected=self.tree.selection()
+        if not selected:return
+        if self.parent_tab.edit_attendance_id(int(selected[0])):self.refresh()
+
+
 class PayrollBatchDetailsDialog(tk.Toplevel):
     def __init__(self,parent,db,batch_id):
         super().__init__(parent); self.title("Committed Weekly Payroll"); self.geometry("1180x680")
         self.minsize(980,580); self.resizable(True,True)
         batch=db.one("SELECT * FROM payroll_batches WHERE id=?",(batch_id,)); body=ttk.Frame(self,padding=18); body.pack(fill="both",expand=True)
         ttk.Label(body,text=f"Payroll batch {batch['batch_ref']}",style="DialogTitle.TLabel").pack(anchor="w")
-        ttk.Label(body,text=f"{batch['period_start']} to {batch['period_end']}  |  Gross {money(batch['gross_cents'])}  |  Deductions {money(batch['deduction_cents'])}  |  Net {money(batch['net_cents'])}",style="Muted.TLabel").pack(anchor="w",pady=(3,10))
+        ttk.Label(body,text=f"{batch['period_start']} to {batch['period_end']}  |  Gross {money(batch['gross_cents'])}  |  Deductions {money(batch['deduction_cents'])}  |  Corrections {money(batch['adjustment_cents'])}  |  Net {money(batch['net_cents'])}",style="Muted.TLabel").pack(anchor="w",pady=(3,10))
         notebook=ttk.Notebook(body); notebook.pack(fill="both",expand=True)
         summary_page=ttk.Frame(notebook,padding=6); detail_page=ttk.Frame(notebook,padding=6)
         notebook.add(summary_page,text="Employee Weekly Summary")
@@ -8151,14 +9823,14 @@ class PayrollBatchDetailsDialog(tk.Toplevel):
             ("position","Position",110),("days","Days",55),("entries","Logs",55),
             ("regular","Regular Hours",90),("ot","OT Hours",75),
             ("regular_pay","Regular Pay",95),("ot_pay","OT Pay",85),
-            ("gross","Gross Salary",100),("deductions","Deductions",95),
+            ("gross","Gross Salary",100),("deductions","Deductions",95),("adjustments","Corrections",90),
             ("net","Net Weekly Pay",110))
         summary_frame=ttk.Frame(summary_page); summary_frame.pack(fill="both",expand=True)
         summary_tree=ttk.Treeview(summary_frame,columns=[c[0] for c in summary_columns],show="headings")
         for key,label,width in summary_columns:
             summary_tree.heading(key,text=label)
             summary_tree.column(key,width=width,stretch=True,
-                anchor="e" if key in {"regular","ot","regular_pay","ot_pay","gross","deductions","net"}
+                anchor="e" if key in {"regular","ot","regular_pay","ot_pay","gross","deductions","adjustments","net"}
                 else "center" if key in {"days","entries"} else "w")
         summary_y=ttk.Scrollbar(summary_frame,orient="vertical",command=summary_tree.yview)
         summary_x=ttk.Scrollbar(summary_frame,orient="horizontal",command=summary_tree.xview)
@@ -8166,18 +9838,20 @@ class PayrollBatchDetailsDialog(tk.Toplevel):
         summary_tree.grid(row=0,column=0,sticky="nsew"); summary_y.grid(row=0,column=1,sticky="ns")
         summary_x.grid(row=1,column=0,sticky="ew"); summary_frame.rowconfigure(0,weight=1); summary_frame.columnconfigure(0,weight=1)
         for row in summary_rows:
-            net=row["gross_cents"]-row["deduction_cents"]
+            net=row["gross_cents"]-row["deduction_cents"]+row["adjustment_cents"]
             summary_tree.insert("","end",iid=row["employee_id"],values=(row["name"],row["employee_no"],
                 row["position"],row["attendance_days"],row["attendance_entries"],
                 f"{row['regular_hours']:.2f}",f"{row['overtime_hours']:.2f}",
                 money(row["regular_pay_cents"]),money(row["overtime_pay_cents"]),
-                money(row["gross_cents"]),money(row["deduction_cents"]),money(net)))
+                money(row["gross_cents"]),money(row["deduction_cents"]),money(row["adjustment_cents"]),money(net)))
         summarized_gross=sum(row["gross_cents"] for row in summary_rows)
         summarized_deductions=sum(row["deduction_cents"] for row in summary_rows)
+        summarized_adjustments=sum(row["adjustment_cents"] for row in summary_rows)
         ttk.Label(summary_page,text=(f"Employees: {len(summary_rows)}   |   Gross salary: {money(summarized_gross)}   |   "
-                  f"Deductions: {money(summarized_deductions)}   |   Net weekly pay: {money(summarized_gross-summarized_deductions)}"),
+                  f"Deductions: {money(summarized_deductions)}   |   Corrections: {money(summarized_adjustments)}   |   "
+                  f"Net weekly pay: {money(summarized_gross-summarized_deductions+summarized_adjustments)}"),
                   style="Section.TLabel").pack(anchor="e",pady=(8,0))
-        columns=(("employee","Employee",160),("in","Time In",150),("out","Time Out",150),("lunch","Lunch",70),("regular","Regular",75),("ot","OT",65),("regpay","Regular Pay",100),("otpay","OT Pay",90),("gross","Gross",100))
+        columns=(("employee","Employee",160),("in","Time In",150),("out","Time Out",150),("lunch","Lunch",70),("regular","Regular",75),("ot","OT",65),("regpay","Regular Pay",100),("otpay","OT Pay",90),("gross","Gross",100),("revisions","Corrections",80))
         frame=ttk.Frame(detail_page); frame.pack(fill="both",expand=True); tree=ttk.Treeview(frame,columns=[c[0] for c in columns],show="headings")
         for key,label,width in columns: tree.heading(key,text=label); tree.column(key,width=width,stretch=True)
         sy=ttk.Scrollbar(frame,orient="vertical",command=tree.yview); sx=ttk.Scrollbar(frame,orient="horizontal",command=tree.xview)
@@ -8185,7 +9859,12 @@ class PayrollBatchDetailsDialog(tk.Toplevel):
         tree.grid(row=0,column=0,sticky="nsew"); sy.grid(row=0,column=1,sticky="ns"); sx.grid(row=1,column=0,sticky="ew")
         frame.rowconfigure(0,weight=1); frame.columnconfigure(0,weight=1)
         for row in db.all("""SELECT a.*,e.name FROM attendance a JOIN employees e ON e.id=a.employee_id WHERE a.payroll_batch_id=? ORDER BY e.name,a.clock_in""",(batch_id,)):
-            tree.insert("","end",values=(row["name"],row["clock_in"].replace("T"," "),row["clock_out"].replace("T"," "),row["lunch_hours"],row["regular_hours"],row["overtime_hours"],money(row["regular_pay_cents"]),money(row["overtime_pay_cents"]),money(row["gross_cents"])))
+            tree.insert("","end",iid=row["id"],values=(row["name"],row["clock_in"].replace("T"," "),row["clock_out"].replace("T"," "),row["lunch_hours"],row["regular_hours"],row["overtime_hours"],money(row["regular_pay_cents"]),money(row["overtime_pay_cents"]),money(row["gross_cents"]),row["revision_count"]))
+        if hasattr(parent,"edit_attendance_id"):
+            def edit_committed_attendance(_event=None):
+                selected=tree.selection()
+                if selected and parent.edit_attendance_id(int(selected[0])):self.destroy()
+            tree.bind("<Double-1>",edit_committed_attendance)
         ttk.Button(body,text="Close",command=self.destroy).pack(anchor="e",pady=(10,0)); self.transient(parent); self.grab_set()
 
 
@@ -8199,6 +9878,8 @@ class PayrollTab(BaseTab):
         actions=ttk.Frame(self); actions.pack(fill="x",pady=(8,4))
         ttk.Button(actions,text="+ Add Employee",command=self.add_employee).pack(side="left")
         ttk.Button(actions,text="Edit Employee",command=self.edit_employee).pack(side="left",padx=5)
+        ttk.Button(actions,text="Transfer Employee",command=self.transfer_employee).pack(side="left")
+        ttk.Button(actions,text="Archive Employee",command=self.archive_employee).pack(side="left",padx=5)
         ttk.Button(actions,text="Batch Attendance",style="Primary.TButton",command=self.batch_attendance).pack(side="left")
         ttk.Button(actions,text="Close Daily Attendance",command=self.close_daily_attendance).pack(side="left",padx=5)
         cards=ttk.Frame(self); cards.pack(fill="x",pady=(4,7))
@@ -8216,12 +9897,19 @@ class PayrollTab(BaseTab):
         ttk.Button(clock,text="OUT",command=lambda:self.clock("out")).pack(side="left",padx=3)
         ttk.Button(clock,text="Expand Kiosk",style="Primary.TButton",command=self.open_kiosk).pack(side="right")
         self.lists=ttk.Notebook(self); self.lists.pack(fill="both",expand=True,pady=(6,0))
-        employee_page,attendance_page,weekly_page,batch_page,advance_page=(ttk.Frame(self.lists,padding=4) for _ in range(5))
+        employee_page,archive_page,attendance_page,weekly_page,batch_page,advance_page=(ttk.Frame(self.lists,padding=4) for _ in range(6))
         for page,title in ((employee_page,"Employee Roster"),(attendance_page,"Attendance Ledger"),
+                           (archive_page,"Employee Archive"),
                            (weekly_page,"Weekly Payroll"),(batch_page,"Committed Weekly Payrolls"),
                            (advance_page,"Cash Advances")): self.lists.add(page,text=title)
         self.employees=make_tree(employee_page,[("no","Employee No.",105),("name","Name",155),("project","Project",130),("position","Position",120),("class","Class",75),("daily","Daily Rate",90),("hourly","Hourly Rate",90),("advance","Advance Balance",110),("state","Status",90)])
-        self.attendance=make_tree(attendance_page,[("employee","Employee",145),("date","Date",90),("in","Time In",130),("out","Time Out",130),("lunch","Lunch",60),("regular","Regular",65),("ot","OT",55),("gross","Gross Pay",90),("source","Source",75),("closure","Daily Close Ref.",135),("workflow","Payroll Status",125)])
+        archive_actions=ttk.Frame(archive_page); archive_actions.pack(fill="x",pady=(0,4))
+        ttk.Label(archive_actions,text="Archived profiles retain attendance, payroll and cash-advance history.",style="Muted.TLabel").pack(side="left")
+        ttk.Button(archive_actions,text="Reactivate Employee",style="Primary.TButton",command=self.reactivate_employee).pack(side="right")
+        self.archived_employees=make_tree(archive_page,[("no","Employee No.",105),("name","Name",155),
+            ("project","Last Project",135),("position","Position",120),("daily","Daily Rate",90),
+            ("archived","Archived",145),("reason","Reason",220)])
+        self.attendance=make_tree(attendance_page,[("employee","Employee",145),("date","Date",90),("in","Time In",130),("out","Time Out",130),("lunch","Lunch",60),("regular","Regular",65),("ot","OT",55),("gross","Gross Pay",90),("source","Source",75),("closure","Daily Close Ref.",135),("workflow","Payroll Status",125),("revisions","Corrections",75)])
         weekly_controls=ttk.Frame(weekly_page); weekly_controls.pack(fill="x",pady=(0,5))
         ttk.Label(weekly_controls,text="Payroll week").pack(side="left")
         self.week_var=tk.StringVar(value=payroll_week_bounds(date.today())[0])
@@ -8238,9 +9926,9 @@ class PayrollTab(BaseTab):
         self.weekly_summary=ttk.Label(weekly_page,style="Section.TLabel"); self.weekly_summary.pack(anchor="w",pady=(0,5))
         self.weekly=make_tree(weekly_page,[("employee","Employee",150),("project","Project",125),
             ("days","Closed Days",75),("regular","Regular Hours",85),("ot","OT Hours",70),
-            ("gross","Gross",95),("deductions","Advance Deductions",115),("net","Net Payable",100),
+            ("gross","Gross",95),("deductions","Advance Deductions",115),("adjustments","Corrections",95),("net","Net Payable",100),
             ("refs","Daily Close References",220),("status","Status",100)])
-        self.batches=make_tree(batch_page,[("ref","Batch",145),("start","Period Start",95),("end","Period End",95),("count","Entries",65),("gross","Gross",100),("deductions","Deductions",95),("net","Net Payable",100),("head","Authorized by",120),("created","Committed",145)])
+        self.batches=make_tree(batch_page,[("ref","Batch",145),("start","Period Start",95),("end","Period End",95),("count","Entries",65),("gross","Gross",100),("deductions","Deductions",95),("adjustments","Corrections",95),("net","Net Payable",100),("head","Authorized by",120),("created","Committed",145)])
         advance_actions=ttk.Frame(advance_page); advance_actions.pack(fill="x",pady=(0,4))
         ttk.Button(advance_actions,text="+ Grant Cash Advance",style="Primary.TButton",command=self.grant_cash_advance).pack(side="left")
         ttk.Button(advance_actions,text="+ Batch Cash Advances",style="Primary.TButton",
@@ -8254,6 +9942,9 @@ class PayrollTab(BaseTab):
         ttk.Label(transactions_frame,text="Every advance and recovery transaction",style="Section.TLabel").pack(anchor="w",pady=(5,0))
         self.advance_transactions=make_tree(transactions_frame,[("date","Date",90),("employee","Employee",140),("type","Transaction",125),("amount","Amount",90),("mop","MOP",100),("reference","Reference",115),("head","Authorized by",115),("balance","Balance after",95)])
         self.employees.bind("<Double-1>",self.open_employee_profile)
+        self.archived_employees.bind("<Double-1>",self.open_archived_employee_profile)
+        self.attendance.bind("<Double-1>",self.edit_selected_attendance)
+        self.weekly.bind("<Double-1>",self.open_weekly_employee_details)
         self.batches.bind("<Double-1>",self.open_batch_details)
         self.advances.bind("<Double-1>",self.open_selected_advance_employee)
         self.week_var.trace_add("write",lambda *_args:self.refresh_weekly())
@@ -8272,15 +9963,19 @@ class PayrollTab(BaseTab):
             birthday=valid_date(data["birthday"]); daily=cents(data["daily_rate"])
             if daily<=0: raise ValueError("Daily rate must be greater than zero.")
             salt,digest=hash_pin(data["pin"])
-            self.db.execute("""INSERT INTO employees(project_id,employee_no,pin_salt,pin_hash,
-                name,position,class,pay_basis,rate_cents,standard_hours,birthday,
-                contact_number,daily_rate_cents,nbi_clearance,police_clearance,
-                drug_test,biodata,photo_data,photo_filename,photo_mime)
-                VALUES(?,?,?,?,?,?,?,'Daily',?,8,?,?,?,?,?,?,?,?,?,?)""",
-                (self.project_id,data["employee_no"],salt,digest,data["name"],data["position"],
-                 data["class"],daily,birthday,data["contact_number"],daily,
-                 data["nbi_clearance"],data["police_clearance"],data["drug_test"],
-                 data["biodata"],data["photo_data"],data["photo_filename"],data["photo_mime"]))
+            with self.db.conn:
+                employee_id=self.db.conn.execute("""INSERT INTO employees(project_id,employee_no,pin_salt,pin_hash,
+                    name,position,class,pay_basis,rate_cents,standard_hours,birthday,
+                    contact_number,daily_rate_cents,nbi_clearance,police_clearance,
+                    drug_test,biodata,photo_data,photo_filename,photo_mime)
+                    VALUES(?,?,?,?,?,?,?,'Daily',?,8,?,?,?,?,?,?,?,?,?,?)""",
+                    (self.project_id,data["employee_no"],salt,digest,data["name"],data["position"],
+                     data["class"],daily,birthday,data["contact_number"],daily,
+                     data["nbi_clearance"],data["police_clearance"],data["drug_test"],
+                     data["biodata"],data["photo_data"],data["photo_filename"],data["photo_mime"])).lastrowid
+                self.db.conn.execute("""INSERT INTO employee_project_assignments(employee_id,project_id,
+                    effective_from,position,daily_rate_cents,reason) VALUES(?,?,?,?,?,'Initial assignment')""",
+                    (employee_id,self.project_id,date.today().isoformat(),data["position"],daily))
             self.db.audit(self.project_id,"EMPLOYEE_ADDED",data["name"]); self.app.refresh_all()
         except (ValueError,sqlite3.Error) as exc: messagebox.showerror(APP_TITLE,str(exc))
 
@@ -8304,6 +9999,132 @@ class PayrollTab(BaseTab):
                 photo_data=?,photo_filename=?,photo_mime=?{pin_sql} WHERE id=?""",tuple(params)); self.app.refresh_all()
         except (ValueError,sqlite3.Error) as exc: messagebox.showerror(APP_TITLE,str(exc))
 
+    def archive_employee(self):
+        employee_id=self.selected_id(self.employees)
+        if not employee_id:return
+        employee=self.db.one("SELECT * FROM employees WHERE id=?",(employee_id,))
+        if not employee:return
+        outstanding=self.db.one("""SELECT COALESCE(SUM(a.original_cents),0)-COALESCE(SUM((
+            SELECT SUM(t.amount_cents) FROM cash_advance_transactions t WHERE t.advance_id=a.id
+            AND t.posted=1 AND t.voided=0 AND t.txn_type<>'Advance')),0) total
+            FROM cash_advances a WHERE a.employee_id=? AND a.voided=0""",(employee_id,))["total"]
+        initial_note=(f"Outstanding cash advance: {money(max(0,outstanding))}. " if outstanding>0 else "")
+        data=dialog(self,"Archive Employee",[("reason","Reason for leaving / archiving")],{"reason":initial_note})
+        if not data or not data["reason"].strip():return
+        head=self.app.authorize_for_project(employee["project_id"],"Archive employee",
+            f"{employee['name']} [{employee['employee_no']}]\n{data['reason']}")
+        if not head:return
+        try:
+            self.db.archive_employee(employee_id,data["reason"],head["id"])
+            messagebox.showinfo(APP_TITLE,f"{employee['name']} was moved to the Employee Archive.")
+            self.app.refresh_all()
+        except (ValueError,sqlite3.Error) as exc:messagebox.showerror(APP_TITLE,str(exc))
+
+    def transfer_employee(self):
+        employee_id=self.selected_id(self.employees)
+        if not employee_id:return
+        employee=self.db.one("SELECT * FROM employees WHERE id=?",(employee_id,))
+        projects={f"{row['name']} [#{row['id']}]":row["id"] for row in self.db.all(
+            "SELECT id,name FROM projects WHERE id<>? AND status<>'Completed' ORDER BY name",
+            (employee["project_id"],))}
+        if not projects:messagebox.showinfo(APP_TITLE,"Create another project before transferring an employee.");return
+        data=dialog(self,"Transfer Employee",[("project","Destination project",list(projects)),
+            ("effective_date","Effective date (YYYY-MM-DD)"),("position","Position in destination project"),
+            ("daily_rate","Daily rate"),("reason","Transfer reason")],
+            {"project":next(iter(projects)),"effective_date":date.today().isoformat(),
+             "position":employee["position"],"daily_rate":money(employee_daily_rate(employee)),"reason":""})
+        if not data:return
+        try:
+            destination_id=projects.get(data["project"]); daily=cents(data["daily_rate"])
+            if not destination_id or not data["reason"].strip():raise ValueError("Select a destination and enter a transfer reason.")
+            valid_date(data["effective_date"],True)
+        except ValueError as exc:messagebox.showerror(APP_TITLE,str(exc));return
+        source_project = self.db.one("SELECT status FROM projects WHERE id=?", (employee["project_id"],))
+        if source_project and source_project["status"] == "Completed":
+            source_head = self.app.authorize_all_heads(
+                employee["project_id"], "Transfer employee from completed project",
+                f"Release {employee['name']} to {data['project']} effective {data['effective_date']}.",
+                allow_completed=True,
+            )
+            source_head = source_head[0] if source_head else None
+        else:
+            source_head=self.app.authorize_for_project(employee["project_id"],"Transfer employee — source approval",
+                f"Release {employee['name']} to {data['project']} effective {data['effective_date']}.")
+        if not source_head:return
+        destination_head=self.app.authorize_for_project(destination_id,"Transfer employee — destination approval",
+            f"Accept {employee['name']} as {data['position']} at {money(daily)} per day.")
+        if not destination_head:return
+        try:
+            self.db.transfer_employee(employee_id,destination_id,data["effective_date"],data["reason"],
+                data["position"],daily,source_head["id"],destination_head["id"])
+            messagebox.showinfo(APP_TITLE,f"{employee['name']} was transferred successfully.")
+            self.app.refresh_all()
+        except (ValueError,sqlite3.Error) as exc:messagebox.showerror(APP_TITLE,str(exc))
+
+    def reactivate_employee(self):
+        selected=self.archived_employees.selection()
+        if not selected:messagebox.showinfo(APP_TITLE,"Select an archived employee first.");return
+        employee_id=int(selected[0]); employee=self.db.one("SELECT * FROM employees WHERE id=?",(employee_id,))
+        projects={f"{row['name']} [#{row['id']}]":row["id"] for row in self.db.all(
+            "SELECT id,name FROM projects WHERE status<>'Completed' ORDER BY name")}
+        data=dialog(self,"Reactivate Employee",[("project","Current project",list(projects)),
+            ("effective_date","Reactivation date (YYYY-MM-DD)"),("position","Position"),
+            ("daily_rate","Daily rate"),("reason","Reactivation notes")],
+            {"project":next((label for label,pid in projects.items() if pid==employee["project_id"]),next(iter(projects),"")),
+             "effective_date":date.today().isoformat(),"position":employee["position"],
+             "daily_rate":money(employee_daily_rate(employee)),"reason":"Returned to active employment"})
+        if not data:return
+        try:
+            project_id=projects.get(data["project"]);daily=cents(data["daily_rate"])
+            if not project_id or not data["reason"].strip():raise ValueError("Select a project and enter reactivation notes.")
+        except ValueError as exc:messagebox.showerror(APP_TITLE,str(exc));return
+        head=self.app.authorize_for_project(project_id,"Reactivate employee",
+            f"{employee['name']} in {data['project']} effective {data['effective_date']}.")
+        if not head:return
+        try:
+            self.db.reactivate_employee(employee_id,project_id,data["effective_date"],data["reason"],
+                data["position"],daily,head["id"])
+            messagebox.showinfo(APP_TITLE,f"{employee['name']} is active again.")
+            self.app.refresh_all();self.lists.select(0)
+        except (ValueError,sqlite3.Error) as exc:messagebox.showerror(APP_TITLE,str(exc))
+
+    def open_archived_employee_profile(self,_event=None):
+        selected=self.archived_employees.selection()
+        if selected:
+            win=EmployeeProfileDialog(self,self.db,int(selected[0]));self.wait_window(win)
+
+    def edit_selected_attendance(self,_event=None):
+        selected=self.attendance.selection()
+        if selected:self.edit_attendance_id(int(selected[0]))
+
+    def edit_attendance_id(self,attendance_id):
+        attendance=self.db.one("""SELECT a.*,e.name,e.employee_no,e.project_id current_project_id
+            FROM attendance a JOIN employees e ON e.id=a.employee_id WHERE a.id=?""",(attendance_id,))
+        if not attendance:return False
+        win=AttendanceEditDialog(self,attendance);self.wait_window(win)
+        if not win.result:return False
+        project_id=attendance["project_id"] or attendance["current_project_id"]
+        head=self.app.authorize_for_project(project_id,"Correct closed attendance",
+            f"{attendance['name']} [{attendance['employee_no']}]\n{win.result['reason']}")
+        if not head:return False
+        try:
+            result=self.db.revise_attendance(attendance_id,win.result["started"],win.result["ended"],
+                win.result["reason"],head["id"])
+            notice=("The settled payroll was preserved. A correction of "
+                    f"{money(result['delta_cents'])} will be applied to the employee's next weekly payroll."
+                    if result["locked_adjustment"] else
+                    "The attendance and its uncommitted/unpaid payroll totals were recalculated.")
+            messagebox.showinfo(APP_TITLE,f"Attendance corrected successfully.\n\n{notice}")
+            self.app.refresh_all();return True
+        except (ValueError,sqlite3.Error) as exc:messagebox.showerror(APP_TITLE,str(exc));return False
+
+    def open_weekly_employee_details(self,_event=None):
+        selected=self.weekly.selection()
+        if not selected or not self.project_id:return
+        week_start,week_end=payroll_week_bounds(self.week_var.get() or date.today())
+        win=WeeklyEmployeeDetailsDialog(self,int(selected[0]),self.project_id,week_start,week_end)
+        self.wait_window(win);self.refresh_weekly()
+
     def open_employee_profile(self,_event=None):
         selected=self.employees.selection()
         if selected: win=EmployeeProfileDialog(self,self.db,int(selected[0])); self.wait_window(win)
@@ -8325,7 +10146,7 @@ class PayrollTab(BaseTab):
         if direction=="in" and open_row: messagebox.showinfo(APP_TITLE,f"{employee['name']} is already clocked in.",parent=parent); return False
         if direction=="out" and not open_row: messagebox.showinfo(APP_TITLE,f"{employee['name']} is not currently clocked in.",parent=parent); return False
         if not open_row:
-            self.db.execute("INSERT INTO attendance(employee_id,clock_in,source) VALUES(?,?,'Kiosk')",(employee["id"],now.isoformat(timespec="seconds"))); messagebox.showinfo(APP_TITLE,f"Welcome, {employee['name']}!\nTime in: {now:%I:%M %p}",parent=parent)
+            self.db.execute("INSERT INTO attendance(employee_id,project_id,clock_in,source) VALUES(?,?,?,'Kiosk')",(employee["id"],employee["project_id"],now.isoformat(timespec="seconds"))); messagebox.showinfo(APP_TITLE,f"Welcome, {employee['name']}!\nTime in: {now:%I:%M %p}",parent=parent)
         else:
             result=compute_shift_pay(datetime.fromisoformat(open_row["clock_in"]),now,employee_daily_rate(employee))
             self.db.execute("""UPDATE attendance SET clock_out=?,hours=?,lunch_hours=?,regular_hours=?,overtime_hours=?,regular_pay_cents=?,overtime_pay_cents=?,gross_cents=? WHERE id=?""",
@@ -8349,8 +10170,8 @@ class PayrollTab(BaseTab):
                 records.append((employee["id"],started.isoformat(timespec="seconds"),ended.isoformat(timespec="seconds"),result))
             with self.db.conn:
                 for employee_id,started,ended,result in records:
-                    self.db.conn.execute("""INSERT INTO attendance(employee_id,clock_in,clock_out,hours,lunch_hours,regular_hours,overtime_hours,regular_pay_cents,overtime_pay_cents,gross_cents,day_type,source,authorized_by_head_id)
-                        VALUES(?,?,?,?,?,?,?,?,?,?,'Ordinary Day','Manual Batch',?)""",(employee_id,started,ended,result["hours"],result["lunch_hours"],result["regular_hours"],result["overtime_hours"],result["regular_pay_cents"],result["overtime_pay_cents"],result["gross_cents"],head["id"]))
+                    self.db.conn.execute("""INSERT INTO attendance(employee_id,project_id,clock_in,clock_out,hours,lunch_hours,regular_hours,overtime_hours,regular_pay_cents,overtime_pay_cents,gross_cents,day_type,source,authorized_by_head_id)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,'Ordinary Day','Manual Batch',?)""",(employee_id,self.project_id,started,ended,result["hours"],result["lunch_hours"],result["regular_hours"],result["overtime_hours"],result["regular_pay_cents"],result["overtime_pay_cents"],result["gross_cents"],head["id"]))
             self.db.audit(self.project_id,"BATCH_ATTENDANCE_ADDED",f"{len(records)} entries authorized by {head['name']}"); self.app.refresh_all()
         except (ValueError,sqlite3.Error) as exc: messagebox.showerror(APP_TITLE,str(exc))
 
@@ -8382,7 +10203,7 @@ class PayrollTab(BaseTab):
                 f"{result['count']} record(s)\nGross: {money(result['gross_cents'])}\n\n"
                 "The amounts are now visible in Weekly Payroll.")
             self.app.refresh_all()
-            self.lists.select(2)
+            self.lists.select(3)
         except (ValueError,sqlite3.Error) as exc:
             messagebox.showerror(APP_TITLE,str(exc))
 
@@ -8408,11 +10229,12 @@ class PayrollTab(BaseTab):
             self.weekly_summary.config(text="Select one project to review and commit weekly payroll.")
             return
         rows=self.db.weekly_payroll_summary(self.project_id,week_start)
-        gross=deductions=net=closed_days=0
+        gross=deductions=adjustments=net=closed_days=0
         for row in rows:
             gross+=row["gross_cents"]
             if row["attendance_count"]:
                 deductions+=row["deduction_cents"]
+                adjustments+=row["adjustment_cents"]
                 net+=row["net_cents"]
                 closed_days+=row["attendance_count"]
             status=("No closed attendance" if not row["attendance_count"] else
@@ -8421,11 +10243,13 @@ class PayrollTab(BaseTab):
                 row["name"],row["project_name"],row["attendance_count"],
                 f"{row['regular_hours_total']:.2f}",f"{row['overtime_hours_total']:.2f}",
                 money(row["gross_cents"]),money(row["deduction_cents"] if row["attendance_count"] else 0),
+                money(row["adjustment_cents"] if row["attendance_count"] else 0),
                 money(max(0,row["net_cents"]) if row["attendance_count"] else 0),
                 row["closure_references"] or "—",status))
         self.weekly_summary.config(
             text=f"Closed attendance entries: {closed_days}   |   Gross: {money(gross)}   |   "
-                 f"Advance deductions: {money(deductions)}   |   Net payable: {money(net)}")
+                 f"Advance deductions: {money(deductions)}   |   Corrections: {money(adjustments)}   |   "
+                 f"Net payable: {money(net)}")
 
     def commit_weekly(self):
         if not self.require_project():return
@@ -8437,14 +10261,15 @@ class PayrollTab(BaseTab):
                 "Close at least one day's completed attendance for this week first.");return
         gross=sum(row["gross_cents"] for row in summary)
         deductions=sum(row["deduction_cents"] for row in summary)
-        net=gross-deductions
+        adjustments=sum(row["adjustment_cents"] for row in summary)
+        net=gross-deductions+adjustments
         if any(row["net_cents"]<0 for row in summary):
             messagebox.showerror(APP_TITLE,
                 "One or more employees have salary deductions greater than their weekly gross pay.");return
         head=self.app.authorize(
             "Commit weekly payroll to Expenses",
             f"Week {week_start} to {week_end}: {len(summary)} employee(s), gross {money(gross)}, "
-            f"deductions {money(deductions)}, net payable {money(net)}."
+            f"deductions {money(deductions)}, corrections {money(adjustments)}, net payable {money(net)}."
         )
         if not head:return
         try:
@@ -8454,8 +10279,9 @@ class PayrollTab(BaseTab):
                 f"Weekly payroll committed as {result['reference']}.\n\n"
                 f"Gross: {money(result['gross_cents'])}\n"
                 f"Advance deductions: {money(result['deduction_cents'])}\n"
+                f"Attendance corrections: {money(result['adjustment_cents'])}\n"
                 f"Net payable: {money(result['net_cents'])}")
-            self.app.refresh_all();self.lists.select(3)
+            self.app.refresh_all();self.lists.select(4)
         except (ValueError,sqlite3.Error) as exc:
             messagebox.showerror(APP_TITLE,str(exc))
 
@@ -8671,7 +10497,7 @@ class PayrollTab(BaseTab):
                 APP_TITLE,
                 f"Cash-advance batch {batch_ref} committed.\n\n"
                 f"Employees: {len(data['entries'])}\nTotal: {money(total)}")
-            self.app.refresh_all(); self.lists.select(4)
+            self.app.refresh_all(); self.lists.select(5)
         except (ValueError, sqlite3.Error) as exc:
             messagebox.showerror(APP_TITLE, str(exc), parent=self)
 
@@ -8746,8 +10572,9 @@ class PayrollTab(BaseTab):
         messagebox.showinfo(APP_TITLE,f"Payroll committed.\nGross: {money(gross)}\nAdvance deductions: {money(deduction_total)}\nNet payable: {money(net)}");self.app.refresh_all()
 
     def refresh(self):
-        for tree in (self.employees,self.attendance,self.weekly,self.batches,self.advances,self.advance_transactions):tree.delete(*tree.get_children())
+        for tree in (self.employees,self.archived_employees,self.attendance,self.weekly,self.batches,self.advances,self.advance_transactions):tree.delete(*tree.get_children())
         employee_project_filter=" AND e.project_id=?" if self.project_id else ""
+        attendance_project_filter=" AND COALESCE(a.project_id,e.project_id)=?" if self.project_id else ""
         batch_project_filter=" AND b.project_id=?" if self.project_id else ""
         advance_project_filter=" AND a.project_id=?" if self.project_id else ""
         employee_params=(self.project_id,) if self.project_id else ()
@@ -8755,12 +10582,17 @@ class PayrollTab(BaseTab):
         for e in employees:
             daily=employee_daily_rate(e); outstanding=self.db.one("""SELECT COALESCE(SUM(a.original_cents),0)-COALESCE(SUM((SELECT SUM(t.amount_cents) FROM cash_advance_transactions t WHERE t.advance_id=a.id AND t.posted=1 AND t.voided=0 AND t.txn_type<>'Advance')),0) total FROM cash_advances a WHERE a.employee_id=? AND a.voided=0""",(e["id"],))["total"]
             self.employees.insert("","end",iid=e["id"],values=(e["employee_no"],e["name"],e["project_name"],e["position"],e["class"],money(daily),money(int((Decimal(daily)/8).quantize(Decimal('1'),rounding=ROUND_HALF_UP))),money(max(0,outstanding)),e["state"]))
+        archived=self.db.all("""SELECT e.*,p.name project_name FROM employees e
+            JOIN projects p ON p.id=e.project_id WHERE e.active=0 ORDER BY e.name COLLATE NOCASE""")
+        for e in archived:self.archived_employees.insert("","end",iid=e["id"],values=(e["employee_no"],
+            e["name"],e["project_name"],e["position"],money(employee_daily_rate(e)),
+            e["archived_at"] or "Legacy archive",e["archive_reason"] or "Not recorded"))
         attendance=self.db.all(f"""SELECT a.*,e.name,
             COALESCE(cb.closure_ref,'') closure_ref,COALESCE(pb.batch_ref,'') weekly_ref
             FROM attendance a JOIN employees e ON e.id=a.employee_id
             LEFT JOIN attendance_closure_batches cb ON cb.id=a.closure_batch_id
             LEFT JOIN payroll_batches pb ON pb.id=a.payroll_batch_id
-            WHERE 1=1{employee_project_filter} ORDER BY a.clock_in DESC""",employee_params)
+            WHERE 1=1{attendance_project_filter} ORDER BY a.clock_in DESC""",employee_params)
         for r in attendance:
             workflow=(f"Weekly: {r['weekly_ref']}" if r["payroll_batch_id"] else
                       "Weekly accumulating" if r["closure_batch_id"] else
@@ -8768,9 +10600,9 @@ class PayrollTab(BaseTab):
             self.attendance.insert("","end",iid=r["id"],values=(r["name"],r["clock_in"][:10],
                 r["clock_in"].replace("T"," "),r["clock_out"].replace("T"," "),r["lunch_hours"],
                 r["regular_hours"],r["overtime_hours"],money(r["gross_cents"]),r["source"],
-                r["closure_ref"] or "—",workflow))
+                r["closure_ref"] or "—",workflow,r["revision_count"]))
         batches=self.db.all(f"""SELECT b.*,COUNT(a.id) attendance_count,COALESCE(h.name,'Legacy / not recorded') head FROM payroll_batches b LEFT JOIN attendance a ON a.payroll_batch_id=b.id LEFT JOIN project_heads h ON h.id=b.authorized_by_head_id WHERE 1=1{batch_project_filter} GROUP BY b.id ORDER BY b.created_at DESC,b.id DESC""",employee_params)
-        for b in batches:self.batches.insert("","end",iid=b["id"],values=(b["batch_ref"],b["period_start"],b["period_end"],b["attendance_count"],money(b["gross_cents"]),money(b["deduction_cents"]),money(b["net_cents"]),b["head"],b["created_at"]))
+        for b in batches:self.batches.insert("","end",iid=b["id"],values=(b["batch_ref"],b["period_start"],b["period_end"],b["attendance_count"],money(b["gross_cents"]),money(b["deduction_cents"]),money(b["adjustment_cents"]),money(b["net_cents"]),b["head"],b["created_at"]))
         advances=self.db.all(f"""SELECT a.*,e.name employee,COALESCE(b.batch_ref,'Individual') batch_ref,
             COALESCE((SELECT SUM(t.amount_cents) FROM cash_advance_transactions t WHERE t.advance_id=a.id AND t.posted=1 AND t.voided=0 AND t.txn_type<>'Advance'),0) recovered
             FROM cash_advances a JOIN employees e ON e.id=a.employee_id
@@ -9140,7 +10972,9 @@ class RemittancesTab(BaseTab):
             messagebox.showerror(APP_TITLE, str(exc), parent=self)
 
     def transaction_form(self, initial=None):
-        projects, banks = self.project_options(), self.bank_options()
+        projects = {label: project_id for label, project_id in self.project_options().items()
+                    if self.db.project_is_active(project_id)}
+        banks = self.bank_options()
         fields = [("project", "Project", list(projects)), ("type", "Type", ["Deposit", "Withdrawal"]),
             ("bank", "Bank account", list(banks)), ("amount", "Amount"), ("txn_date", "Date"),
             ("purpose", "Purpose"), ("care_of", "C/O (team head)"),
@@ -9339,7 +11173,15 @@ class RemittancesTab(BaseTab):
             return
         record_id = self.selected_remittance_id()
         if record_id:
-            row = self.db.one("SELECT type,voided FROM remittances WHERE id=?", (record_id,))
+            row = self.db.one("SELECT type,voided,project_id FROM remittances WHERE id=?", (record_id,))
+            if (row and row["type"] != "Withdrawal"
+                    and not self.db.project_is_active(row["project_id"])):
+                messagebox.showinfo(
+                    APP_TITLE,
+                    "This transaction belongs to a completed project and cannot be changed unless the project is reactivated.",
+                    parent=self,
+                )
+                return
             linked = self.db.one(
                 """SELECT COUNT(*) n FROM cash_allocation_sources s
                    JOIN cash_allocations a ON a.id=s.allocation_id
@@ -9683,6 +11525,8 @@ class CalendarTab(BaseTab):
                 messagebox.showerror(APP_TITLE, str(exc))
 
     def edit(self):
+        if not self.require_project():
+            return
         record_id = self.selected_id(self.tree)
         if not record_id:
             return
@@ -9703,12 +11547,16 @@ class CalendarTab(BaseTab):
                 messagebox.showerror(APP_TITLE, str(exc))
 
     def toggle(self):
+        if not self.require_project():
+            return
         record_id = self.selected_id(self.tree)
         if record_id:
             self.db.execute("UPDATE calendar_events SET completed=1-completed WHERE id=?", (record_id,))
             self.app.refresh_all()
 
     def delete(self):
+        if not self.require_project():
+            return
         record_id = self.selected_id(self.tree)
         if record_id and messagebox.askyesno(APP_TITLE, "Delete this event?"):
             self.db.execute("DELETE FROM calendar_events WHERE id=?", (record_id,))
@@ -9804,7 +11652,8 @@ class ContractorApp(tk.Tk):
                  font=("Segoe UI", 9, "bold")).pack(anchor="w")
         nav = tk.Frame(sidebar, bg=NAVY, pady=18); nav.pack(fill="x")
         self.nav_buttons = {}
-        nav_items = [("Dashboard", "▦"), ("Progress", "↗"), ("Expenses", "▣"),
+        nav_items = [("Dashboard", "▦"), ("Completed Projects", "✓"),
+                     ("Progress", "↗"), ("Expenses", "▣"), ("Inventory", "▨"),
                      ("Contacts", "▤"), ("Payroll", "▥"), ("Remittances", "▧"),
                      ("Calendar", "□")]
         for name, icon in nav_items:
@@ -9836,6 +11685,11 @@ class ContractorApp(tk.Tk):
             command=self.manage_current_heads,
         )
         self.project_heads_button.pack(side="left")
+        self.complete_project_button = ttk.Button(
+            header, text="Complete Project", style="Success.TButton",
+            command=lambda: self.pages["Dashboard"].complete_project(),
+        )
+        self.complete_project_button.pack(side="left", padx=(5, 0))
         ttk.Button(header, text="+ New Project", style="Primary.TButton",
                    command=lambda: self.pages["Dashboard"].add()).pack(side="right")
         tools = tk.Menubutton(header, text="Tools ▾", bg=WHITE, fg=INK, relief="solid", bd=1,
@@ -9872,8 +11726,11 @@ class ContractorApp(tk.Tk):
             lambda _event: self.page_canvas.configure(scrollregion=self.page_canvas.bbox("all")),
         )
         self.tabs = [
-            ("Dashboard", ProjectsTab(self)), ("Progress", ProgressTab(self)),
-            ("Expenses", ExpensesTab(self)), ("Contacts", ContactsTab(self)),
+            ("Dashboard", ProjectsTab(self)),
+            ("Completed Projects", CompletedProjectsTab(self)),
+            ("Progress", ProgressTab(self)),
+            ("Expenses", ExpensesTab(self)), ("Inventory", InventoryTab(self)),
+            ("Contacts", ContactsTab(self)),
             ("Payroll", PayrollTab(self)), ("Remittances", RemittancesTab(self)),
             ("Calendar", CalendarTab(self)),
         ]
@@ -9941,6 +11798,12 @@ class ContractorApp(tk.Tk):
     def authorize_for_project(self, project_id: int | None, action: str, details: str):
         if not project_id:
             messagebox.showinfo(APP_TITLE, "Create or select a project first."); return None
+        if not self.db.project_is_active(project_id):
+            messagebox.showerror(
+                APP_TITLE,
+                "This project is completed and read-only. Reactivate it from Completed Projects before making changes."
+            )
+            return None
         heads = self.db.all(
             "SELECT * FROM project_heads WHERE project_id=? AND active=1 ORDER BY name", (project_id,))
         if not heads:
@@ -9954,7 +11817,14 @@ class ContractorApp(tk.Tk):
         win = HeadAuthorizationDialog(self, heads, action, details); self.wait_window(win)
         return win.result
 
-    def authorize_all_heads(self, project_id: int, action: str, details: str):
+    def authorize_all_heads(self, project_id: int, action: str, details: str,
+                            allow_completed: bool = False):
+        if not allow_completed and not self.db.project_is_active(project_id):
+            messagebox.showerror(
+                APP_TITLE,
+                "This project is completed and read-only. Reactivate it before making changes."
+            )
+            return None
         heads = self.db.all(
             "SELECT * FROM project_heads WHERE project_id=? AND active=1 ORDER BY name", (project_id,))
         if not heads:
@@ -9966,6 +11836,9 @@ class ContractorApp(tk.Tk):
     def authorize_two_heads(self, project_id: int, action: str, details: str,
                             role_one="Issuer / approver", role_two="Receiver / reviewer",
                             head_ids=None):
+        if not self.db.project_is_active(project_id):
+            messagebox.showerror(APP_TITLE, "This project is completed and read-only.")
+            return None
         heads = self.db.all(
             "SELECT * FROM project_heads WHERE project_id=? AND active=1 ORDER BY name", (project_id,)
         )
@@ -10006,15 +11879,22 @@ class ContractorApp(tk.Tk):
     def manage_current_heads(self):
         if not self.project_id:
             messagebox.showinfo(APP_TITLE, "Create or select a project first."); return
+        if not self.db.project_is_active(self.project_id):
+            messagebox.showinfo(
+                APP_TITLE, "Completed projects are read-only. Reactivate the project before changing its heads."
+            ); return
         win = ManageHeadsDialog(self, self.db, self.project_id); self.wait_window(win)
 
     def manage_head_registry(self):
         win = HeadRegistryDialog(self, self.db); self.wait_window(win)
 
     def load_projects(self, select_id=None):
-        rows = self.db.all("SELECT id,name FROM projects ORDER BY name")
+        rows = self.db.all("SELECT id,name,status FROM projects ORDER BY name")
         self.project_lookup = {ALL_PROJECTS_LABEL: None}
-        self.project_lookup.update({f"{r['name']}  [#{r['id']}]": r["id"] for r in rows})
+        self.project_lookup.update({
+            f"{'✓ ' if r['status']=='Completed' else ''}{r['name']}  [#{r['id']}]": r["id"]
+            for r in rows
+        })
         self.project_combo["values"] = list(self.project_lookup)
         valid_ids = {row["id"] for row in rows}
         if select_id is not None:
@@ -10026,9 +11906,11 @@ class ContractorApp(tk.Tk):
             self.project_var.set(label)
         else:
             self.project_var.set(ALL_PROJECTS_LABEL)
-        button_state = "normal" if self.project_id else "disabled"
+        active_selected = bool(self.project_id and self.db.project_is_active(self.project_id))
+        button_state = "normal" if active_selected else "disabled"
         self.edit_project_button.configure(state=button_state)
         self.project_heads_button.configure(state=button_state)
+        self.complete_project_button.configure(state=button_state)
         self.refresh_all()
 
     def combo_selected(self, _event=None):

@@ -13,6 +13,294 @@ from app import (Database, PayrollTab, cents, hash_pin, money, resolve_db_path,
 
 
 class ContractorTrackerTests(unittest.TestCase):
+    def test_inventory_consumables_track_opening_restock_and_employee_usage(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "inventory-consumables.db")
+            project_id = db.create_project({
+                "name": "Inventory Project", "client": "Client", "contract_value": "100000",
+                "start_date": "2026-08-01", "target_date": "", "address": "Site", "notes": "",
+                "heads": [{"name": "Inventory Head", "position": "Manager", "pin": "0000"}],
+            })
+            head = db.one("SELECT * FROM project_heads WHERE project_id=?", (project_id,))
+            salt, digest = hash_pin("1111")
+            employee_id = db.execute(
+                """INSERT INTO employees(project_id,employee_no,pin_salt,pin_hash,name,position,
+                   class,pay_basis,rate_cents,daily_rate_cents,standard_hours)
+                   VALUES(?,?,?,?,?,'Painter','Skilled','Daily',80000,80000,'8')""",
+                (project_id, "INV-EMP-001", salt, digest, "Employee One"),
+            ).lastrowid
+            registered = db.register_inventory_item(
+                project_id=project_id, name="Interior Paint", material_type="Consumable",
+                category="Finishing", unit="liters", opening_quantity_milli=10_000,
+                reorder_level_milli=3_000, condition_status="Good", notes="White",
+                authorized_by_head_id=head["id"], registration_date="2026-08-26",
+            )
+            self.assertTrue(registered["item_code"].startswith("INV-"))
+            self.assertTrue(registered["reference"].startswith("STK-20260826-"))
+            db.record_inventory_movement(
+                item_id=registered["id"], transaction_type="Restock", quantity_milli=5_500,
+                transaction_date="2026-08-26", reason="Delivery received", notes="",
+                authorized_by_head_id=head["id"],
+            )
+            usage_ref = db.record_inventory_movement(
+                item_id=registered["id"], transaction_type="Consume", quantity_milli=12_500,
+                transaction_date="2026-08-26", reason="Paint second-floor walls", notes="",
+                employee_id=employee_id, authorized_by_head_id=head["id"],
+            )
+            self.assertTrue(usage_ref.startswith("USE-20260826-"))
+            balance = db.inventory_item_balance(registered["id"])
+            self.assertEqual(balance["on_hand_milli"], 3_000)
+            self.assertEqual(balance["status"], "Low Stock")
+            with self.assertRaisesRegex(ValueError, "currently in stock"):
+                db.record_inventory_movement(
+                    item_id=registered["id"], transaction_type="Consume", quantity_milli=3_001,
+                    transaction_date="2026-08-26", reason="Excess issue", notes="",
+                    employee_id=employee_id, authorized_by_head_id=head["id"],
+                )
+            transaction = db.one(
+                "SELECT * FROM inventory_transactions WHERE reference=?", (usage_ref,)
+            )
+            self.assertEqual(transaction["employee_id"], employee_id)
+            self.assertEqual(transaction["reason"], "Paint second-floor walls")
+            db.close()
+
+    def test_inventory_tools_track_borrower_returns_and_completed_project_lock(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "inventory-tools.db")
+            project_id = db.create_project({
+                "name": "Tool Project", "client": "Client", "contract_value": "100000",
+                "start_date": "2026-08-01", "target_date": "", "address": "Site", "notes": "",
+                "heads": [{"name": "Tool Head", "position": "Manager", "pin": "0000"}],
+            })
+            head = db.one("SELECT * FROM project_heads WHERE project_id=?", (project_id,))
+            salt, digest = hash_pin("1111")
+            employee_id = db.execute(
+                """INSERT INTO employees(project_id,employee_no,pin_salt,pin_hash,name,position,
+                   class,pay_basis,rate_cents,daily_rate_cents,standard_hours)
+                   VALUES(?,?,?,?,?,'Carpenter','Skilled','Daily',90000,90000,'8')""",
+                (project_id, "TOOL-EMP-001", salt, digest, "Employee Two"),
+            ).lastrowid
+            registered = db.register_inventory_item(
+                project_id=project_id, name="Electric Drill", material_type="Non-Consumable",
+                category="Power Tools", unit="unit", opening_quantity_milli=2_000,
+                reorder_level_milli=0, condition_status="Good", notes="",
+                authorized_by_head_id=head["id"], registration_date="2026-08-26",
+            )
+            borrow_ref = db.record_inventory_movement(
+                item_id=registered["id"], transaction_type="Borrow", quantity_milli=2_000,
+                transaction_date="2026-08-26", reason="Install ceiling frames", notes="",
+                employee_id=employee_id, condition_note="Good",
+                authorized_by_head_id=head["id"],
+            )
+            loan = db.one("SELECT * FROM inventory_transactions WHERE reference=?", (borrow_ref,))
+            self.assertEqual(db.inventory_item_balance(registered["id"])["status"], "Borrowed")
+            db.record_inventory_movement(
+                item_id=registered["id"], transaction_type="Return", quantity_milli=1_000,
+                transaction_date="2026-08-26", reason="One drill returned", notes="",
+                employee_id=employee_id, condition_note="Good", linked_transaction_id=loan["id"],
+                authorized_by_head_id=head["id"],
+            )
+            active = db.active_inventory_loans(project_id)
+            self.assertEqual(len(active), 1)
+            self.assertEqual(active[0]["outstanding_milli"], 1_000)
+            db.record_inventory_movement(
+                item_id=registered["id"], transaction_type="Return", quantity_milli=1_000,
+                transaction_date="2026-08-26", reason="Final drill returned", notes="",
+                employee_id=employee_id, condition_note="Good", linked_transaction_id=loan["id"],
+                authorized_by_head_id=head["id"],
+            )
+            self.assertEqual(db.active_inventory_loans(project_id), [])
+            self.assertEqual(db.inventory_item_balance(registered["id"])["available_milli"], 2_000)
+            db.complete_project(project_id, "2026-08-26", "Inventory returned", [head])
+            with self.assertRaisesRegex(ValueError, "completed project"):
+                db.record_inventory_movement(
+                    item_id=registered["id"], transaction_type="Borrow", quantity_milli=1_000,
+                    transaction_date="2026-08-26", reason="Late issue", notes="",
+                    employee_id=employee_id, authorized_by_head_id=head["id"],
+                )
+            db.close()
+
+    def test_project_completion_preserves_records_and_supports_reactivation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "project-completion.db")
+            project_id = db.create_project({
+                "name": "Project Complete", "client": "Client", "contract_value": "100000",
+                "start_date": "2026-01-01", "target_date": "2026-08-31",
+                "address": "Site", "notes": "Original notes",
+                "heads": [{"name": "Head One", "position": "Manager", "pin": "0000"}],
+            })
+            head = db.one("SELECT * FROM project_heads WHERE project_id=?", (project_id,))
+            db.execute("""INSERT INTO remittances(project_id,type,amount_cents,txn_date)
+                VALUES(?,'Deposit',10000000,'2026-01-02')""", (project_id,))
+            expense_id = db.execute("""INSERT INTO expenses(project_id,name,expense_date,
+                total_cents,status,verification_status) VALUES(?,'Closeout expense','2026-08-20',
+                2500000,'Partially Paid','Verified')""", (project_id,)).lastrowid
+            db.execute("""INSERT INTO payments(expense_id,amount_cents,payment_date,method)
+                VALUES(?,1500000,'2026-08-20','Cash')""", (expense_id,))
+            before = {
+                table: db.one(f"SELECT COUNT(*) n FROM {table}")["n"]
+                for table in ("projects", "expenses", "payments", "remittances")
+            }
+
+            reference = db.complete_project(
+                project_id, "2026-08-25", "Turned over to client", [head]
+            )
+            self.assertTrue(reference.startswith("CMP-20260825-"))
+            self.assertFalse(db.project_is_active(project_id))
+            snapshot = db.one(
+                "SELECT * FROM project_completion_snapshots WHERE completion_reference=?",
+                (reference,),
+            )
+            self.assertEqual(snapshot["deposited_cents"], 10000000)
+            self.assertEqual(snapshot["active_expense_cents"], 2500000)
+            self.assertEqual(snapshot["paid_cents"], 1500000)
+            self.assertEqual(snapshot["outstanding_cents"], 1000000)
+            after = {
+                table: db.one(f"SELECT COUNT(*) n FROM {table}")["n"]
+                for table in ("projects", "expenses", "payments", "remittances")
+            }
+            self.assertEqual(before, after)
+            self.assertTrue(db.one(
+                "SELECT 1 FROM audit_log WHERE project_id=? AND action='PROJECT_COMPLETED'",
+                (project_id,),
+            ))
+
+            db.reactivate_project(project_id, "Additional client work", [head])
+            self.assertTrue(db.project_is_active(project_id))
+            self.assertTrue(db.one(
+                "SELECT reactivated_at FROM project_completion_snapshots WHERE id=?",
+                (snapshot["id"],),
+            )["reactivated_at"])
+            db.close()
+
+    def test_project_completion_blocks_open_or_uncommitted_attendance(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "project-completion-blocker.db")
+            project_id = db.create_project({
+                "name": "Open Attendance", "client": "Client", "contract_value": "1000",
+                "start_date": "2026-08-01", "target_date": "", "address": "", "notes": "",
+                "heads": [{"name": "Head", "position": "Manager", "pin": "0000"}],
+            })
+            head = db.one("SELECT * FROM project_heads WHERE project_id=?", (project_id,))
+            salt, digest = hash_pin("1111")
+            employee_id = db.execute("""INSERT INTO employees(project_id,employee_no,pin_salt,
+                pin_hash,name,position,rate_cents,daily_rate_cents)
+                VALUES(?,?,?,?,?,'Laborer',80000,80000)""",
+                (project_id, "OPEN-001", salt, digest, "Employee"),
+            ).lastrowid
+            db.execute("""INSERT INTO attendance(employee_id,project_id,clock_in,clock_out)
+                VALUES(?,?,'2026-08-25T08:00:00','')""", (employee_id, project_id))
+            with self.assertRaisesRegex(ValueError, "still clocked in"):
+                db.complete_project(project_id, "2026-08-25", "Closeout", [head])
+            db.execute("""UPDATE attendance SET clock_out='2026-08-25T17:00:00' WHERE employee_id=?""",
+                       (employee_id,))
+            with self.assertRaisesRegex(ValueError, "not been committed"):
+                db.complete_project(project_id, "2026-08-25", "Closeout", [head])
+            db.close()
+
+    def test_employee_transfer_archive_and_attendance_correction_are_audited(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "employee-history.db")
+            project_one = db.create_project({
+                "name": "Project One", "client": "Client", "contract_value": "100000",
+                "start_date": "2026-08-01", "target_date": "", "address": "", "notes": "",
+                "heads": [{"name": "Head One", "position": "Manager", "pin": "0000"}],
+            })
+            project_two = db.create_project({
+                "name": "Project Two", "client": "Client", "contract_value": "100000",
+                "start_date": "2026-08-01", "target_date": "", "address": "", "notes": "",
+                "heads": [{"name": "Head Two", "position": "Manager", "pin": "0000"}],
+            })
+            head_one = db.one("SELECT * FROM project_heads WHERE project_id=?", (project_one,))
+            head_two = db.one("SELECT * FROM project_heads WHERE project_id=?", (project_two,))
+            salt, digest = hash_pin("1111")
+            employee_id = db.execute(
+                """INSERT INTO employees(project_id,employee_no,pin_salt,pin_hash,name,position,
+                   class,pay_basis,rate_cents,daily_rate_cents,standard_hours)
+                   VALUES(?,?,?,?,?,'Laborer','Labor','Daily',80000,80000,'8')""",
+                (project_one, "ONE-001", salt, digest, "Employee One"),
+            ).lastrowid
+            db.execute(
+                """INSERT INTO employee_project_assignments(employee_id,project_id,effective_from,
+                   position,daily_rate_cents,reason) VALUES(?,?,?,?,?,'Initial')""",
+                (employee_id, project_one, "2026-08-01", "Laborer", 80000),
+            )
+            attendance_id = db.execute(
+                """INSERT INTO attendance(employee_id,project_id,clock_in,clock_out,hours,
+                   lunch_hours,regular_hours,overtime_hours,regular_pay_cents,overtime_pay_cents,
+                   gross_cents,source) VALUES(?,?,? ,?,'8.00','1.00','8.00','0.00',80000,0,80000,'Manual Batch')""",
+                (employee_id, project_one, "2026-08-08T08:00:00", "2026-08-08T17:00:00"),
+            ).lastrowid
+
+            db.transfer_employee(employee_id, project_two, "2026-08-09", "Reassignment",
+                                 "Laborer", 80000, head_one["id"], head_two["id"])
+            self.assertEqual(db.one("SELECT project_id FROM employees WHERE id=?", (employee_id,))["project_id"], project_two)
+            self.assertEqual(db.one("SELECT project_id FROM attendance WHERE id=?", (attendance_id,))["project_id"], project_one)
+
+            correction = db.revise_attendance(
+                attendance_id, app_module.datetime.fromisoformat("2026-08-08T13:00:00"),
+                app_module.datetime.fromisoformat("2026-08-08T17:00:00"),
+                "Corrected afternoon shift", head_one["id"],
+            )
+            self.assertEqual(correction["gross_cents"], 40000)
+            self.assertEqual(db.one("SELECT revision_count FROM attendance WHERE id=?", (attendance_id,))["revision_count"], 1)
+
+            db.archive_employee(employee_id, "Project completed", head_two["id"])
+            self.assertEqual(db.one("SELECT active FROM employees WHERE id=?", (employee_id,))["active"], 0)
+            db.reactivate_employee(employee_id, project_one, "2026-08-10", "Rehired",
+                                   "Laborer", 85000, head_one["id"])
+            self.assertEqual(db.one("SELECT active FROM employees WHERE id=?", (employee_id,))["active"], 1)
+            self.assertEqual(db.one("SELECT COUNT(*) n FROM employee_project_assignments WHERE employee_id=?", (employee_id,))["n"], 3)
+            self.assertEqual(db.one("SELECT COUNT(*) n FROM attendance_revisions WHERE attendance_id=?", (attendance_id,))["n"], 1)
+            db.close()
+
+    def test_paid_payroll_attendance_correction_queues_next_week_adjustment(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "paid-correction.db")
+            project_id = db.create_project({
+                "name": "Project Paid", "client": "Client", "contract_value": "100000",
+                "start_date": "2026-08-01", "target_date": "", "address": "", "notes": "",
+                "heads": [{"name": "Payroll Head", "position": "Manager", "pin": "0000"}],
+            })
+            head = db.one("SELECT * FROM project_heads WHERE project_id=?", (project_id,))
+            salt, digest = hash_pin("1111")
+            employee_id = db.execute(
+                """INSERT INTO employees(project_id,employee_no,pin_salt,pin_hash,name,position,
+                   class,pay_basis,rate_cents,daily_rate_cents,standard_hours)
+                   VALUES(?,?,?,?,?,'Laborer','Labor','Daily',80000,80000,'8')""",
+                (project_id, "PAID-001", salt, digest, "Paid Employee"),
+            ).lastrowid
+            db.execute("""INSERT INTO employee_project_assignments(employee_id,project_id,
+                effective_from,position,daily_rate_cents,reason) VALUES(?,?,?,?,?,'Initial')""",
+                (employee_id, project_id, "2026-08-01", "Laborer", 80000))
+            expense_id = db.execute("""INSERT INTO expenses(project_id,name,total_cents,
+                unit_price_cents,expense_date,status) VALUES(?,'Weekly Payroll',80000,80000,
+                '2026-08-15','Paid')""", (project_id,)).lastrowid
+            batch_id = db.execute("""INSERT INTO payroll_batches(project_id,batch_ref,period_start,
+                period_end,gross_cents,deduction_cents,net_cents,expense_id,authorized_by_head_id)
+                VALUES(?,'PAYW-TEST-0001','2026-08-15','2026-08-21',80000,0,80000,?,?)""",
+                (project_id, expense_id, head["id"])).lastrowid
+            attendance_id = db.execute("""INSERT INTO attendance(employee_id,project_id,clock_in,
+                clock_out,hours,lunch_hours,regular_hours,overtime_hours,regular_pay_cents,
+                overtime_pay_cents,gross_cents,payroll_batch_id,committed_expense_id)
+                VALUES(?,?,'2026-08-15T08:00:00','2026-08-15T17:00:00','8.00','1.00',
+                '8.00','0.00',80000,0,80000,?,?)""",
+                (employee_id, project_id, batch_id, expense_id)).lastrowid
+            db.execute("""INSERT INTO payments(expense_id,amount_cents,payment_date,method)
+                VALUES(?,80000,'2026-08-15','Cash')""", (expense_id,))
+
+            result = db.revise_attendance(
+                attendance_id, app_module.datetime.fromisoformat("2026-08-15T13:00:00"),
+                app_module.datetime.fromisoformat("2026-08-15T17:00:00"),
+                "Correct afternoon-only shift", head["id"],
+            )
+            self.assertTrue(result["locked_adjustment"])
+            self.assertEqual(db.one("SELECT gross_cents FROM payroll_batches WHERE id=?", (batch_id,))["gross_cents"], 80000)
+            adjustment = db.one("SELECT * FROM payroll_adjustments WHERE source_attendance_id=?", (attendance_id,))
+            self.assertEqual(adjustment["amount_cents"], -40000)
+            self.assertEqual(adjustment["status"], "Pending")
+            db.close()
+
     def test_expense_import_form_round_trip_preserves_metadata_and_rows(self):
         with tempfile.TemporaryDirectory() as folder:
             form_path = Path(folder) / "expense-import.csv"
