@@ -388,6 +388,110 @@ class ContractorTrackerTests(unittest.TestCase):
             self.assertEqual(adjustment["status"], "Pending")
             db.close()
 
+    def test_reopen_committed_payroll_reverses_expense_and_creates_linked_replacement(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "payroll-reopen.db")
+            project_id = db.create_project({
+                "name": "Payroll Reopen", "client": "Client", "contract_value": "100000",
+                "start_date": "2026-08-01", "target_date": "", "address": "", "notes": "",
+                "heads": [{"name": "Payroll Head", "position": "Manager", "pin": "0000"}],
+            })
+            head = db.one("SELECT * FROM project_heads WHERE project_id=?", (project_id,))
+            salt, digest = hash_pin("1111")
+            employee_id = db.execute(
+                """INSERT INTO employees(project_id,employee_no,pin_salt,pin_hash,name,position,
+                   class,pay_basis,rate_cents,daily_rate_cents,standard_hours)
+                   VALUES(?,?,?,?,?,'Laborer','Labor','Daily',80000,80000,'8')""",
+                (project_id, "REOPEN-001", salt, digest, "Reopen Employee"),
+            ).lastrowid
+            db.execute(
+                """INSERT INTO employee_project_assignments(employee_id,project_id,effective_from,
+                   position,daily_rate_cents,reason) VALUES(?,?,?,?,?,'Initial')""",
+                (employee_id, project_id, "2026-08-01", "Laborer", 80000),
+            )
+            attendance_id = db.execute(
+                """INSERT INTO attendance(employee_id,project_id,clock_in,clock_out,hours,
+                   lunch_hours,regular_hours,overtime_hours,regular_pay_cents,overtime_pay_cents,
+                   gross_cents,pay_rate_cents,source)
+                   VALUES(?,?,'2026-08-15T08:00:00','2026-08-15T17:00:00','8.00','1.00',
+                   '8.00','0.00',80000,0,80000,80000,'Manual Batch')""",
+                (employee_id, project_id),
+            ).lastrowid
+            db.close_attendance_day(project_id, "2026-08-15", head["id"])
+            advance_id = db.execute(
+                """INSERT INTO cash_advances(project_id,employee_id,original_cents,advance_date,
+                   repayment_plan) VALUES(?,?,?,?,?)""",
+                (project_id, employee_id, 20000, "2026-08-15", "Salary Deduction"),
+            ).lastrowid
+            deduction_id = db.execute(
+                """INSERT INTO cash_advance_transactions(advance_id,txn_type,amount_cents,
+                   txn_date,method,posted) VALUES(?,'Salary Deduction',20000,'2026-08-15',
+                   'Salary Deduction',0)""", (advance_id,),
+            ).lastrowid
+            bank_id = db.execute(
+                """INSERT INTO bank_accounts(bank_name,account_name,account_number,active)
+                   VALUES('PBCom','Payroll','0001',1)"""
+            ).lastrowid
+            db.execute(
+                """INSERT INTO remittances(project_id,type,amount_cents,txn_date,bank_account_id)
+                   VALUES(?,'Deposit',100000,'2026-08-15',?)""", (project_id, bank_id),
+            )
+            committed = db.commit_weekly_payroll(project_id, "2026-08-15", head["id"])
+            payment_id = db.execute(
+                """INSERT INTO payments(expense_id,amount_cents,payment_date,method,bank_account_id)
+                   VALUES(?,60000,'2026-08-15','Bank Transfer',?)""",
+                (committed["expense_id"], bank_id),
+            ).lastrowid
+            db.execute(
+                """UPDATE expenses SET status='Paid',verification_status='Verified',
+                   verified_at='2026-08-15T18:00:00' WHERE id=?""", (committed["expense_id"],)
+            )
+
+            reopened = db.reopen_payroll_batch(
+                committed["id"], "Incorrect attendance time", head["id"]
+            )
+            self.assertEqual(reopened["payment_total_cents"], 60000)
+            self.assertEqual(db.bank_balance(bank_id), 100000)
+            self.assertEqual(
+                db.one("SELECT accounting_excluded FROM payments WHERE id=?", (payment_id,))["accounting_excluded"],
+                1,
+            )
+            old_expense = db.one("SELECT * FROM expenses WHERE id=?", (committed["expense_id"],))
+            self.assertEqual((old_expense["voided"], old_expense["workflow_status"]),
+                             (1, "Payroll Reopened"))
+            staged = db.one("SELECT * FROM attendance WHERE id=?", (attendance_id,))
+            self.assertIsNone(staged["payroll_batch_id"])
+            self.assertEqual(staged["reopened_from_payroll_batch_id"], committed["id"])
+            pending = db.one("SELECT * FROM cash_advance_transactions WHERE id=?", (deduction_id,))
+            self.assertEqual(pending["posted"], 0)
+            self.assertIsNone(pending["payroll_batch_id"])
+            self.assertEqual(db.payroll_batch_employee_summary(committed["id"])[0]["gross_cents"], 80000)
+            self.assertEqual(db.payroll_batch_attendance_rows(committed["id"])[0]["gross_cents"], 80000)
+
+            db.revise_attendance(
+                attendance_id, app_module.datetime.fromisoformat("2026-08-15T13:00:00"),
+                app_module.datetime.fromisoformat("2026-08-15T17:00:00"),
+                "Correct afternoon shift", head["id"],
+            )
+            replacement = db.commit_weekly_payroll(project_id, "2026-08-15", head["id"])
+            self.assertEqual(replacement["supersedes_batch_id"], committed["id"])
+            old_batch = db.one("SELECT * FROM payroll_batches WHERE id=?", (committed["id"],))
+            self.assertEqual(old_batch["status"], "Superseded")
+            self.assertEqual(old_batch["replacement_batch_id"], replacement["id"])
+            self.assertEqual(
+                db.one("SELECT workflow_status FROM expenses WHERE id=?", (committed["expense_id"],))["workflow_status"],
+                "Superseded",
+            )
+            self.assertEqual(db.payroll_batch_employee_summary(committed["id"])[0]["gross_cents"], 80000)
+            self.assertEqual(db.payroll_batch_employee_summary(replacement["id"])[0]["gross_cents"], 40000)
+            self.assertEqual(
+                db.one("SELECT COUNT(*) n FROM audit_log WHERE action='WEEKLY_PAYROLL_REOPENED'")["n"],
+                1,
+            )
+            with self.assertRaisesRegex(ValueError, "already superseded"):
+                db.reopen_payroll_batch(committed["id"], "Again", head["id"])
+            db.close()
+
     def test_attendance_correction_can_override_rate_and_exact_final_pay(self):
         with tempfile.TemporaryDirectory() as folder:
             db = Database(Path(folder) / "pay-override.db")

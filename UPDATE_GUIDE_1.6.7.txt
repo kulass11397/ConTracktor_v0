@@ -1,0 +1,45 @@
+ConTracktor_v1 1.6.7 - PAYROLL REOPEN AND REPLACEMENT
+=====================================================
+
+INSTALL ON THE CLIENT COMPUTER
+1. Close ConTracktor completely.
+2. Download ConTracktor_v1_Update_1.6.7_PayrollReopen.exe from the official
+   GitHub v1.6.7 release.
+3. Run the updater for the same Windows user who normally uses ConTracktor.
+4. Open ConTracktor normally. Existing records remain in place.
+
+AUTOMATIC SAFETY COPIES
+- Database:
+  %LOCALAPPDATA%\ConTracktor_v1\Data\Backups\Before_v1.6.7_<timestamp>\
+- Previous application:
+  %LOCALAPPDATA%\ConTracktor_v1\AppBackups\Before_v1.6.7_<timestamp>\
+
+REOPEN A COMMITTED WEEKLY PAYROLL
+1. Open Payroll > Committed Weekly Payrolls.
+2. Select the payroll and click Reopen for Correction.
+3. Enter the required correction reason.
+4. Review the confirmation, including any linked payments that will be
+   reversed, then authorize the action.
+5. The original payroll and expense remain in history as Payroll Reopened.
+6. The attendance returns to Weekly Payroll for the same Saturday-Friday week.
+7. Correct attendance or final pay as needed.
+8. Commit the week again. The new payroll and expense will show that they
+   replace the original; the original changes to Superseded.
+
+ACCOUNTING EFFECT
+- The old payroll expense is excluded from current expense totals.
+- Active payments on that expense are reversed, restoring their PC, DP, or
+  bank balances.
+- Salary deductions and payroll adjustments return to pending and are posted
+  once against the replacement payroll.
+- Original payroll totals and daily attendance remain available for audit and
+  PDF export.
+
+IMPORTANT
+- Do not uninstall ConTracktor before updating.
+- Do not replace or copy over contractor_tracker.db manually.
+- Keep the installer and automatic backup until the updated records are
+  reviewed.
+- Download only from the official repository and compare the installer SHA-256
+  with SHA256SUMS.txt on the release page.
+

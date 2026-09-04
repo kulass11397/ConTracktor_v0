@@ -731,11 +731,7 @@ def export_payroll_batch_pdf(db, batch_id: int, path: Path | str,
             "corrections": money(row["adjustment_cents"]), "net": money(net),
         })
     detail_rows = []
-    attendance = db.all(
-        """SELECT a.*,e.name FROM attendance a JOIN employees e ON e.id=a.employee_id
-           WHERE a.payroll_batch_id=? ORDER BY e.name COLLATE NOCASE,a.clock_in,a.id""",
-        (batch_id,),
-    ) if include_attendance else []
+    attendance = db.payroll_batch_attendance_rows(batch_id) if include_attendance else []
     for row in attendance:
         rate_used = row["pay_rate_cents"] or db.employee_daily_rate_at(
             row["employee_id"], row["clock_in"][:10], batch["project_id"]
@@ -1813,6 +1809,37 @@ class Database:
             authorized_by_head_id INTEGER REFERENCES project_heads(id),
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS payroll_batch_employee_snapshots (
+            payroll_batch_id INTEGER NOT NULL REFERENCES payroll_batches(id) ON DELETE CASCADE,
+            employee_id INTEGER NOT NULL REFERENCES employees(id),
+            employee_no TEXT NOT NULL DEFAULT '', employee_name TEXT NOT NULL DEFAULT '',
+            position TEXT NOT NULL DEFAULT '', class TEXT NOT NULL DEFAULT '',
+            attendance_entries INTEGER NOT NULL DEFAULT 0,
+            attendance_days INTEGER NOT NULL DEFAULT 0,
+            regular_hours REAL NOT NULL DEFAULT 0, overtime_hours REAL NOT NULL DEFAULT 0,
+            regular_pay_cents INTEGER NOT NULL DEFAULT 0,
+            overtime_pay_cents INTEGER NOT NULL DEFAULT 0,
+            gross_cents INTEGER NOT NULL DEFAULT 0,
+            deduction_cents INTEGER NOT NULL DEFAULT 0,
+            adjustment_cents INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(payroll_batch_id,employee_id)
+        );
+        CREATE TABLE IF NOT EXISTS payroll_batch_attendance_snapshots (
+            payroll_batch_id INTEGER NOT NULL REFERENCES payroll_batches(id) ON DELETE CASCADE,
+            attendance_id INTEGER NOT NULL REFERENCES attendance(id),
+            employee_id INTEGER NOT NULL REFERENCES employees(id),
+            employee_name TEXT NOT NULL DEFAULT '',
+            clock_in TEXT NOT NULL DEFAULT '', clock_out TEXT NOT NULL DEFAULT '',
+            hours TEXT NOT NULL DEFAULT '', lunch_hours TEXT NOT NULL DEFAULT '',
+            regular_hours TEXT NOT NULL DEFAULT '', overtime_hours TEXT NOT NULL DEFAULT '',
+            regular_pay_cents INTEGER NOT NULL DEFAULT 0,
+            overtime_pay_cents INTEGER NOT NULL DEFAULT 0,
+            gross_cents INTEGER NOT NULL DEFAULT 0,
+            pay_rate_cents INTEGER NOT NULL DEFAULT 0,
+            manual_pay_adjustment_cents INTEGER NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT '', revision_count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(payroll_batch_id,attendance_id)
+        );
         CREATE TABLE IF NOT EXISTS attendance_closure_batches (
             id INTEGER PRIMARY KEY,
             project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -2183,6 +2210,8 @@ class Database:
         self._ensure_column("expenses", "created_at", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("expenses", "verification_status", "TEXT NOT NULL DEFAULT 'Unverified'")
         self._ensure_column("expenses", "verified_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("expenses", "workflow_status", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("expenses", "superseded_by_payroll_batch_id", "INTEGER")
         self._ensure_column("employees", "birthday", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("employees", "contact_number", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("employees", "daily_rate_cents", "INTEGER NOT NULL DEFAULT 0")
@@ -2210,6 +2239,7 @@ class Database:
         self._ensure_column("attendance", "pay_rate_cents", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("attendance", "manual_pay_adjustment_cents", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("attendance", "pay_override_note", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("attendance", "reopened_from_payroll_batch_id", "INTEGER")
         self._ensure_column("attendance_revisions", "old_pay_rate_cents", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("attendance_revisions", "new_pay_rate_cents", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("attendance_revisions", "old_manual_adjustment_cents", "INTEGER NOT NULL DEFAULT 0")
@@ -2309,6 +2339,15 @@ class Database:
         self._ensure_column("inventory_transactions", "last_edited_by_head_id", "INTEGER")
         self._ensure_column("payroll_batches", "week_schedule", "TEXT NOT NULL DEFAULT 'Legacy / Stored Period'")
         self._ensure_column("payroll_batches", "adjustment_cents", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("payroll_batches", "status", "TEXT NOT NULL DEFAULT 'Committed'")
+        self._ensure_column("payroll_batches", "reopened_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("payroll_batches", "reopen_reason", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("payroll_batches", "reopened_by_head_id", "INTEGER")
+        self._ensure_column("payroll_batches", "supersedes_batch_id", "INTEGER")
+        self._ensure_column("payroll_batches", "replacement_batch_id", "INTEGER")
+        self.conn.execute(
+            "UPDATE payroll_batches SET status='Committed' WHERE TRIM(COALESCE(status,''))=''"
+        )
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_cash_advance_batch ON cash_advances(batch_id)"
         )
@@ -2413,6 +2452,15 @@ class Database:
         self._backfill_shared_cash_references()
         self._migrate_cash_repayment_surrenders()
         self._migrate_v120_payroll_deductions()
+        # Preserve the employee and daily details of every existing committed
+        # payroll before any future reopen operation detaches its live attendance.
+        for payroll in self.conn.execute(
+            """SELECT b.id FROM payroll_batches b
+               WHERE EXISTS(SELECT 1 FROM attendance a WHERE a.payroll_batch_id=b.id)
+                 AND NOT EXISTS(SELECT 1 FROM payroll_batch_employee_snapshots s
+                                WHERE s.payroll_batch_id=b.id)"""
+        ).fetchall():
+            self._capture_payroll_batch_snapshot(payroll["id"])
         self.conn.execute(
             """INSERT INTO app_metadata(key,value,updated_at) VALUES('schema_version','1.2.0',?)
                ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at""",
@@ -4943,6 +4991,10 @@ class Database:
                            WHEN ?<=0 THEN 'Paid' ELSE 'Unpaid' END WHERE id=?""",
                         (new_net, new_net, new_net, batch["expense_id"]),
                     )
+            if batch and not locked:
+                # Keep the committed-batch snapshot aligned with authorized
+                # in-place corrections until the payroll is explicitly reopened.
+                self._capture_payroll_batch_snapshot(batch["id"])
             self.conn.execute("INSERT INTO audit_log(project_id,action,details) VALUES(?,?,?)",
                 (project_id, "ATTENDANCE_CORRECTED",
                  f"Attendance #{attendance_id}, {row['name']} [{row['employee_no']}], "
@@ -5058,10 +5110,92 @@ class Database:
             result.append(row)
         return result
 
+    def _capture_payroll_batch_snapshot(self, batch_id: int):
+        """Store immutable payroll detail before live attendance can be reopened."""
+        if not self.one("SELECT 1 FROM payroll_batches WHERE id=?", (batch_id,)):
+            raise ValueError("The selected payroll batch no longer exists.")
+        self.conn.execute(
+            "DELETE FROM payroll_batch_employee_snapshots WHERE payroll_batch_id=?",
+            (batch_id,),
+        )
+        self.conn.execute(
+            "DELETE FROM payroll_batch_attendance_snapshots WHERE payroll_batch_id=?",
+            (batch_id,),
+        )
+        self.conn.execute(
+            """INSERT INTO payroll_batch_employee_snapshots(
+                   payroll_batch_id,employee_id,employee_no,employee_name,position,class,
+                   attendance_entries,attendance_days,regular_hours,overtime_hours,
+                   regular_pay_cents,overtime_pay_cents,gross_cents,deduction_cents,
+                   adjustment_cents)
+               SELECT ?,e.id,e.employee_no,e.name,e.position,e.class,COUNT(a.id),
+                      COUNT(DISTINCT SUBSTR(a.clock_in,1,10)),
+                      COALESCE(SUM(CAST(NULLIF(a.regular_hours,'') AS REAL)),0),
+                      COALESCE(SUM(CAST(NULLIF(a.overtime_hours,'') AS REAL)),0),
+                      COALESCE(SUM(a.regular_pay_cents),0),
+                      COALESCE(SUM(a.overtime_pay_cents),0),COALESCE(SUM(a.gross_cents),0),
+                      COALESCE((SELECT SUM(t.amount_cents)
+                        FROM cash_advance_transactions t
+                        JOIN cash_advances ca ON ca.id=t.advance_id
+                        WHERE t.payroll_batch_id=? AND ca.employee_id=e.id
+                          AND t.txn_type='Salary Deduction' AND t.posted=1
+                          AND t.voided=0 AND ca.voided=0),0),
+                      COALESCE((SELECT SUM(pa.amount_cents) FROM payroll_adjustments pa
+                        WHERE pa.applied_payroll_batch_id=? AND pa.employee_id=e.id
+                          AND pa.status='Applied'),0)
+               FROM attendance a JOIN employees e ON e.id=a.employee_id
+               WHERE a.payroll_batch_id=? GROUP BY e.id""",
+            (batch_id, batch_id, batch_id, batch_id),
+        )
+        self.conn.execute(
+            """INSERT INTO payroll_batch_attendance_snapshots(
+                   payroll_batch_id,attendance_id,employee_id,employee_name,clock_in,clock_out,
+                   hours,lunch_hours,regular_hours,overtime_hours,regular_pay_cents,
+                   overtime_pay_cents,gross_cents,pay_rate_cents,
+                   manual_pay_adjustment_cents,source,revision_count)
+               SELECT ?,a.id,a.employee_id,e.name,a.clock_in,a.clock_out,a.hours,a.lunch_hours,
+                      a.regular_hours,a.overtime_hours,a.regular_pay_cents,a.overtime_pay_cents,
+                      a.gross_cents,a.pay_rate_cents,a.manual_pay_adjustment_cents,a.source,
+                      a.revision_count
+               FROM attendance a JOIN employees e ON e.id=a.employee_id
+               WHERE a.payroll_batch_id=?""",
+            (batch_id, batch_id),
+        )
+
+    def payroll_batch_attendance_rows(self, batch_id: int):
+        """Return the batch's preserved daily ledger, falling back for legacy data."""
+        snapshots = self.all(
+            """SELECT attendance_id id,attendance_id,employee_id,employee_name name,
+                      clock_in,clock_out,hours,lunch_hours,regular_hours,overtime_hours,
+                      regular_pay_cents,overtime_pay_cents,gross_cents,pay_rate_cents,
+                      manual_pay_adjustment_cents,source,revision_count
+               FROM payroll_batch_attendance_snapshots WHERE payroll_batch_id=?
+               ORDER BY employee_name COLLATE NOCASE,clock_in,attendance_id""",
+            (batch_id,),
+        )
+        if snapshots:
+            return snapshots
+        return self.all(
+            """SELECT a.*,e.name FROM attendance a JOIN employees e ON e.id=a.employee_id
+               WHERE a.payroll_batch_id=? ORDER BY e.name COLLATE NOCASE,a.clock_in,a.id""",
+            (batch_id,),
+        )
+
     def payroll_batch_employee_summary(self, batch_id: int):
         """Return one reconciled weekly-payroll row per employee in a committed batch."""
         if not self.one("SELECT 1 FROM payroll_batches WHERE id=?", (batch_id,)):
             raise ValueError("The selected payroll batch no longer exists.")
+        snapshots = self.all(
+            """SELECT employee_id,employee_no,employee_name name,position,class,
+                      attendance_entries,attendance_days,regular_hours,overtime_hours,
+                      regular_pay_cents,overtime_pay_cents,gross_cents,deduction_cents,
+                      adjustment_cents
+               FROM payroll_batch_employee_snapshots WHERE payroll_batch_id=?
+               ORDER BY employee_name COLLATE NOCASE""",
+            (batch_id,),
+        )
+        if snapshots:
+            return snapshots
         return self.all(
             """SELECT e.id employee_id,e.employee_no,e.name,e.position,e.class,
                       COUNT(a.id) attendance_entries,
@@ -5086,6 +5220,111 @@ class Database:
             (batch_id, batch_id, batch_id),
         )
 
+    def reopen_payroll_batch(self, batch_id: int, reason: str,
+                             authorized_by_head_id: int) -> dict:
+        """Reverse a committed payroll into weekly staging without deleting history."""
+        reason = reason.strip()
+        if not reason:
+            raise ValueError("Enter the reason for reopening this payroll.")
+        batch = self.one(
+            """SELECT b.*,p.status project_status,e.voided expense_voided,
+                      e.verification_status,e.name expense_name
+               FROM payroll_batches b JOIN projects p ON p.id=b.project_id
+               LEFT JOIN expenses e ON e.id=b.expense_id WHERE b.id=?""",
+            (batch_id,),
+        )
+        if not batch:
+            raise ValueError("The selected payroll batch no longer exists.")
+        if batch["project_status"] == "Completed":
+            raise ValueError("Reactivate the completed project before reopening its payroll.")
+        if batch["status"] != "Committed":
+            raise ValueError(
+                f"This payroll is already {batch['status'].lower()} and cannot be reopened again."
+            )
+        head = self.one(
+            "SELECT id,name FROM project_heads WHERE id=? AND project_id=? AND active=1",
+            (authorized_by_head_id, batch["project_id"]),
+        )
+        if not head:
+            raise ValueError("An active project head for this project must authorize the reopening.")
+        attendance = self.all(
+            "SELECT id FROM attendance WHERE payroll_batch_id=? ORDER BY id", (batch_id,)
+        )
+        if not attendance:
+            raise ValueError("This payroll has no linked attendance to return to staging.")
+        payments = self.all(
+            """SELECT id,cash_allocation_id,amount_cents FROM payments
+               WHERE expense_id=? AND accounting_excluded=0 ORDER BY id""",
+            (batch["expense_id"],),
+        ) if batch["expense_id"] else []
+        payment_ids = [row["id"] for row in payments]
+        allocation_ids = {row["cash_allocation_id"] for row in payments
+                          if row["cash_allocation_id"]}
+        payment_total = sum(row["amount_cents"] for row in payments)
+        stamp = local_timestamp()
+        with self.conn:
+            self._capture_payroll_batch_snapshot(batch_id)
+            if payment_ids:
+                placeholders = ",".join("?" for _ in payment_ids)
+                self.conn.execute(
+                    f"""UPDATE payments SET accounting_excluded=1,
+                        notes=TRIM(notes || ?) WHERE id IN ({placeholders})""",
+                    (f" | REVERSED WHEN PAYROLL REOPENED: {reason}", *payment_ids),
+                )
+                self.conn.execute(
+                    f"""UPDATE cash_allocation_transactions SET voided=1,voided_at=?,
+                        void_reason=?,voided_by_head_id=?
+                        WHERE payment_id IN ({placeholders}) AND voided=0""",
+                    (stamp, f"Payroll reopened: {reason}", authorized_by_head_id,
+                     *payment_ids),
+                )
+            if batch["expense_id"]:
+                self.conn.execute(
+                    """UPDATE expenses SET voided=1,status='Reopened/Superseded',
+                       workflow_status='Payroll Reopened',verification_status='Unverified',
+                       verified_at='',notes=TRIM(notes || ?)
+                       WHERE id=?""",
+                    (f" | Payroll {batch['batch_ref']} reopened: {reason}",
+                     batch["expense_id"]),
+                )
+            self.conn.execute(
+                """UPDATE cash_advance_transactions
+                   SET posted=0,payroll_batch_id=NULL,
+                       txn_date=COALESCE((SELECT advance_date FROM cash_advances ca
+                                          WHERE ca.id=cash_advance_transactions.advance_id),txn_date),
+                       notes=TRIM(notes || ?)
+                   WHERE payroll_batch_id=? AND txn_type='Salary Deduction'
+                     AND voided=0""",
+                (f" | Returned to pending when {batch['batch_ref']} was reopened", batch_id),
+            )
+            self.conn.execute(
+                """UPDATE payroll_adjustments SET status='Pending',applied_payroll_batch_id=NULL
+                   WHERE applied_payroll_batch_id=? AND status='Applied'""", (batch_id,)
+            )
+            self.conn.execute(
+                """UPDATE attendance SET committed_expense_id=NULL,payroll_batch_id=NULL,
+                   reopened_from_payroll_batch_id=? WHERE payroll_batch_id=?""",
+                (batch_id, batch_id),
+            )
+            self.conn.execute(
+                """UPDATE payroll_batches SET status='Reopened',reopened_at=?,reopen_reason=?,
+                   reopened_by_head_id=? WHERE id=?""",
+                (stamp, reason, authorized_by_head_id, batch_id),
+            )
+            for allocation_id in allocation_ids:
+                self._sync_allocation_usage_status(allocation_id)
+            self.conn.execute(
+                "INSERT INTO audit_log(project_id,action,details) VALUES(?,?,?)",
+                (batch["project_id"], "WEEKLY_PAYROLL_REOPENED",
+                 f"{batch['batch_ref']} returned {len(attendance)} attendance record(s) to staging; "
+                 f"reversed {len(payments)} payment(s) totaling {money(payment_total)}; "
+                 f"reason: {reason}; authorized by {head['name']}"),
+            )
+        return {"id": batch_id, "reference": batch["batch_ref"],
+                "project_id": batch["project_id"], "week_start": batch["period_start"],
+                "week_end": batch["period_end"], "attendance_count": len(attendance),
+                "payment_count": len(payments), "payment_total_cents": payment_total}
+
     def commit_weekly_payroll(self, project_id: int, week_value: str | date,
                               authorized_by_head_id: int) -> dict:
         """Create one weekly payroll expense from daily-closed attendance only."""
@@ -5101,6 +5340,23 @@ class Database:
         )
         if not attendance:
             raise ValueError("This week has no daily-closed attendance awaiting payroll.")
+        reopened_batch_ids = {row["reopened_from_payroll_batch_id"] for row in attendance
+                              if row["reopened_from_payroll_batch_id"]}
+        if len(reopened_batch_ids) > 1:
+            raise ValueError(
+                "This week contains attendance from more than one reopened payroll. "
+                "Recommit each original payroll separately."
+            )
+        supersedes_batch_id = next(iter(reopened_batch_ids), None)
+        superseded = None
+        if supersedes_batch_id:
+            superseded = self.one(
+                """SELECT * FROM payroll_batches WHERE id=? AND project_id=?
+                   AND period_start=? AND period_end=? AND status='Reopened'""",
+                (supersedes_batch_id, project_id, week_start, week_end),
+            )
+            if not superseded:
+                raise ValueError("The reopened payroll link is no longer valid for this week.")
         head = self.one(
             "SELECT id,name FROM project_heads WHERE id=? AND project_id=? AND active=1",
             (authorized_by_head_id, project_id),
@@ -5145,18 +5401,22 @@ class Database:
                  "Daily-closed attendance payroll", "Payroll", net, net,
                  "PAYROLL", "Labor", commit_date, commit_date, reference,
                   f"{len(attendance)} attendance record(s); salary deductions {money(deduction_total)}; "
-                  f"attendance corrections {money(adjustment_total)}",
+                  f"attendance corrections {money(adjustment_total)}" +
+                  (f"; replaces {superseded['batch_ref']}" if superseded else ""),
                  authorized_by_head_id, "Paid" if net <= 0 else "Unpaid"),
             ).lastrowid
             batch_id = self.conn.execute(
                 """INSERT INTO payroll_batches(project_id,batch_ref,period_start,
                    period_end,gross_cents,deduction_cents,adjustment_cents,net_cents,expense_id,
-                   authorized_by_head_id,week_schedule) VALUES(?,?,?,?,?,?,?,?,?,?,'Saturday-Friday')""",
+                   authorized_by_head_id,week_schedule,supersedes_batch_id)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,'Saturday-Friday',?)""",
                  (project_id, reference, week_start, week_end, gross,
-                  deduction_total, adjustment_total, net, expense_id, authorized_by_head_id),
+                  deduction_total, adjustment_total, net, expense_id, authorized_by_head_id,
+                  supersedes_batch_id),
             ).lastrowid
             self.conn.executemany(
-                """UPDATE attendance SET committed_expense_id=?,payroll_batch_id=?
+                """UPDATE attendance SET committed_expense_id=?,payroll_batch_id=?,
+                   reopened_from_payroll_batch_id=NULL
                    WHERE id=?""",
                 [(expense_id, batch_id, row["id"]) for row in attendance],
             )
@@ -5170,20 +5430,35 @@ class Database:
                        WHERE id=?""",
                     [(batch_id, row["id"]) for row in adjustment_rows],
                 )
+            self._capture_payroll_batch_snapshot(batch_id)
+            if superseded:
+                self.conn.execute(
+                    """UPDATE payroll_batches SET status='Superseded',replacement_batch_id=?
+                       WHERE id=?""", (batch_id, supersedes_batch_id)
+                )
+                if superseded["expense_id"]:
+                    self.conn.execute(
+                        """UPDATE expenses SET workflow_status='Superseded',
+                           superseded_by_payroll_batch_id=? WHERE id=?""",
+                        (batch_id, superseded["expense_id"]),
+                    )
             self.conn.execute(
                 "INSERT INTO audit_log(project_id,action,details) VALUES(?,?,?)",
                 (project_id, "WEEKLY_PAYROLL_COMMITTED",
                  f"{reference}: {week_start} to {week_end}, gross {money(gross)}, "
                   f"deductions {money(deduction_total)}, corrections {money(adjustment_total)}, "
                   f"net {money(net)}, "
-                 f"authorized by {head['name']}"),
+                 f"authorized by {head['name']}" +
+                 (f"; replaces {superseded['batch_ref']}" if superseded else "")),
             )
         return {"id": batch_id, "reference": reference,
                 "week_start": week_start, "week_end": week_end,
                 "attendance_count": len(attendance), "gross_cents": gross,
                 "deduction_cents": deduction_total, "adjustment_cents": adjustment_total,
                 "net_cents": net,
-                "expense_id": expense_id}
+                "expense_id": expense_id,
+                "supersedes_batch_id": supersedes_batch_id,
+                "supersedes_reference": superseded["batch_ref"] if superseded else ""}
 
     def create_project(self, values: dict) -> int:
         with self.conn:
@@ -9442,7 +9717,7 @@ class ExpenseDetailsDialog(tk.Toplevel):
                WHERE e.id=? GROUP BY e.id""", (expense_id,)
         )
         outstanding = max(0, row["total_cents"] - row["payment_total"])
-        status = ("VOID" if row["voided"] else "Paid" if outstanding == 0 and row["total_cents"] > 0
+        status = ((row["workflow_status"] or "VOID") if row["voided"] else "Paid" if outstanding == 0 and row["total_cents"] > 0
                   else "Partially Paid" if row["payment_total"] > 0 else "Unpaid")
         details = [
             ("Project", row["project"]), ("Status", status),
@@ -10853,14 +11128,35 @@ class ExpensesTab(BaseTab):
         expense_id = self.selected_id(self.tree)
         if expense_id:
             expense = self.db.one(
-                """SELECT e.project_id,e.name,e.total_cents,e.voided,p.status project_status
-                     FROM expenses e JOIN projects p ON p.id=e.project_id WHERE e.id=?""",
+                """SELECT e.project_id,e.name,e.total_cents,e.voided,e.workflow_status,
+                            p.status project_status,COALESCE(pb.batch_ref,'') payroll_reference,
+                            COALESCE(pb.status,'') payroll_status
+                     FROM expenses e JOIN projects p ON p.id=e.project_id
+                     LEFT JOIN payroll_batches pb ON pb.expense_id=e.id WHERE e.id=?""",
                 (expense_id,),
             )
             if expense and expense["project_status"] == "Completed":
                 messagebox.showinfo(
                     APP_TITLE,
                     "This expense belongs to a completed project and cannot be changed unless the project is reactivated.",
+                    parent=self,
+                )
+                return
+            if expense and expense["payroll_reference"] and not expense["voided"]:
+                messagebox.showinfo(
+                    APP_TITLE,
+                    f"{expense['payroll_reference']} is a committed payroll.\n\n"
+                    "Open Payroll > Committed Weekly Payrolls and use Reopen for Correction. "
+                    "That action safely reverses the linked expense, payments and deductions together.",
+                    parent=self,
+                )
+                return
+            if expense and expense["voided"] and expense["workflow_status"] in {
+                    "Payroll Reopened", "Superseded"}:
+                messagebox.showinfo(
+                    APP_TITLE,
+                    "This historical payroll expense cannot be restored independently. "
+                    "Correct and recommit the reopened week to create its active replacement.",
                     parent=self,
                 )
                 return
@@ -11133,7 +11429,7 @@ class ExpensesTab(BaseTab):
                     verified_total += net_total
             advance_status = ("Advance Settled" if net_total == 0 else
                               "Advance Partial" if row["recovery_total"] else "Advance Outstanding")
-            display_status = ("VOID" if row["voided"] else
+            display_status = ((row["workflow_status"] or "VOID") if row["voided"] else
                               f"Paid - {advance_status}" if row["cash_advance_id"] else
                               "Paid" if outstanding <= 0 and row["total_cents"] > 0 else
                               "Partially Paid" if row["payment_total"] > 0 else "Unpaid")
@@ -12786,9 +13082,16 @@ class PayrollBatchDetailsDialog(tk.Toplevel):
         super().__init__(parent); self.db=db; self.batch_id=batch_id
         self.title("Committed Weekly Payroll"); self.geometry("1180x680")
         self.minsize(980,580); self.resizable(True,True)
-        batch=db.one("SELECT * FROM payroll_batches WHERE id=?",(batch_id,)); body=ttk.Frame(self,padding=18); body.pack(fill="both",expand=True)
+        batch=db.one("""SELECT b.*,
+            COALESCE((SELECT old.batch_ref FROM payroll_batches old
+                      WHERE old.id=b.supersedes_batch_id),'') supersedes_ref,
+            COALESCE((SELECT replacement.batch_ref FROM payroll_batches replacement
+                      WHERE replacement.id=b.replacement_batch_id),'') replacement_ref
+            FROM payroll_batches b WHERE b.id=?""",(batch_id,)); body=ttk.Frame(self,padding=18); body.pack(fill="both",expand=True)
         ttk.Label(body,text=f"Payroll batch {batch['batch_ref']}",style="DialogTitle.TLabel").pack(anchor="w")
-        ttk.Label(body,text=f"{batch['period_start']} to {batch['period_end']}  |  Gross {money(batch['gross_cents'])}  |  Deductions {money(batch['deduction_cents'])}  |  Corrections {money(batch['adjustment_cents'])}  |  Net {money(batch['net_cents'])}",style="Muted.TLabel").pack(anchor="w",pady=(3,10))
+        relation=(f"  |  Replaces {batch['supersedes_ref']}" if batch['supersedes_ref'] else
+                  f"  |  Replaced by {batch['replacement_ref']}" if batch['replacement_ref'] else "")
+        ttk.Label(body,text=f"{batch['period_start']} to {batch['period_end']}  |  Gross {money(batch['gross_cents'])}  |  Deductions {money(batch['deduction_cents'])}  |  Corrections {money(batch['adjustment_cents'])}  |  Net {money(batch['net_cents'])}  |  Status {batch['status']}{relation}",style="Muted.TLabel").pack(anchor="w",pady=(3,10))
         notebook=ttk.Notebook(body); notebook.pack(fill="both",expand=True)
         summary_page=ttk.Frame(notebook,padding=6); detail_page=ttk.Frame(notebook,padding=6)
         notebook.add(summary_page,text="Employee Weekly Summary")
@@ -12837,20 +13140,23 @@ class PayrollBatchDetailsDialog(tk.Toplevel):
         tree.configure(yscrollcommand=sy.set,xscrollcommand=sx.set)
         tree.grid(row=0,column=0,sticky="nsew"); sy.grid(row=0,column=1,sticky="ns"); sx.grid(row=1,column=0,sticky="ew")
         frame.rowconfigure(0,weight=1); frame.columnconfigure(0,weight=1)
-        for row in db.all("""SELECT a.*,e.name FROM attendance a JOIN employees e ON e.id=a.employee_id WHERE a.payroll_batch_id=? ORDER BY e.name,a.clock_in""",(batch_id,)):
+        for row in db.payroll_batch_attendance_rows(batch_id):
             rate_used=(row["pay_rate_cents"] or
                 db.employee_daily_rate_at(row["employee_id"],row["clock_in"][:10],
                                           batch["project_id"]))
             override=(money(row["manual_pay_adjustment_cents"])
                       if row["manual_pay_adjustment_cents"] else "—")
             tree.insert("","end",iid=row["id"],values=(row["name"],row["clock_in"].replace("T"," "),row["clock_out"].replace("T"," "),row["lunch_hours"],row["regular_hours"],row["overtime_hours"],money(rate_used),money(row["regular_pay_cents"]),money(row["overtime_pay_cents"]),override,money(row["gross_cents"]),row["revision_count"]))
-        if hasattr(parent,"edit_attendance_id"):
+        if hasattr(parent,"edit_attendance_id") and batch["status"] == "Committed":
             def edit_committed_attendance(_event=None):
                 selected=tree.selection()
                 if selected and parent.edit_attendance_id(int(selected[0])):self.destroy()
             tree.bind("<Double-1>",edit_committed_attendance)
         footer=ttk.Frame(body); footer.pack(fill="x",pady=(10,0))
-        ttk.Label(footer,text="PDF export can include the summary only or the complete daily ledger.",
+        footer_message=("This is an audit snapshot. Edit the reopened entries in Weekly Payroll."
+                        if batch["status"] in {"Reopened","Superseded"} else
+                        "PDF export can include the summary only or the complete daily ledger.")
+        ttk.Label(footer,text=footer_message,
                   style="Muted.TLabel").pack(side="left")
         ttk.Button(footer,text="Close",command=self.destroy).pack(side="right")
         ttk.Button(footer,text="Export Payroll PDF",style="Primary.TButton",
@@ -12945,7 +13251,9 @@ class PayrollTab(BaseTab):
                   style="Muted.TLabel").pack(side="left")
         ttk.Button(batch_actions,text="Export Selected Payroll PDF",style="Primary.TButton",
                    command=self.export_selected_batch_pdf).pack(side="right")
-        self.batches=make_tree(batch_page,[("ref","Batch",145),("start","Period Start",95),("end","Period End",95),("count","Entries",65),("gross","Gross",100),("deductions","Deductions",95),("adjustments","Corrections",95),("net","Net Payable",100),("head","Authorized by",120),("created","Committed",145)])
+        ttk.Button(batch_actions,text="Reopen for Correction",
+                   command=self.reopen_selected_payroll).pack(side="right",padx=(0,6))
+        self.batches=make_tree(batch_page,[("ref","Batch",145),("start","Period Start",95),("end","Period End",95),("count","Entries",65),("gross","Gross",100),("deductions","Deductions",95),("adjustments","Corrections",95),("net","Net Payable",100),("status","Status",105),("replacement","Replacement",145),("head","Authorized by",120),("created","Committed",145)])
         advance_actions=ttk.Frame(advance_page); advance_actions.pack(fill="x",pady=(0,4))
         ttk.Button(advance_actions,text="+ Grant Cash Advance",style="Primary.TButton",command=self.grant_cash_advance).pack(side="left")
         ttk.Button(advance_actions,text="+ Batch Cash Advances",style="Primary.TButton",
@@ -13235,6 +13543,46 @@ class PayrollTab(BaseTab):
     def open_batch_details(self,_event=None):
         selected=self.batches.selection()
         if selected: win=PayrollBatchDetailsDialog(self,self.db,int(selected[0])); self.wait_window(win)
+    def reopen_selected_payroll(self):
+        selected=self.batches.selection()
+        if not selected:
+            messagebox.showinfo(APP_TITLE,"Select a committed weekly payroll first.",parent=self);return
+        batch_id=int(selected[0])
+        batch=self.db.one("""SELECT b.*,p.name project,
+            COALESCE((SELECT COUNT(*) FROM attendance a WHERE a.payroll_batch_id=b.id),0) attendance_count,
+            COALESCE((SELECT COUNT(*) FROM payments pay WHERE pay.expense_id=b.expense_id
+                      AND pay.accounting_excluded=0),0) payment_count,
+            COALESCE((SELECT SUM(pay.amount_cents) FROM payments pay WHERE pay.expense_id=b.expense_id
+                      AND pay.accounting_excluded=0),0) payment_total
+            FROM payroll_batches b JOIN projects p ON p.id=b.project_id WHERE b.id=?""",(batch_id,))
+        if not batch:return
+        if batch["status"]!="Committed":
+            messagebox.showinfo(APP_TITLE,
+                f"{batch['batch_ref']} is already {batch['status'].lower()}.",parent=self);return
+        data=dialog(self,"Reopen Weekly Payroll",[("reason","Required correction reason")],
+                    required_keys=("reason",))
+        if not data:return
+        payment_notice=(f" {batch['payment_count']} payment(s) totaling {money(batch['payment_total'])} "
+                        "will be reversed and their PC/DP or bank balances restored."
+                        if batch["payment_count"] else " No payments need to be reversed.")
+        head=self.app.authorize_for_project(batch["project_id"],"Reopen committed payroll",
+            f"{batch['batch_ref']} | {batch['period_start']} to {batch['period_end']} | "
+            f"Net {money(batch['net_cents'])}.{payment_notice} "
+            f"Attendance will return to Weekly Payroll. Reason: {data['reason']}")
+        if not head:return
+        try:
+            result=self.db.reopen_payroll_batch(batch_id,data["reason"],head["id"])
+            self.week_var.set(result["week_start"])
+            messagebox.showinfo(APP_TITLE,
+                f"{result['reference']} was reopened safely.\n\n"
+                f"{result['attendance_count']} attendance record(s) returned to Weekly Payroll.\n"
+                f"{result['payment_count']} payment(s) reversed: "
+                f"{money(result['payment_total_cents'])}.\n\n"
+                "The original payroll and expense remain in history as Reopened. "
+                "After corrections, recommit this week to create a linked replacement.",parent=self)
+            self.app.refresh_all();self.lists.select(3)
+        except (ValueError,sqlite3.Error) as exc:
+            messagebox.showerror(APP_TITLE,str(exc),parent=self)
     def export_selected_batch_pdf(self):
         selected=self.batches.selection()
         if not selected:
@@ -13892,8 +14240,16 @@ class PayrollTab(BaseTab):
                 r["regular_hours"],r["overtime_hours"],money(rate_used),override,
                 money(r["gross_cents"]),r["source"],
                 r["closure_ref"] or "—",workflow,r["revision_count"]))
-        batches=self.db.all(f"""SELECT b.*,COUNT(a.id) attendance_count,COALESCE(h.name,'Legacy / not recorded') head FROM payroll_batches b LEFT JOIN attendance a ON a.payroll_batch_id=b.id LEFT JOIN project_heads h ON h.id=b.authorized_by_head_id WHERE 1=1{batch_project_filter} GROUP BY b.id ORDER BY b.created_at DESC,b.id DESC""",employee_params)
-        for b in batches:self.batches.insert("","end",iid=b["id"],values=(b["batch_ref"],b["period_start"],b["period_end"],b["attendance_count"],money(b["gross_cents"]),money(b["deduction_cents"]),money(b["adjustment_cents"]),money(b["net_cents"]),b["head"],b["created_at"]))
+        batches=self.db.all(f"""SELECT b.*,
+            COALESCE((SELECT SUM(s.attendance_entries) FROM payroll_batch_employee_snapshots s
+                      WHERE s.payroll_batch_id=b.id),COUNT(a.id)) attendance_count,
+            COALESCE((SELECT replacement.batch_ref FROM payroll_batches replacement
+                      WHERE replacement.id=b.replacement_batch_id),'') replacement_ref,
+            COALESCE(h.name,'Legacy / not recorded') head
+            FROM payroll_batches b LEFT JOIN attendance a ON a.payroll_batch_id=b.id
+            LEFT JOIN project_heads h ON h.id=b.authorized_by_head_id
+            WHERE 1=1{batch_project_filter} GROUP BY b.id ORDER BY b.created_at DESC,b.id DESC""",employee_params)
+        for b in batches:self.batches.insert("","end",iid=b["id"],values=(b["batch_ref"],b["period_start"],b["period_end"],b["attendance_count"],money(b["gross_cents"]),money(b["deduction_cents"]),money(b["adjustment_cents"]),money(b["net_cents"]),b["status"],b["replacement_ref"] or "—",b["head"],b["created_at"]))
         advances=self.db.all(f"""SELECT a.*,e.name employee,COALESCE(b.batch_ref,'Individual') batch_ref,
             COALESCE((SELECT SUM(t.amount_cents) FROM cash_advance_transactions t WHERE t.advance_id=a.id AND t.posted=1 AND t.voided=0 AND t.txn_type<>'Advance'),0) recovered
             FROM cash_advances a JOIN employees e ON e.id=a.employee_id
