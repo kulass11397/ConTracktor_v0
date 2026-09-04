@@ -863,6 +863,48 @@ class ContractorTrackerTests(unittest.TestCase):
             )
             db.close()
 
+    def test_payment_source_options_include_positive_stale_status_allocation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "all-payment-sources.db")
+            project_id = db.create_project({
+                "name": "Allocation Visibility", "client": "Client",
+                "contract_value": "100000", "start_date": "2026-09-01",
+                "target_date": "", "address": "", "notes": "",
+                "heads": [
+                    {"name": "Issuer", "position": "Manager", "pin": "0000"},
+                    {"name": "Holder", "position": "Custodian", "pin": "1111"},
+                ],
+            })
+            issuer, holder = db.all(
+                "SELECT * FROM project_heads WHERE project_id=? ORDER BY id", (project_id,)
+            )
+            bank_id = db.enroll_bank_account({
+                "bank_name": "Test Bank", "account_name": "Operating",
+                "account_number": "1234", "notes": "",
+            })
+            db.execute(
+                """INSERT INTO remittances(project_id,bank_account_id,type,amount_cents,
+                   txn_date,system_reference) VALUES(?,?,'Withdrawal',100000,
+                   '2026-09-04','WD-20260904-0001')""",
+                (project_id, bank_id),
+            )
+            allocation_id = db.create_cash_allocation(
+                project_id=project_id, allocation_type="Petty Cash", amount_cents=100000,
+                allocation_date="2026-09-04", issuer_head_id=issuer["id"],
+                receiver_head_id=holder["id"], purpose="Visible source",
+            )
+            db.execute(
+                "UPDATE cash_allocations SET status='Fully Used' WHERE id=?", (allocation_id,)
+            )
+
+            options = db.active_allocation_options()
+
+            self.assertIn(allocation_id, options.values())
+            label = next(label for label, value in options.items() if value == allocation_id)
+            self.assertIn("1,000.00 remaining", label)
+            self.assertIn("Allocation Visibility", label)
+            db.close()
+
     def test_reassign_payment_requires_cash_surrender_to_be_voided_first(self):
         with tempfile.TemporaryDirectory() as folder:
             db = Database(Path(folder) / "payment-source-surrender-guard.db")

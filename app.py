@@ -4310,12 +4310,20 @@ class Database:
         }
 
     def active_allocation_options(self, project_id: int | None = None) -> dict:
+        """Return every non-void allocation that still has spendable cash.
+
+        The calculated balance is authoritative. Older records can retain a
+        stale closed/used status after a payment correction or restored cash
+        surrender, so status must not hide an otherwise usable source.
+        """
         options = {}
-        for row in self.cash_allocation_rows(None, active_only=True):
+        for row in self.cash_allocation_rows(None, active_only=False):
             balance = max(0, row["amount_cents"] - row["spent_cents"] - row["returned_cents"])
             if balance <= 0: continue
             holder = row["holder"] or row["supplier"] or "Unassigned"
-            label = f"{row['reference']} | {row['allocation_type']} | {holder} | {money(balance)} remaining"
+            context = row["project"] or "Legacy project"
+            label = (f"{row['reference']} | {row['allocation_type']} | {holder} | "
+                     f"{money(balance)} remaining | {context}")
             options[label] = row["id"]
         return options
 
@@ -8897,7 +8905,7 @@ class WorkflowDraftPicker(tk.Toplevel):
     """Small reusable chooser for persisted batch drafts."""
     def __init__(self, parent, drafts, title):
         super().__init__(parent)
-        self.title(title); self.geometry("650x390"); self.minsize(560, 320)
+        self.title(title); self.geometry("860x430"); self.minsize(700, 340)
         self.result = None
         body = ttk.Frame(self, padding=16); body.pack(fill="both", expand=True)
         ttk.Label(body, text=title, style="DialogTitle.TLabel").pack(anchor="w")
@@ -8905,8 +8913,9 @@ class WorkflowDraftPicker(tk.Toplevel):
             body, text="Opening a draft replaces the entries currently staged in this window.",
             style="Muted.TLabel",
         ).pack(anchor="w", pady=(2, 10))
-        columns = (("reference", "Draft reference", 180),
-                   ("updated", "Last saved", 180), ("items", "Entries", 90))
+        columns = (("reference", "Draft reference", 175), ("project", "Project", 175),
+                   ("updated", "Last saved", 165), ("items", "Entries", 75),
+                   ("source", "Imported source", 175))
         self.tree = ttk.Treeview(
             body, columns=[item[0] for item in columns], show="headings", selectmode="browse"
         )
@@ -8921,10 +8930,12 @@ class WorkflowDraftPicker(tk.Toplevel):
             try:
                 payload = json.loads(row["payload_json"])
                 count = len(payload.get("entries", payload.get("items", [])))
+                project = payload.get("form", {}).get("project", "")
+                source = payload.get("import_metadata", {}).get("source_file", "")
             except (TypeError, json.JSONDecodeError):
-                count = "?"
+                count, project, source = "?", "", ""
             self.tree.insert("", "end", iid=key, values=(
-                row["reference"], row["updated_at"], count,
+                row["reference"], project or "—", row["updated_at"], count, source or "Manual entry",
             ))
         button_bar = ttk.Frame(self); button_bar.pack(fill="x", padx=16, pady=(0, 16))
         ttk.Button(button_bar, text="Cancel", command=self.destroy).pack(side="right")
@@ -8949,6 +8960,7 @@ class BulkExpenseDialog(tk.Toplevel):
         super().__init__(parent)
         self.title("Bulk Expense Entry"); self.geometry("1120x720"); self.minsize(980, 650)
         self.db, self.result, self.items = db, None, []
+        self.editing_index = None
         self.draft_id = None
         self.draft_reference = ""
         self.import_metadata = {}
@@ -9025,12 +9037,12 @@ class BulkExpenseDialog(tk.Toplevel):
             widget.pack(fill="x", pady=(2, 0)); self.widgets[key] = widget
             form.columnconfigure(col, weight=1)
         actions = ttk.Frame(body); actions.pack(fill="x", pady=(4, 6))
-        ttk.Button(actions, text="+ Add Expense Item", style="Primary.TButton", command=self.add_item).pack(side="left")
+        self.add_item_button = ttk.Button(
+            actions, text="+ Add Expense Item", style="Primary.TButton", command=self.add_item)
+        self.add_item_button.pack(side="left")
+        ttk.Button(actions, text="Edit Selected", command=self.edit_item).pack(
+            side="left", padx=(6, 0))
         ttk.Button(actions, text="Remove Selected", style="Secondary.TButton", command=self.remove_item).pack(side="left", padx=6)
-        ttk.Button(actions, text="Create Import Form", command=self.create_import_form).pack(side="left", padx=(2, 6))
-        ttk.Button(actions, text="Import Filled Form", command=self.import_filled_form).pack(side="left", padx=(0, 6))
-        ttk.Button(actions, text="Open Draft", command=self.open_draft).pack(side="left", padx=(0, 6))
-        ttk.Button(actions, text="Save Draft", command=self.save_draft).pack(side="left", padx=(0, 6))
         self.count_label = ttk.Label(actions, text="0 items", style="Muted.TLabel")
         self.count_label.pack(side="left")
         self.commit_button = ttk.Button(
@@ -9041,6 +9053,16 @@ class BulkExpenseDialog(tk.Toplevel):
         ttk.Button(
             actions, text="Cancel", style="Secondary.TButton", command=self.destroy
         ).pack(side="right", padx=(0, 8))
+        workflow_actions = ttk.Frame(body); workflow_actions.pack(fill="x", pady=(0, 6))
+        ttk.Label(workflow_actions, text="Import and drafts:", style="Muted.TLabel").pack(side="left")
+        ttk.Button(workflow_actions, text="Create Import Form", command=self.create_import_form).pack(
+            side="left", padx=(6, 4))
+        ttk.Button(workflow_actions, text="Import Filled Form", command=self.import_filled_form).pack(
+            side="left", padx=4)
+        ttk.Button(workflow_actions, text="Open Draft", command=self.open_draft).pack(
+            side="left", padx=4)
+        ttk.Button(workflow_actions, text="Save Draft", command=self.save_draft).pack(
+            side="left", padx=4)
         totals = ttk.Frame(body); totals.pack(fill="x", pady=(1, 7))
         for column in range(3):
             totals.columnconfigure(column, weight=1, uniform="batch_totals")
@@ -9056,6 +9078,7 @@ class BulkExpenseDialog(tk.Toplevel):
             ("item", "Item", 155), ("supplier", "Supplier", 130), ("area", "Area", 120),
             ("qty", "Qty", 55), ("total", "Total", 95), ("status", "Status", 80),
             ("method", "Payment source", 105)])
+        self.tree.bind("<Double-1>", self.edit_item)
         self.allocation_options = {}
         self.project_changed(); self.update_payment_controls()
         if initial:
@@ -9076,6 +9099,8 @@ class BulkExpenseDialog(tk.Toplevel):
         }
 
     def restore_snapshot(self, payload):
+        self.editing_index = None
+        self.add_item_button.configure(text="+ Add Expense Item")
         form = payload.get("form", {}) if isinstance(payload, dict) else {}
         project_label = form.get("project", "")
         if project_label in self.projects:
@@ -9431,18 +9456,87 @@ class BulkExpenseDialog(tk.Toplevel):
         except (OSError, ValueError) as exc:
             messagebox.showerror(APP_TITLE, str(exc), parent=self)
 
+    def edit_item(self, _event=None):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showinfo(APP_TITLE, "Select a staged expense row first.", parent=self)
+            return
+        index = int(selected[0])
+        item = self.items[index]
+        project_label = next(
+            (label for label, project_id in self.projects.items()
+             if project_id == item.get("project_id")), item.get("project", ""),
+        )
+        if project_label in self.projects:
+            self.vars["project"].set(project_label)
+            self.project_changed()
+        values = {
+            "item": item.get("item", item.get("name", "")),
+            "dimensions": item.get("dimensions", ""),
+            "supplier": item.get("supplier", ""),
+            "qty": item.get("qty", "1"),
+            "unit_price": money(item.get("unit_price_cents", 0)),
+            "phase": item.get("phase", ""), "area": item.get("area", ""),
+            "status": item.get("status", "Unpaid"),
+            "initial_payment": (money(item.get("payment_amount_cents", 0))
+                                if item.get("status") == "Partially Paid" else ""),
+            "payment_method": item.get("payment_method", "Cash"),
+            "expense_date": item.get("expense_date", date.today().isoformat()),
+            "notes": item.get("notes", ""),
+        }
+        bank_label = next(
+            (label for label, bank_id in self.banks.items()
+             if bank_id == item.get("bank_account_id")), "",
+        )
+        allocation_label = next(
+            (label for label, allocation_id in self.allocation_options.items()
+             if allocation_id == item.get("cash_allocation_id")), "",
+        )
+        values["bank"] = bank_label
+        values["cash_allocation"] = allocation_label or "Intended source not selected"
+        for key, value in values.items():
+            if key in self.vars:
+                self.vars[key].set(str(value or ""))
+        self.editing_index = index
+        self.add_item_button.configure(text="Save Item Changes")
+        self.update_payment_controls()
+        self.widgets["item"].focus_set()
+
+    def _clear_item_editor(self):
+        self.editing_index = None
+        self.add_item_button.configure(text="+ Add Expense Item")
+        for key in ("name", "item", "dimensions", "supplier", "unit_price",
+                    "initial_payment", "trade", "due_date", "invoice_no", "notes"):
+            self.vars[key].set("")
+        self.vars["qty"].set("1")
+        self.vars["status"].set("Unpaid")
+        self.update_payment_controls()
+
     def add_item(self):
         required = EXPENSE_IMPORT_REQUIRED_FIELDS
         if flash_missing_fields(self, self.vars, self.widgets, required):
             return
         try:
             values = {key: var.get().strip() for key, var in self.vars.items()}
-            item = self._build_item(values, self.items)
-            self.items.append(item); self.redraw_items()
+            previous_item = (self.items[self.editing_index]
+                             if self.editing_index is not None else None)
+            if previous_item:
+                values["source_reference"] = previous_item.get(
+                    "invoice_no", previous_item.get("source_reference", ""))
+            staged_items = [item for index, item in enumerate(self.items)
+                            if index != self.editing_index]
+            item = self._build_item(values, staged_items)
+            if previous_item:
+                for key in ("import_draft_reference", "import_source_file", "import_source_row"):
+                    if key in previous_item:
+                        item[key] = previous_item[key]
+            if self.editing_index is None:
+                self.items.append(item)
+            else:
+                self.items[self.editing_index] = item
+            self.redraw_items()
             self.widgets["project"].configure(state="disabled")
-            for key in ("name", "item", "dimensions", "qty", "unit_price", "initial_payment",
-                        "trade", "due_date", "invoice_no", "notes"):
-                self.vars[key].set("1" if key == "qty" else "")
+            self._clear_item_editor()
         except ValueError as exc:
             messagebox.showerror(APP_TITLE, str(exc), parent=self)
 
@@ -9483,7 +9577,10 @@ class BulkExpenseDialog(tk.Toplevel):
     def remove_item(self):
         selected = self.tree.selection()
         if selected:
-            self.items.pop(int(selected[0])); self.redraw_items()
+            removed_index = int(selected[0])
+            self.items.pop(removed_index); self.redraw_items()
+            if self.editing_index is not None:
+                self._clear_item_editor()
             if not self.items:
                 self.widgets["project"].configure(state="readonly")
 
@@ -9603,20 +9700,22 @@ class PaymentSourcesDialog(tk.Toplevel):
         self.add_callback = add_callback
         self.reassign_callback = reassign_callback
         self.title("Expense Payments / Funding Sources")
-        self.geometry("980x500")
-        self.minsize(820, 420)
+        self.geometry("1080x700")
+        self.minsize(880, 580)
         body = ttk.Frame(self, padding=20); body.pack(fill="both", expand=True)
         ttk.Label(body, text="Payments and funding sources",
                   style="DialogTitle.TLabel").pack(anchor="w")
         self.summary = ttk.Label(body, style="Muted.TLabel")
         self.summary.pack(anchor="w", pady=(3, 12))
+        ttk.Label(body, text="Payments already recorded", style="Section.TLabel").pack(
+            anchor="w", pady=(0, 5))
         columns = (("date", "Date", 95), ("amount", "Amount", 105),
                    ("method", "MOP", 105), ("source", "Funding source", 210),
                    ("authorized", "Authorized by", 145),
                    ("reference", "Reference", 130), ("notes", "Notes", 190))
         table = ttk.Frame(body); table.pack(fill="both", expand=True)
         self.tree = ttk.Treeview(table, columns=[column[0] for column in columns],
-                                 show="headings", selectmode="browse")
+                                 show="headings", selectmode="browse", height=6)
         for key, label, width in columns:
             self.tree.heading(key, text=label)
             self.tree.column(key, width=width, minwidth=70, stretch=True)
@@ -9626,13 +9725,46 @@ class PaymentSourcesDialog(tk.Toplevel):
         self.tree.grid(row=0, column=0, sticky="nsew")
         sy.grid(row=0, column=1, sticky="ns"); sx.grid(row=1, column=0, sticky="ew")
         table.rowconfigure(0, weight=1); table.columnconfigure(0, weight=1)
+
+        ttk.Label(body, text="Available cash allocations", style="Section.TLabel").pack(
+            anchor="w", pady=(12, 0))
+        self.allocation_note = ttk.Label(body, style="Muted.TLabel", wraplength=1000)
+        self.allocation_note.pack(anchor="w", pady=(2, 5))
+        allocation_columns = (
+            ("reference", "Allocation ref.", 155), ("type", "Type", 135),
+            ("holder", "Holder / Payee", 165), ("project", "Issuance project", 150),
+            ("issued", "Issued", 105), ("remaining", "Remaining", 110),
+            ("status", "Status", 125),
+        )
+        allocation_table = ttk.Frame(body); allocation_table.pack(fill="both", expand=True)
+        self.allocation_tree = ttk.Treeview(
+            allocation_table, columns=[column[0] for column in allocation_columns],
+            show="headings", selectmode="browse", height=7,
+        )
+        for key, label, width in allocation_columns:
+            self.allocation_tree.heading(key, text=label)
+            self.allocation_tree.column(key, width=width, minwidth=75, stretch=True)
+        allocation_sy = ttk.Scrollbar(
+            allocation_table, orient="vertical", command=self.allocation_tree.yview)
+        allocation_sx = ttk.Scrollbar(
+            allocation_table, orient="horizontal", command=self.allocation_tree.xview)
+        self.allocation_tree.configure(
+            yscrollcommand=allocation_sy.set, xscrollcommand=allocation_sx.set)
+        self.allocation_tree.grid(row=0, column=0, sticky="nsew")
+        allocation_sy.grid(row=0, column=1, sticky="ns")
+        allocation_sx.grid(row=1, column=0, sticky="ew")
+        allocation_table.rowconfigure(0, weight=1)
+        allocation_table.columnconfigure(0, weight=1)
         buttons = ttk.Frame(body); buttons.pack(fill="x", pady=(12, 0))
-        ttk.Button(buttons, text="Add Payment Source", style="Primary.TButton",
-                   command=self.add_source).pack(side="left")
+        ttk.Button(buttons, text="Use Selected Allocation", style="Primary.TButton",
+                   command=self.add_selected_allocation).pack(side="left")
+        ttk.Button(buttons, text="Add Bank / Choose Source",
+                   command=self.add_source).pack(side="left", padx=(8, 0))
         ttk.Button(buttons, text="Reassign Selected", command=self.reassign_selected).pack(
             side="left", padx=(8, 0))
         ttk.Button(buttons, text="Close", command=self.destroy).pack(side="right")
         self.tree.bind("<Double-1>", self.reassign_selected)
+        self.allocation_tree.bind("<Double-1>", self.add_selected_allocation)
         self.refresh()
         self.transient(parent); self.grab_set(); self.bind("<Escape>", lambda _e: self.destroy())
         self.after_idle(lambda: center_toplevel(self))
@@ -9668,8 +9800,52 @@ class PaymentSourcesDialog(tk.Toplevel):
                   f"Paid {money(paid)}  |  Outstanding {money(max(0, expense['total_cents']-paid))}")
         )
 
+        self.allocation_tree.delete(*self.allocation_tree.get_children())
+        allocations = self.db.cash_allocation_rows(None, active_only=False)
+        available_count = 0
+        for allocation in allocations:
+            balance = self.db.allocation_balance(allocation["id"])
+            if balance > 0:
+                available_count += 1
+            holder = allocation["holder"] or allocation["supplier"] or "Unassigned"
+            status = allocation["status"] or "Legacy"
+            if balance <= 0:
+                status = f"{status} / No balance"
+            self.allocation_tree.insert("", "end", iid=str(allocation["id"]), values=(
+                allocation["reference"], allocation["allocation_type"], holder,
+                allocation["project"], money(allocation["amount_cents"]), money(balance), status,
+            ), tags=("unavailable",) if balance <= 0 else ())
+        self.allocation_tree.tag_configure("unavailable", foreground="#7A8496")
+        if not allocations:
+            self.allocation_tree.insert(
+                "", "end", iid="none",
+                values=("No cash allocations recorded", "", "", "", "", "", ""),
+                tags=("unavailable",),
+            )
+        self.allocation_note.configure(
+            text=(f"Showing {len(allocations)} non-void allocation(s); "
+                  f"{available_count} currently have a usable balance. "
+                  "Allocations are shared across projects."))
+
     def add_source(self):
-        if self.add_callback(self.expense_id, self):
+        if self.add_callback(self.expense_id, self, None):
+            self.refresh()
+
+    def add_selected_allocation(self, _event=None):
+        selected = self.allocation_tree.selection()
+        if not selected or selected[0] == "none":
+            messagebox.showinfo(
+                APP_TITLE, "Select a cash allocation from the lower list first.", parent=self)
+            return
+        allocation_id = int(selected[0])
+        if self.db.allocation_balance(allocation_id) <= 0:
+            messagebox.showinfo(
+                APP_TITLE,
+                "That allocation has no remaining balance. Select another allocation.",
+                parent=self,
+            )
+            return
+        if self.add_callback(self.expense_id, self, allocation_id):
             self.refresh()
 
     def reassign_selected(self, _event=None):
@@ -9894,6 +10070,8 @@ class ExpensesTab(BaseTab):
         header = ttk.Frame(self); header.pack(fill="x")
         ttk.Label(header, text="Expense ledger — all projects", style="Title.TLabel").pack(side="left")
         ttk.Button(header, text="+ Add Expense Batch", style="Primary.TButton", command=self.add).pack(side="right")
+        ttk.Button(header, text="Batch Expense Drafts", command=self.open_batch_drafts).pack(
+            side="right", padx=(0, 8))
         cards = ttk.Frame(self); cards.pack(fill="x", pady=(12, 8))
         (self.total_card, self.total_value, self.verified_label,
          self.verified_value) = metric_card_with_detail(
@@ -10719,6 +10897,28 @@ class ExpensesTab(BaseTab):
             messagebox.showerror(APP_TITLE, str(exc))
             self.after(0, lambda payload=resume_payload: self.add(payload))
 
+    def open_batch_drafts(self):
+        drafts = self.db.workflow_drafts("expense_batch", None)
+        if not drafts:
+            messagebox.showinfo(
+                APP_TITLE,
+                "There are no saved batch expense drafts.\n\n"
+                "Use + Add Expense Batch, stage entries, then choose Save Draft.",
+                parent=self,
+            )
+            return
+        picker = WorkflowDraftPicker(self, drafts, "Batch Expense Drafts")
+        self.wait_window(picker)
+        if not picker.result:
+            return
+        try:
+            row, payload = self.db.load_workflow_draft(picker.result, "expense_batch")
+            payload["draft_id"] = row["id"]
+            payload["draft_reference"] = row["reference"]
+            self.add(initial=payload)
+        except (ValueError, sqlite3.Error) as exc:
+            messagebox.showerror(APP_TITLE, str(exc), parent=self)
+
     def verify_selected(self):
         expense_ids = [int(value) for value in self.tree.selection()]
         if not expense_ids:
@@ -10868,7 +11068,8 @@ class ExpensesTab(BaseTab):
             reassign_callback=self._reassign_payment_source,
         )
 
-    def _record_payment_source(self, expense_id=None, parent=None):
+    def _record_payment_source(self, expense_id=None, parent=None,
+                               preferred_allocation_id=None):
         parent = parent or self
         expense_id = expense_id or self.selected_id(self.tree)
         if not expense_id: return
@@ -10890,6 +11091,10 @@ class ExpensesTab(BaseTab):
         # before confirmation; the selected source determines which holder is
         # recorded for the completed form.
         allocation_lookup = self.db.active_allocation_options()
+        preferred_allocation = next(
+            (label for label, allocation_id in allocation_lookup.items()
+             if allocation_id == preferred_allocation_id), "",
+        )
         data = dialog(parent, "Add Payment Source", [
             ("_cash_available", "Shared cash on-hand", None, "display"),
             ("_unallocated", "Unallocated cash", None, "display"),
@@ -10901,7 +11106,8 @@ class ExpensesTab(BaseTab):
             ("reference", "Reference"), ("notes", "Notes")],
             {"_cash_available": money(cash_available), "_unallocated": money(self.db.unallocated_cash()),
              "_project_budget": money(available),
-             "amount": money(balance), "payment_date": date.today().isoformat()},
+             "amount": money(balance), "payment_date": date.today().isoformat(),
+             "method": "Cash", "allocation": preferred_allocation},
             required_keys=("amount", "payment_date", "method"))
         if not data: return False
         try:

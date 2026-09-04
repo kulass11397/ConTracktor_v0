@@ -1,10 +1,25 @@
-# ConTracktor v1.6.7
+# ConTracktor v1.6.8
 
 ConTracktor is a local Windows contractor-management system built with Python,
 Tkinter, and SQLite. It manages projects, expenses, petty cash, remittances,
 attendance, weekly payroll, employee advances, inventory, contacts, and events.
 
-## v1.6.7 release highlights
+## v1.6.8 release highlights
+
+- Shows every non-void Petty Cash and Direct Procurement allocation directly
+  in the Payments / Funding window, including its issued and remaining amounts.
+- Allows a usable allocation to be selected directly for an expense payment;
+  zero-balance allocations remain visible but cannot be used.
+- Uses calculated allocation balance instead of stale saved status when deciding
+  whether a funding source is available.
+- Adds a dedicated **Batch Expense Drafts** entry point covering both manual and
+  imported draft batches.
+- Adds Edit Selected and double-click editing for staged batch-expense rows, with
+  totals and funding validations recalculated before the row is saved.
+- Keeps staged row removal and ensures edits to committed expenses return them
+  to Unverified for rechecking.
+
+The update also retains all v1.6.7 features:
 
 - Adds **Reopen for Correction** to committed weekly payrolls.
 - Reverses the linked expense payments and restores their PC, DP, or bank
@@ -60,8 +75,8 @@ The update also retains all v1.6.5 features:
   project inventory, project completion records, batch verification, flexible
   suppliers, and prior payroll/cash-advance accounting repairs.
 
-See [RELEASE_NOTES_1.6.7.md](RELEASE_NOTES_1.6.7.md) for the current changes
-and [UPDATE_GUIDE_1.6.7.txt](UPDATE_GUIDE_1.6.7.txt) for client instructions.
+See [RELEASE_NOTES_1.6.8.md](RELEASE_NOTES_1.6.8.md) for the current changes
+and [UPDATE_GUIDE_1.6.8.txt](UPDATE_GUIDE_1.6.8.txt) for client instructions.
 
 ## Data safety
 
@@ -71,14 +86,14 @@ The update is additive and does not replace the current SQLite database.
 - Existing installations continue using
   `%LOCALAPPDATA%\ConTracktor_v1\Data\contractor_tracker.db`.
 - Before replacing application files, the installer copies the old program to
-  `%LOCALAPPDATA%\ConTracktor_v1\AppBackups\Before_v1.6.7_TIMESTAMP\`.
+  `%LOCALAPPDATA%\ConTracktor_v1\AppBackups\Before_v1.6.8_TIMESTAMP\`.
 - Before updating an existing client, it copies the database and any WAL/SHM
   sidecars to
-  `%LOCALAPPDATA%\ConTracktor_v1\Data\Backups\Before_v1.6.7_TIMESTAMP\`.
+  `%LOCALAPPDATA%\ConTracktor_v1\Data\Backups\Before_v1.6.8_TIMESTAMP\`.
 - Required schema additions are applied in place when the updated app opens.
 
 Do not uninstall the existing app before updating. Close ConTracktor and run
-the v1.6.7 updater over the existing installation.
+the v1.6.8 updater over the existing installation.
 
 ## Run from Python
 
@@ -138,7 +153,7 @@ python app.py
 
 ## Validation
 
-The v1.6.7 source passes 44 automated tests. The record-preserving updater was
+The v1.6.8 source passes 45 automated tests. The record-preserving updater was
 also tested against an existing SQLite database: the live database remained
 byte-for-byte unchanged, the timestamped safety backup matched it, and the
 installer payload contained no database files.

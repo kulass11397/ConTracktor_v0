@@ -1,0 +1,56 @@
+ConTracktor v1.6.8 - Client Update Guide
+========================================
+
+Installer:
+ConTracktor_v1_Update_1.6.8_FundingDrafts.exe
+
+Before updating
+---------------
+1. Close ConTracktor completely.
+2. Keep the current client computer and Windows user account signed in.
+3. Run the downloaded installer. Do not uninstall the existing app first.
+4. Approve the Windows prompt and choose Install/OK.
+
+Record safety
+-------------
+- This updater does not contain or replace contractor_tracker.db.
+- The live database remains in:
+  %LOCALAPPDATA%\ConTracktor_v1\Data\contractor_tracker.db
+- A timestamped database backup is made in:
+  %LOCALAPPDATA%\ConTracktor_v1\Data\Backups\Before_v1.6.8_TIMESTAMP\
+- Existing application files are backed up in:
+  %LOCALAPPDATA%\ConTracktor_v1\AppBackups\Before_v1.6.8_TIMESTAMP\
+
+Using the improved funding-source window
+----------------------------------------
+1. Open Expenses and select an expense.
+2. Choose Payments / Funding.
+3. The upper table shows payments already recorded.
+4. The lower table shows every non-void Petty Cash and Direct Procurement allocation.
+5. Select a source with a positive Remaining balance.
+6. Choose Use Selected Allocation, enter the payment details, and confirm.
+7. For a bank payment, choose Add Bank / Choose Source instead.
+
+Using batch expense drafts
+--------------------------
+1. Open Expenses and choose + Add Expense Batch.
+2. Add entries manually or import a filled Excel/Google Sheets form.
+3. Choose Save Draft if the batch is not ready to commit.
+4. Later, choose Batch Expense Drafts from the Expense Ledger header.
+5. Open the saved draft.
+6. Select a staged row and choose Edit Selected, or double-click the row.
+7. Correct the fields and choose Save Item Changes.
+8. Use Remove Selected for a row that should not be included.
+9. Commit the batch only after totals and funding sources are correct.
+
+Verification after corrections
+------------------------------
+- Draft edits happen before ledger verification.
+- If an already committed expense is edited, its verification returns to Unverified.
+- Use Verify Selected or Batch Verify Unverified to approve the corrected record again.
+
+If Windows warns about the installer
+--------------------------------------
+The installer is an unsigned in-house Windows application, so SmartScreen or antivirus
+may show a reputation warning. Verify the SHA-256 value against SHA256SUMS.txt on the
+GitHub release page. Do not disable antivirus protection globally.
