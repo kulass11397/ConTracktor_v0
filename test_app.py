@@ -8,11 +8,16 @@ from unittest.mock import patch
 import app as app_module
 from app import (Database, PayrollTab, cents, hash_pin, money, resolve_db_path,
                  verify_pin, payroll_week_bounds, write_expense_ledger_pdf,
-                 write_simple_pdf, read_expense_import_form,
-                 write_expense_import_form, write_expense_import_xlsx)
+                 write_simple_pdf, write_payroll_batch_pdf, read_expense_import_form,
+                 write_expense_import_form, write_expense_import_xlsx,
+                 cash_allocation_approval_mode, EXPENSE_IMPORT_REQUIRED_FIELDS)
 
 
 class ContractorTrackerTests(unittest.TestCase):
+    def test_direct_procurement_uses_single_issuer_approval(self):
+        self.assertEqual(cash_allocation_approval_mode("Direct Procurement"), "Single Issuer")
+        self.assertEqual(cash_allocation_approval_mode("Petty Cash"), "Two Heads")
+
     def test_inventory_consumables_track_opening_restock_and_employee_usage(self):
         with tempfile.TemporaryDirectory() as folder:
             db = Database(Path(folder) / "inventory-consumables.db")
@@ -62,6 +67,33 @@ class ContractorTrackerTests(unittest.TestCase):
             )
             self.assertEqual(transaction["employee_id"], employee_id)
             self.assertEqual(transaction["reason"], "Paint second-floor walls")
+            db.revise_inventory_transaction(
+                transaction["id"], quantity_milli=11_000,
+                transaction_date="2026-08-27", reason="Corrected issue quantity",
+                condition_note="", notes="Verified against issue slip",
+                correction_reason="Encoding correction",
+                authorized_by_head_id=head["id"],
+            )
+            corrected = db.one(
+                "SELECT * FROM inventory_transactions WHERE id=?", (transaction["id"],)
+            )
+            self.assertEqual(corrected["quantity_milli"], 11_000)
+            self.assertEqual(corrected["revision_count"], 1)
+            self.assertEqual(db.inventory_item_balance(registered["id"])["on_hand_milli"], 4_500)
+            db.edit_inventory_item(
+                registered["id"], name="Interior Acrylic Paint", category="Finishing",
+                unit="liters", reorder_level_milli=2_000, condition_status="Good",
+                notes="White", correction_reason="Correct product name",
+                authorized_by_head_id=head["id"],
+            )
+            self.assertEqual(
+                db.one("SELECT name FROM inventory_items WHERE id=?", (registered["id"],))["name"],
+                "Interior Acrylic Paint",
+            )
+            self.assertEqual(
+                db.one("SELECT COUNT(*) n FROM audit_log WHERE action='INVENTORY_TRANSACTION_EDITED'")["n"],
+                1,
+            )
             db.close()
 
     def test_inventory_tools_track_borrower_returns_and_completed_project_lock(self):
@@ -254,6 +286,60 @@ class ContractorTrackerTests(unittest.TestCase):
             self.assertEqual(db.one("SELECT COUNT(*) n FROM attendance_revisions WHERE attendance_id=?", (attendance_id,))["n"], 1)
             db.close()
 
+    def test_employee_can_be_deployed_to_multiple_projects_without_transfer(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "multi-project-employee.db")
+            project_one = db.create_project({
+                "name": "Home Project", "client": "Client", "contract_value": "100000",
+                "start_date": "2026-08-01", "target_date": "", "address": "", "notes": "",
+                "heads": [{"name": "Home Head", "position": "Manager", "pin": "0000"}],
+            })
+            project_two = db.create_project({
+                "name": "Second Project", "client": "Client", "contract_value": "100000",
+                "start_date": "2026-08-01", "target_date": "", "address": "", "notes": "",
+                "heads": [{"name": "Second Head", "position": "Manager", "pin": "0000"}],
+            })
+            head_two = db.one("SELECT * FROM project_heads WHERE project_id=?", (project_two,))
+            salt, digest = hash_pin("1111")
+            employee_id = db.execute(
+                """INSERT INTO employees(project_id,employee_no,pin_salt,pin_hash,name,position,
+                   class,pay_basis,rate_cents,daily_rate_cents,standard_hours)
+                   VALUES(?,?,?,?,?,'Laborer','Labor','Daily',80000,80000,'8')""",
+                (project_one, "HOME-001", salt, digest, "Shared Employee"),
+            ).lastrowid
+            db.execute(
+                """INSERT INTO employee_project_assignments(employee_id,project_id,effective_from,
+                   position,daily_rate_cents,reason) VALUES(?,?,?,?,?,'Initial')""",
+                (employee_id, project_one, "2026-08-01", "Laborer", 80000),
+            )
+
+            db.deploy_employee(employee_id, project_two, "2026-08-29", "Finisher", 95000,
+                               "Shared across active sites", head_two["id"])
+
+            self.assertEqual(
+                db.one("SELECT project_id FROM employees WHERE id=?", (employee_id,))["project_id"],
+                project_one,
+            )
+            self.assertEqual(
+                db.one("""SELECT COUNT(*) n FROM employee_project_assignments
+                           WHERE employee_id=? AND effective_to=''""", (employee_id,))["n"],
+                2,
+            )
+            deployed = db.employees_deployed_to(project_two, on_date="2026-08-29")
+            self.assertEqual([row["id"] for row in deployed], [employee_id])
+            self.assertEqual(app_module.employee_daily_rate(deployed[0]), 95000)
+            self.assertEqual(db.employee_daily_rate_at(
+                employee_id, "2026-08-29", project_one), 80000)
+            self.assertEqual(db.employee_daily_rate_at(
+                employee_id, "2026-08-29", project_two), 95000)
+            self.assertEqual(
+                db.one("SELECT COUNT(*) n FROM audit_log WHERE action='EMPLOYEE_DEPLOYED'")["n"], 1
+            )
+            with self.assertRaisesRegex(ValueError, "already deployed"):
+                db.deploy_employee(employee_id, project_two, "2026-08-29", "Finisher", 95000,
+                                   "Duplicate", head_two["id"])
+            db.close()
+
     def test_paid_payroll_attendance_correction_queues_next_week_adjustment(self):
         with tempfile.TemporaryDirectory() as folder:
             db = Database(Path(folder) / "paid-correction.db")
@@ -301,6 +387,384 @@ class ContractorTrackerTests(unittest.TestCase):
             self.assertEqual(adjustment["status"], "Pending")
             db.close()
 
+    def test_attendance_correction_can_override_rate_and_exact_final_pay(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "pay-override.db")
+            project_id = db.create_project({
+                "name": "Rate Override", "client": "Client", "contract_value": "100000",
+                "start_date": "2026-08-01", "target_date": "", "address": "", "notes": "",
+                "heads": [{"name": "Payroll Head", "position": "Manager", "pin": "0000"}],
+            })
+            head = db.one("SELECT * FROM project_heads WHERE project_id=?", (project_id,))
+            salt, digest = hash_pin("1111")
+            employee_id = db.execute(
+                """INSERT INTO employees(project_id,employee_no,pin_salt,pin_hash,name,position,
+                   class,pay_basis,rate_cents,daily_rate_cents,standard_hours)
+                   VALUES(?,?,?,?,?,'Laborer','Labor','Daily',80000,80000,'8')""",
+                (project_id, "RATE-001", salt, digest, "Rate Employee"),
+            ).lastrowid
+            db.execute("""INSERT INTO employee_project_assignments(employee_id,project_id,
+                effective_from,position,daily_rate_cents,reason) VALUES(?,?,?,?,?,'Initial')""",
+                (employee_id, project_id, "2026-08-01", "Laborer", 80000))
+            attendance_id = db.execute(
+                """INSERT INTO attendance(employee_id,project_id,clock_in,clock_out,hours,
+                   lunch_hours,regular_hours,overtime_hours,regular_pay_cents,overtime_pay_cents,
+                   gross_cents,pay_rate_cents,source)
+                   VALUES(?,?,'2026-08-27T08:00:00','2026-08-27T17:00:00','8.00','1.00',
+                   '8.00','0.00',80000,0,80000,80000,'Manual Batch')""",
+                (employee_id, project_id),
+            ).lastrowid
+            result = db.revise_attendance(
+                attendance_id, app_module.datetime.fromisoformat("2026-08-27T08:00:00"),
+                app_module.datetime.fromisoformat("2026-08-27T17:00:00"),
+                "Approved day-rate exception", head["id"],
+                daily_rate_cents=100000, final_gross_cents=90000,
+            )
+            self.assertEqual(result["computed_gross_cents"], 100000)
+            self.assertEqual(result["gross_cents"], 90000)
+            self.assertEqual(result["manual_pay_adjustment_cents"], -10000)
+            attendance = db.one("SELECT * FROM attendance WHERE id=?", (attendance_id,))
+            self.assertEqual(attendance["pay_rate_cents"], 100000)
+            self.assertEqual(attendance["manual_pay_adjustment_cents"], -10000)
+            revision = db.one(
+                "SELECT * FROM attendance_revisions WHERE attendance_id=?", (attendance_id,)
+            )
+            self.assertEqual(revision["new_pay_rate_cents"], 100000)
+            self.assertEqual(revision["new_manual_adjustment_cents"], -10000)
+            db.close()
+
+    def test_void_cash_advance_reverses_payment_and_keeps_audit_history(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "void-advance.db")
+            project_id = db.create_project({
+                "name": "Advance Void", "client": "Client", "contract_value": "100000",
+                "start_date": "2026-08-01", "target_date": "", "address": "", "notes": "",
+                "heads": [{"name": "Advance Head", "position": "Manager", "pin": "0000"}],
+            })
+            head = db.one("SELECT * FROM project_heads WHERE project_id=?", (project_id,))
+            salt, digest = hash_pin("1111")
+            employee_id = db.execute(
+                """INSERT INTO employees(project_id,employee_no,pin_salt,pin_hash,name,position,
+                   class,pay_basis,rate_cents,daily_rate_cents,standard_hours)
+                   VALUES(?,?,?,?,?,'Laborer','Labor','Daily',80000,80000,'8')""",
+                (project_id, "ADV-001", salt, digest, "Advance Employee"),
+            ).lastrowid
+            bank_id = db.execute(
+                """INSERT INTO bank_accounts(bank_name,account_name,account_number,active)
+                   VALUES('PBCOM','Operating','0001',1)"""
+            ).lastrowid
+            db.execute(
+                """INSERT INTO remittances(project_id,type,amount_cents,txn_date,bank_account_id)
+                   VALUES(?,'Deposit',100000,'2026-08-27',?)""", (project_id, bank_id)
+            )
+            expense_id = db.execute(
+                """INSERT INTO expenses(project_id,name,total_cents,unit_price_cents,
+                   expense_date,status) VALUES(?,'CASH ADVANCE - Advance Employee',20000,20000,
+                   '2026-08-27','Paid')""", (project_id,)
+            ).lastrowid
+            db.execute(
+                """INSERT INTO payments(expense_id,amount_cents,payment_date,method,
+                   bank_account_id,authorized_by_head_id) VALUES(?,20000,'2026-08-27',
+                   'Bank Transfer',?,?)""", (expense_id, bank_id, head["id"])
+            )
+            advance_id = db.execute(
+                """INSERT INTO cash_advances(project_id,employee_id,expense_id,original_cents,
+                   advance_date,method,bank_account_id,authorized_by_head_id,repayment_plan,
+                   system_reference) VALUES(?,?,?,20000,'2026-08-27','Bank Transfer',?,?,
+                   'Salary Deduction','CA-20260827-0001')""",
+                (project_id, employee_id, expense_id, bank_id, head["id"]),
+            ).lastrowid
+            db.execute(
+                """INSERT INTO cash_advance_transactions(advance_id,txn_type,amount_cents,
+                   txn_date,method,posted) VALUES(?,'Advance',20000,'2026-08-27','Bank Transfer',1)""",
+                (advance_id,)
+            )
+            db.execute(
+                """INSERT INTO cash_advance_transactions(advance_id,txn_type,amount_cents,
+                   txn_date,method,posted) VALUES(?,'Salary Deduction',20000,'2026-08-27',
+                   'Salary Deduction',0)""", (advance_id,)
+            )
+            self.assertEqual(db.bank_balance(bank_id), 80000)
+            result = db.void_cash_advance(advance_id, "Incorrect employee", head["id"])
+            self.assertEqual(result["amount_cents"], 20000)
+            self.assertEqual(db.bank_balance(bank_id), 100000)
+            self.assertEqual(db.one("SELECT voided FROM expenses WHERE id=?", (expense_id,))["voided"], 1)
+            self.assertEqual(db.one("SELECT accounting_excluded FROM payments WHERE expense_id=?", (expense_id,))["accounting_excluded"], 1)
+            advance = db.one("SELECT * FROM cash_advances WHERE id=?", (advance_id,))
+            self.assertEqual(advance["voided"], 1)
+            self.assertEqual(advance["void_reason"], "Incorrect employee")
+            self.assertEqual(db.one("SELECT COUNT(*) n FROM cash_advance_transactions WHERE advance_id=? AND voided=0", (advance_id,))["n"], 0)
+            self.assertEqual(db.one("SELECT COUNT(*) n FROM audit_log WHERE action='CASH_ADVANCE_VOIDED'", ())["n"], 1)
+            db.close()
+
+    def test_void_cash_advance_recovery_restores_balance_and_surrender_state(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "void-recovery.db")
+            project_id = db.create_project({
+                "name": "Recovery Void", "client": "Client", "contract_value": "100000",
+                "start_date": "2026-08-01", "target_date": "", "address": "", "notes": "",
+                "heads": [{"name": "Recovery Head", "position": "Manager", "pin": "0000"}],
+            })
+            head = db.one("SELECT * FROM project_heads WHERE project_id=?", (project_id,))
+            salt, digest = hash_pin("1111")
+            employee_id = db.execute(
+                """INSERT INTO employees(project_id,employee_no,pin_salt,pin_hash,name,position,
+                   class,pay_basis,rate_cents,daily_rate_cents,standard_hours)
+                   VALUES(?,?,?,?,?,'Laborer','Labor','Daily',80000,80000,'8')""",
+                (project_id, "REC-001", salt, digest, "Recovery Employee"),
+            ).lastrowid
+            advance_id = db.execute(
+                """INSERT INTO cash_advances(project_id,employee_id,original_cents,
+                   advance_date,reason,method,authorized_by_head_id,repayment_plan,
+                   system_reference) VALUES(?,?,20000,'2026-08-27','Test','Cash',?,
+                   'Cash Repayment','CA-20260827-0002')""",
+                (project_id, employee_id, head["id"]),
+            ).lastrowid
+            db.execute(
+                """INSERT INTO cash_advance_transactions(advance_id,txn_type,amount_cents,
+                   txn_date,method,posted) VALUES(?,'Advance',20000,'2026-08-27','Cash',1)""",
+                (advance_id,),
+            )
+            recovery_id = db.execute(
+                """INSERT INTO cash_advance_transactions(advance_id,txn_type,amount_cents,
+                   txn_date,method,reference,authorized_by_head_id,posted)
+                   VALUES(?,'Cash Repayment',5000,'2026-08-27','Cash Repayment',
+                   'SR-20260827-0001',?,1)""",
+                (advance_id, head["id"]),
+            ).lastrowid
+            db.execute(
+                """INSERT INTO cash_repayment_surrenders(reference,advance_transaction_id,
+                   advance_id,amount_cents,surrender_date,received_by_head_id,status)
+                   VALUES('SR-20260827-0001',?,?,5000,'2026-08-27',?,'Awaiting Deposit')""",
+                (recovery_id, advance_id, head["id"]),
+            )
+            result = db.void_cash_advance_recovery(
+                recovery_id, "Incorrect repayment amount", head["id"]
+            )
+            self.assertEqual(result["amount_cents"], 5000)
+            self.assertEqual(
+                db.one("SELECT voided FROM cash_advance_transactions WHERE id=?", (recovery_id,))["voided"],
+                1,
+            )
+            self.assertEqual(
+                db.one("SELECT status FROM cash_repayment_surrenders WHERE advance_transaction_id=?", (recovery_id,))["status"],
+                "Voided",
+            )
+            recovered = db.one(
+                """SELECT COALESCE(SUM(amount_cents),0) total
+                   FROM cash_advance_transactions WHERE advance_id=? AND posted=1
+                   AND voided=0 AND txn_type<>'Advance'""", (advance_id,),
+            )["total"]
+            self.assertEqual(recovered, 0)
+            self.assertEqual(
+                db.one("SELECT COUNT(*) n FROM audit_log WHERE action='CASH_ADVANCE_RECOVERY_VOIDED'")["n"],
+                1,
+            )
+            restored = db.restore_cash_advance_recovery(
+                recovery_id, "Recovery was valid", head["id"]
+            )
+            self.assertEqual(restored["amount_cents"], 5000)
+            self.assertEqual(
+                db.one("SELECT voided FROM cash_advance_transactions WHERE id=?", (recovery_id,))["voided"],
+                0,
+            )
+            self.assertEqual(
+                db.one("SELECT status FROM cash_repayment_surrenders WHERE advance_transaction_id=?", (recovery_id,))["status"],
+                "Awaiting Deposit",
+            )
+            self.assertEqual(
+                db.one("SELECT COUNT(*) n FROM audit_log WHERE action='CASH_ADVANCE_RECOVERY_RESTORED'")["n"],
+                1,
+            )
+            db.close()
+
+    def test_allocation_surrender_and_redeposit_can_be_voided_and_restored(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "void-cash-return.db")
+            project_id = db.create_project({
+                "name": "Cash Return", "client": "Client", "contract_value": "100000",
+                "start_date": "2026-08-01", "target_date": "", "address": "", "notes": "",
+                "heads": [
+                    {"name": "Cash Issuer", "position": "Manager", "pin": "0000"},
+                    {"name": "Cash Receiver", "position": "Custodian", "pin": "1111"},
+                ],
+            })
+            heads = db.all(
+                "SELECT * FROM project_heads WHERE project_id=? ORDER BY id", (project_id,)
+            )
+            issuer, receiver = heads[0], heads[1]
+            bank_id = db.enroll_bank_account({
+                "bank_name": "Test Bank", "account_name": "Cash Return Account",
+                "account_number": "1234", "notes": "",
+            })
+            db.execute(
+                """INSERT INTO remittances(project_id,bank_account_id,type,amount_cents,
+                   txn_date,system_reference) VALUES(?,?,'Withdrawal',50000,
+                   '2026-08-27','WD-20260827-0001')""",
+                (project_id, bank_id),
+            )
+            allocation_id = db.create_cash_allocation(
+                project_id=project_id, allocation_type="Petty Cash", amount_cents=50000,
+                allocation_date="2026-08-27", issuer_head_id=issuer["id"],
+                receiver_head_id=receiver["id"], purpose="Site operations",
+            )
+            returned = db.close_cash_allocation(
+                allocation_id, "2026-08-28", receiver["id"], issuer["id"], "Unused cash"
+            )
+            self.assertEqual(returned, 50000)
+            surrender = db.one(
+                """SELECT * FROM cash_allocation_transactions
+                   WHERE allocation_id=? AND txn_type='Surrendered'""", (allocation_id,)
+            )
+            self.assertEqual(db.surrendered_awaiting_deposit(), 50000)
+            registry_id = issuer["registry_head_id"]
+            reference, deposited = db.redeposit_all_surrendered(
+                bank_id, "2026-08-29", registry_id, "Returned to bank"
+            )
+            self.assertEqual(deposited, 50000)
+            redeposit = db.one("SELECT * FROM cash_redeposits WHERE reference=?", (reference,))
+            self.assertEqual(db.surrendered_awaiting_deposit(), 0)
+            with self.assertRaisesRegex(ValueError, "Void redeposit"):
+                db.set_allocation_surrender_voided(
+                    surrender["id"], True, "Attempt out of order", issuer["id"]
+                )
+
+            db.set_cash_redeposit_voided(
+                redeposit["id"], True, "Deposit entered incorrectly", registry_id
+            )
+            self.assertEqual(db.surrendered_awaiting_deposit(), 50000)
+            self.assertEqual(db.bank_balance(bank_id), -50000)
+            db.set_allocation_surrender_voided(
+                surrender["id"], True, "Cash remains with custodian", issuer["id"]
+            )
+            self.assertEqual(db.surrendered_awaiting_deposit(), 0)
+            self.assertEqual(db.allocation_balance(allocation_id), 50000)
+            db.set_allocation_surrender_voided(
+                surrender["id"], False, "Cash was surrendered", issuer["id"]
+            )
+            self.assertEqual(db.surrendered_awaiting_deposit(), 50000)
+            db.set_cash_redeposit_voided(
+                redeposit["id"], False, "Confirmed bank deposit", registry_id
+            )
+            self.assertEqual(db.surrendered_awaiting_deposit(), 0)
+            self.assertEqual(db.bank_balance(bank_id), 0)
+            self.assertEqual(
+                db.one("SELECT voided FROM cash_redeposits WHERE id=?", (redeposit["id"],))["voided"],
+                0,
+            )
+            db.close()
+
+    def test_withdrawal_fee_repair_keeps_cash_principal_and_committed_surrender_balanced(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "withdrawal-fee-repair.db")
+            project_id = db.create_project({
+                "name": "Fee Repair", "client": "Client", "contract_value": "500000",
+                "start_date": "2026-07-30", "target_date": "", "address": "", "notes": "",
+                "heads": [
+                    {"name": "Cash Issuer", "position": "Manager", "pin": "0000"},
+                    {"name": "Cash Receiver", "position": "Custodian", "pin": "1111"},
+                ],
+            })
+            issuer, receiver = db.all(
+                "SELECT * FROM project_heads WHERE project_id=? ORDER BY id", (project_id,)
+            )
+            bank_id = db.enroll_bank_account({
+                "bank_name": "Test Bank", "account_name": "Operating Account",
+                "account_number": "4450", "notes": "",
+            })
+            db.execute(
+                """INSERT INTO remittances(project_id,bank_account_id,type,amount_cents,
+                   txn_date,system_reference) VALUES(?,?,'Deposit',50000000,
+                   '2026-07-30','BD-20260730-0001')""",
+                (project_id, bank_id),
+            )
+            withdrawal_id = db.execute(
+                """INSERT INTO remittances(project_id,bank_account_id,type,amount_cents,
+                   txn_date,system_reference,shared_cash) VALUES(?,?,'Withdrawal',44504500,
+                   '2026-07-30','WD-20260730-0001',1)""",
+                (project_id, bank_id),
+            ).lastrowid
+            allocation_id = db.create_cash_allocation(
+                project_id=project_id, allocation_type="Petty Cash", amount_cents=44504500,
+                allocation_date="2026-07-30", issuer_head_id=issuer["id"],
+                receiver_head_id=receiver["id"], purpose="Site operations",
+            )
+            expense_id = db.execute(
+                """INSERT INTO expenses(project_id,name,total_cents,unit_price_cents,
+                   expense_date,status) VALUES(?,'Recorded site expenses',44488400,44488400,
+                   '2026-08-07','Paid')""",
+                (project_id,),
+            ).lastrowid
+            db.execute(
+                """INSERT INTO payments(expense_id,amount_cents,payment_date,method,
+                   cash_allocation_id,authorized_by_head_id)
+                   VALUES(?,44488400,'2026-08-07','Cash',?,?)""",
+                (expense_id, allocation_id, receiver["id"]),
+            )
+            old_return = db.close_cash_allocation(
+                allocation_id, "2026-08-07", receiver["id"], issuer["id"],
+                "Initial surrender before fee correction",
+            )
+            self.assertEqual(old_return, 16100)  # P161.00
+            surrender = db.one(
+                """SELECT * FROM cash_allocation_transactions
+                   WHERE allocation_id=? AND txn_type='Surrendered' AND voided=0""",
+                (allocation_id,),
+            )
+            with self.assertRaisesRegex(ValueError, "Void any linked"):
+                db.reduce_withdrawal_allocations(
+                    withdrawal_id, 44500000, "Separate fee", issuer["registry_head_id"]
+                )
+
+            db.set_allocation_surrender_voided(
+                surrender["id"], True, "Correct withdrawal principal", issuer["id"]
+            )
+            with db.conn:
+                changes = db.reduce_withdrawal_allocations(
+                    withdrawal_id, 44500000,
+                    "Correct cash principal and separate bank fee",
+                    issuer["registry_head_id"],
+                )
+                db.conn.execute(
+                    """UPDATE remittances SET amount_cents=44500000,
+                       withdrawal_fee_cents=4500 WHERE id=?""",
+                    (withdrawal_id,),
+                )
+                fee_expense_id = db.sync_withdrawal_fee_expense(
+                    withdrawal_id, 4500, issuer["registry_head_id"]
+                )
+
+            self.assertEqual(changes[0]["amount_cents"], 4500)
+            self.assertEqual(db.allocation_balance(allocation_id), 11600)  # P116.00
+            self.assertEqual(db.cash_summary(project_id), (44500000, 44488400, 11600))
+            self.assertEqual(db.bank_balance(bank_id), 5495500)
+            fee_expense = db.one("SELECT * FROM expenses WHERE id=?", (fee_expense_id,))
+            fee_payment = db.one("SELECT * FROM payments WHERE expense_id=?", (fee_expense_id,))
+            self.assertEqual(fee_expense["total_cents"], 4500)
+            self.assertEqual(fee_expense["area"], "BANK FEES")
+            self.assertEqual(fee_payment["amount_cents"], 4500)
+            self.assertEqual(fee_payment["method"], "Bank Transfer")
+
+            corrected_return = db.close_cash_allocation(
+                allocation_id, "2026-08-07", receiver["id"], issuer["id"],
+                "Corrected surrender after separating bank fee",
+            )
+            self.assertEqual(corrected_return, 11600)
+            active_returns = db.all(
+                """SELECT amount_cents FROM cash_allocation_transactions
+                   WHERE allocation_id=? AND txn_type='Surrendered' AND voided=0""",
+                (allocation_id,),
+            )
+            self.assertEqual([row["amount_cents"] for row in active_returns], [11600])
+            self.assertEqual(
+                db.one(
+                    """SELECT COUNT(*) n FROM audit_log
+                       WHERE action='CASH_ALLOCATION_PRINCIPAL_CORRECTED'"""
+                )["n"],
+                1,
+            )
+            db.close()
+
     def test_expense_import_form_round_trip_preserves_metadata_and_rows(self):
         with tempfile.TemporaryDirectory() as folder:
             form_path = Path(folder) / "expense-import.csv"
@@ -314,6 +778,8 @@ class ContractorTrackerTests(unittest.TestCase):
             self.assertEqual(metadata["declared_total"], "1250.00")
             self.assertEqual(rows[0]["project"], "PROJECT OASIS")
             self.assertEqual(rows[0]["item"], "Example item")
+            self.assertEqual(rows[0]["supplier"], "")
+            self.assertNotIn("supplier", EXPENSE_IMPORT_REQUIRED_FIELDS)
             self.assertGreater(rows[0]["source_row"], 0)
 
     def test_excel_expense_form_contains_dropdowns_and_google_sheets_reference_lists(self):
@@ -332,8 +798,12 @@ class ContractorTrackerTests(unittest.TestCase):
                 references = archive.read("xl/worksheets/sheet2.xml").decode("utf-8")
             self.assertIn("dataValidations", sheet)
             self.assertIn("CashAllocationOptions", sheet)
+            self.assertNotIn("SupplierOptions", workbook)
+            self.assertNotIn('sqref="D7:D506"', sheet)
+            self.assertIn("Supplier (Optional)", sheet)
             self.assertIn('state="hidden"', workbook)
             self.assertIn("PC-20260819-0001", references)
+            self.assertNotIn("Supplier One", references)
             metadata, rows = read_expense_import_form(form_path)
             self.assertEqual(metadata["draft_reference"], "DRF-20260819-130000")
             self.assertEqual(rows, [])
@@ -872,6 +1342,42 @@ class ContractorTrackerTests(unittest.TestCase):
             self.assertIn(b"UNPAID SUBTOTAL", payload)
             self.assertIn(b"PARTIALLY PAID SUBTOTAL", payload)
             self.assertIn(b"OVERALL TOTAL", payload)
+
+    def test_weekly_payroll_pdf_has_summary_details_and_page_footer(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "weekly_payroll.pdf"
+            batch = {
+                "project": "PROJECT OASIS", "batch_ref": "PAYW-20260810-0001",
+                "period_start": "2026-08-08", "period_end": "2026-08-14",
+                "authorized_by": "Kent Fajardo", "gross_cents": 3398000,
+                "deduction_cents": 60000, "adjustment_cents": 0,
+                "net_cents": 3338000,
+            }
+            summary_rows = [{
+                "employee": f"Employee {index:02d}", "number": f"OASIS-{index:03d}",
+                "position": "General Laborer", "days": 5, "logs": 5,
+                "regular_hours": "40.00", "ot_hours": "0.00",
+                "regular_pay": "3,000.00", "ot_pay": "0.00",
+                "gross": "3,000.00", "deductions": "0.00",
+                "corrections": "0.00", "net": "3,000.00",
+            } for index in range(1, 24)]
+            detail_rows = [{
+                "employee": f"Employee {(index % 8) + 1:02d}", "date": "2026-08-10",
+                "time_in": "08:00:00", "time_out": "17:00:00", "lunch": "1.00",
+                "regular_hours": "8.00", "ot_hours": "0.00", "rate": "600.00",
+                "regular_pay": "600.00", "ot_pay": "0.00", "override": "-",
+                "gross": "600.00", "corrections": 0,
+            } for index in range(40)]
+            write_payroll_batch_pdf(path, batch, summary_rows, detail_rows)
+            payload = path.read_bytes()
+            self.assertTrue(payload.startswith(b"%PDF-1.4"))
+            self.assertTrue(payload.rstrip().endswith(b"%%EOF"))
+            self.assertIn(b"/MediaBox [0 0 842 595]", payload)
+            self.assertIn(b"EMPLOYEE WEEKLY SUMMARY", payload)
+            self.assertIn(b"DAILY ATTENDANCE DETAILS", payload)
+            self.assertIn(b"FINANCIAL SUMMARY", payload)
+            self.assertIn(b"PAYW-20260810-0001", payload)
+            self.assertIn(b"Page 1 of", payload)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,31 @@
+ConTracktor_v1 1.6.3 - WITHDRAWAL FEE UPDATE
+================================================
+
+INSTALL ON THE CLIENT COMPUTER
+1. Close ConTracktor completely.
+2. Copy ConTracktor_v1_Update_1.6.3_WithdrawalFee.exe to the client computer.
+3. Run the updater and click OK.
+4. Open ConTracktor normally. Existing records are retained.
+
+AUTOMATIC SAFETY COPIES
+- Database:
+  %LOCALAPPDATA%\ConTracktor_v1\Data\Backups\Before_v1.6.3_<timestamp>\
+- Previous application files:
+  %LOCALAPPDATA%\ConTracktor_v1\AppBackups\Before_v1.6.3_<timestamp>\
+
+CORRECT THE P445,045 / P45 FEE / P161 SURRENDER CASE
+1. Open Expenses > Petty Cash & Direct Procurement.
+2. In cash-return history, select the P161 surrender and choose Void / Restore Cash Return.
+3. If the P161 was already redeposited, void its redeposit first, then void the surrender.
+4. Open Remittances and edit the original withdrawal.
+5. Set Cash amount to 445,000.00 and Withdrawal fee to 45.00, then confirm.
+6. Return to Petty Cash & Direct Procurement and close/surrender the allocation again.
+7. The new surrender should be 116.00.
+
+EXPECTED RESULT
+- Physical cash received / allocation principal: P445,000.00
+- Separate bank-fee expense: P45.00
+- Total bank debit: P445,045.00
+- Corrected cash surrender: P116.00
+
+DO NOT copy or replace contractor_tracker.db manually during this update.
