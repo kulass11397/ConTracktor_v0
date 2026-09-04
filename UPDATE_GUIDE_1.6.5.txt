@@ -1,0 +1,54 @@
+ConTracktor_v1 1.6.5 - BATCH DRAFTS AND STAGED-ENTRY EDITING
+=============================================================
+
+INSTALL ON THE CLIENT COMPUTER
+1. Close ConTracktor completely.
+2. Download ConTracktor_v1_Update_1.6.5_BatchDrafts.exe.
+3. Run the updater and confirm installation.
+4. Open ConTracktor normally. Existing records remain in place.
+
+AUTOMATIC SAFETY COPIES
+- Database:
+  %LOCALAPPDATA%\ConTracktor_v1\Data\Backups\Before_v1.6.5_<timestamp>\
+- Previous application:
+  %LOCALAPPDATA%\ConTracktor_v1\AppBackups\Before_v1.6.5_<timestamp>\
+
+SAVE OR REOPEN A BATCH DRAFT
+1. Open Batch Expenses or Batch Cash Advance.
+2. Stage one or more entries and click Save Draft.
+3. Later, open the same batch window and click Open Draft.
+4. Select the saved draft and click Open Selected.
+5. Saving a draft does not post expenses, payments, advances, or cash movement.
+
+EDIT A STAGED CASH ADVANCE
+1. Select one staged employee and click Edit Selected, or double-click the row.
+2. Correct the amount, purpose, repayment method, or weekly deduction limit.
+3. Change the shared Effective Advance Date if the whole batch date is wrong.
+4. Click Apply Changes.
+
+CANCEL DURING FINAL REVIEW
+- If Confirm/Authorize is cancelled, the batch window reopens with all staged
+  rows retained. Nothing is posted until the final approval succeeds.
+
+EXPORT CASH ADVANCES
+1. Open Payroll > Cash Advances.
+2. Click Export Advances PDF.
+3. Check one or more repayment methods, or click Select All.
+4. Click Export PDF and choose where to save it.
+
+CORRECT THE P445,045 / P45 FEE / P161 SURRENDER CASE
+1. Open Expenses > Petty Cash & Direct Procurement.
+2. Select the P161 surrender and choose Void / Restore Cash Return.
+3. If it was redeposited, void the redeposit first, then void the surrender.
+4. Open Remittances and edit the original withdrawal.
+5. Set Cash amount to 445,000.00 and Withdrawal fee to 45.00.
+6. Return to Petty Cash & Direct Procurement and close the allocation again.
+7. The corrected surrender should be 116.00.
+
+EXPECTED ACCOUNTING
+- Physical cash / allocation principal: P445,000.00
+- Linked bank-fee expense: P45.00
+- Total bank debit: P445,045.00
+- Corrected surrender: P116.00
+
+Do not uninstall ConTracktor and do not manually replace contractor_tracker.db.

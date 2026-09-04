@@ -854,7 +854,8 @@ class ContractorTrackerTests(unittest.TestCase):
             )
 
             class FakeDialog:
-                def __init__(self, _parent, employees, banks, _allocations):
+                def __init__(self, _parent, _db, _project_id, employees, banks,
+                             _allocations, initial=None):
                     bank_name = next(iter(banks))
                     self.result = {
                         "date": "2026-08-12", "method": "Bank Transfer",
@@ -902,6 +903,52 @@ class ContractorTrackerTests(unittest.TestCase):
                 db.one("SELECT COUNT(*) n FROM expenses WHERE name LIKE 'CASH ADVANCE - %'")["n"], 2)
             self.assertEqual(
                 db.one("SELECT COUNT(*) n FROM cash_advance_transactions WHERE txn_type='Salary Deduction'")["n"], 1)
+            db.close()
+
+    def test_batch_drafts_persist_without_financial_side_effects(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "drafts.db")
+            project_id = db.create_project({
+                "name": "Draft Project", "client": "Client", "contract_value": "100000",
+                "start_date": "2026-09-01", "target_date": "", "notes": "",
+                "heads": [{"name": "Head One", "position": "Manager", "pin": "0000"}],
+            })
+            before = {
+                "expenses": db.one("SELECT COUNT(*) n FROM expenses")["n"],
+                "advances": db.one("SELECT COUNT(*) n FROM cash_advances")["n"],
+                "payments": db.one("SELECT COUNT(*) n FROM payments")["n"],
+            }
+            cash_payload = {
+                "date": "2026-09-02", "method": "Cash Allocation",
+                "allocation": "PC-TEST", "bank": "",
+                "entries": [{
+                    "employee_id": 12, "employee": "Draft Employee", "employee_no": "D-012",
+                    "amount_cents": 50000, "reason": "Site supplies",
+                    "repayment_plan": "Salary Deduction", "weekly_cap_cents": 25000,
+                }],
+            }
+            saved = db.save_workflow_draft(project_id, "cash_advance_batch", cash_payload)
+            self.assertTrue(saved["reference"].startswith("CAD-2026"))
+            row, loaded = db.load_workflow_draft(saved["id"], "cash_advance_batch")
+            self.assertEqual(loaded["entries"][0]["amount_cents"], 50000)
+            loaded["entries"][0]["reason"] = "Corrected purpose"
+            updated = db.save_workflow_draft(
+                project_id, "cash_advance_batch", loaded, saved["id"],
+            )
+            self.assertEqual(updated["reference"], row["reference"])
+            self.assertEqual(len(db.workflow_drafts("cash_advance_batch", project_id)), 1)
+            after_save = {
+                "expenses": db.one("SELECT COUNT(*) n FROM expenses")["n"],
+                "advances": db.one("SELECT COUNT(*) n FROM cash_advances")["n"],
+                "payments": db.one("SELECT COUNT(*) n FROM payments")["n"],
+            }
+            self.assertEqual(after_save, before)
+            db.commit_workflow_draft(saved["id"])
+            self.assertEqual(db.workflow_drafts("cash_advance_batch", project_id), [])
+            self.assertEqual(
+                db.one("SELECT status FROM workflow_drafts WHERE id=?", (saved["id"],))["status"],
+                "Committed",
+            )
             db.close()
 
     def test_money_helpers(self):

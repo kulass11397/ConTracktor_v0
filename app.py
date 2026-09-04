@@ -11,6 +11,7 @@ import base64
 import csv
 import hashlib
 import io
+import json
 import os
 import re
 import secrets
@@ -1958,6 +1959,17 @@ class Database:
             authorized_by_head_id INTEGER REFERENCES project_heads(id),
             notes TEXT NOT NULL DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS workflow_drafts (
+            id INTEGER PRIMARY KEY,
+            project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+            draft_type TEXT NOT NULL CHECK(draft_type IN ('cash_advance_batch','expense_batch')),
+            reference TEXT NOT NULL UNIQUE,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'Draft',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            committed_at TEXT NOT NULL DEFAULT ''
+        );
         CREATE TABLE IF NOT EXISTS expense_verification_batches (
             id INTEGER PRIMARY KEY,
             reference TEXT NOT NULL UNIQUE,
@@ -2132,6 +2144,8 @@ class Database:
         CREATE INDEX IF NOT EXISTS idx_bank_transfer_destination
             ON bank_account_transfers(to_bank_account_id,transfer_date);
         CREATE INDEX IF NOT EXISTS idx_expense_batch_project ON expense_batches(project_id,committed_at);
+        CREATE INDEX IF NOT EXISTS idx_workflow_draft_project
+            ON workflow_drafts(project_id,draft_type,status,updated_at);
         CREATE INDEX IF NOT EXISTS idx_expense_verify_item ON expense_verification_items(expense_id);
         CREATE INDEX IF NOT EXISTS idx_project_completion_project
             ON project_completion_snapshots(project_id,completion_date);
@@ -2826,6 +2840,81 @@ class Database:
         cur = self.conn.execute(sql, params)
         self.conn.commit()
         return cur
+
+    def save_workflow_draft(self, project_id: int | None, draft_type: str,
+                            payload: dict, draft_id: int | None = None):
+        """Persist staging data without creating any financial transaction."""
+        if draft_type not in {"cash_advance_batch", "expense_batch"}:
+            raise ValueError("Unsupported draft type.")
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        stamp = local_timestamp()
+        with self.conn:
+            if draft_id:
+                existing = self.conn.execute(
+                    "SELECT id,reference FROM workflow_drafts WHERE id=? AND status='Draft'",
+                    (draft_id,),
+                ).fetchone()
+                if not existing:
+                    raise ValueError("This saved draft is no longer available.")
+                self.conn.execute(
+                    """UPDATE workflow_drafts
+                          SET project_id=?,draft_type=?,payload_json=?,updated_at=?
+                        WHERE id=?""",
+                    (project_id, draft_type, encoded, stamp, draft_id),
+                )
+                return {"id": draft_id, "reference": existing["reference"]}
+            prefix = "CAD" if draft_type == "cash_advance_batch" else "EBD"
+            reference = self._next_system_reference(
+                prefix, "workflow_drafts", "reference", stamp[:10]
+            )
+            cursor = self.conn.execute(
+                """INSERT INTO workflow_drafts(
+                       project_id,draft_type,reference,payload_json,status,created_at,updated_at)
+                   VALUES(?,?,?,?, 'Draft',?,?)""",
+                (project_id, draft_type, reference, encoded, stamp, stamp),
+            )
+        return {"id": cursor.lastrowid, "reference": reference}
+
+    def workflow_drafts(self, draft_type: str, project_id: int | None = None):
+        params = [draft_type]
+        project_filter = ""
+        if project_id is not None:
+            project_filter = " AND (project_id=? OR project_id IS NULL)"
+            params.append(project_id)
+        return self.all(
+            """SELECT id,project_id,draft_type,reference,payload_json,status,
+                      created_at,updated_at
+                 FROM workflow_drafts
+                WHERE draft_type=? AND status='Draft'""" + project_filter +
+            " ORDER BY updated_at DESC,id DESC",
+            tuple(params),
+        )
+
+    def load_workflow_draft(self, draft_id: int, draft_type: str):
+        row = self.one(
+            """SELECT * FROM workflow_drafts
+                WHERE id=? AND draft_type=? AND status='Draft'""",
+            (draft_id, draft_type),
+        )
+        if not row:
+            raise ValueError("This saved draft is no longer available.")
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("This saved draft is damaged and cannot be opened.") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("This saved draft has an invalid format.")
+        return row, payload
+
+    def commit_workflow_draft(self, draft_id: int | None):
+        if not draft_id:
+            return
+        self.execute(
+            """UPDATE workflow_drafts
+                  SET status='Committed',committed_at=?,updated_at=?
+                WHERE id=? AND status='Draft'""",
+            (local_timestamp(), local_timestamp(), draft_id),
+        )
 
     def enroll_bank_account(self, values: dict) -> int:
         """Enroll an account across both current and legacy bank table layouts."""
@@ -8332,12 +8421,64 @@ class ExpenseImportReviewDialog(tk.Toplevel):
         self.destroy()
 
 
+class WorkflowDraftPicker(tk.Toplevel):
+    """Small reusable chooser for persisted batch drafts."""
+    def __init__(self, parent, drafts, title):
+        super().__init__(parent)
+        self.title(title); self.geometry("650x390"); self.minsize(560, 320)
+        self.result = None
+        body = ttk.Frame(self, padding=16); body.pack(fill="both", expand=True)
+        ttk.Label(body, text=title, style="DialogTitle.TLabel").pack(anchor="w")
+        ttk.Label(
+            body, text="Opening a draft replaces the entries currently staged in this window.",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(2, 10))
+        columns = (("reference", "Draft reference", 180),
+                   ("updated", "Last saved", 180), ("items", "Entries", 90))
+        self.tree = ttk.Treeview(
+            body, columns=[item[0] for item in columns], show="headings", selectmode="browse"
+        )
+        for key, label, width in columns:
+            self.tree.heading(key, text=label); self.tree.column(key, width=width)
+        scroll = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="left", fill="y")
+        self.drafts = {str(row["id"]): row for row in drafts}
+        for key, row in self.drafts.items():
+            try:
+                payload = json.loads(row["payload_json"])
+                count = len(payload.get("entries", payload.get("items", [])))
+            except (TypeError, json.JSONDecodeError):
+                count = "?"
+            self.tree.insert("", "end", iid=key, values=(
+                row["reference"], row["updated_at"], count,
+            ))
+        button_bar = ttk.Frame(self); button_bar.pack(fill="x", padx=16, pady=(0, 16))
+        ttk.Button(button_bar, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(
+            button_bar, text="Open Selected", style="Primary.TButton", command=self.open_selected,
+        ).pack(side="right", padx=(0, 8))
+        self.tree.bind("<Double-1>", lambda _event: self.open_selected())
+        self.transient(parent); self.grab_set(); self.bind("<Escape>", lambda _event: self.destroy())
+
+    def open_selected(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showinfo(APP_TITLE, "Select a saved draft first.", parent=self)
+            return
+        self.result = int(selected[0])
+        self.destroy()
+
+
 class BulkExpenseDialog(tk.Toplevel):
     """Stages multiple expense items before project-head authorization."""
-    def __init__(self, parent, db, initial_project_id=None):
+    def __init__(self, parent, db, initial_project_id=None, initial=None):
         super().__init__(parent)
         self.title("Bulk Expense Entry"); self.geometry("1120x720"); self.minsize(980, 650)
         self.db, self.result, self.items = db, None, []
+        self.draft_id = None
+        self.draft_reference = ""
         self.import_metadata = {}
         projects = db.all("SELECT id,name FROM projects WHERE status<>'Completed' ORDER BY name")
         self.projects = {f"{row['name']} [#{row['id']}]": row["id"] for row in projects}
@@ -8416,6 +8557,8 @@ class BulkExpenseDialog(tk.Toplevel):
         ttk.Button(actions, text="Remove Selected", style="Secondary.TButton", command=self.remove_item).pack(side="left", padx=6)
         ttk.Button(actions, text="Create Import Form", command=self.create_import_form).pack(side="left", padx=(2, 6))
         ttk.Button(actions, text="Import Filled Form", command=self.import_filled_form).pack(side="left", padx=(0, 6))
+        ttk.Button(actions, text="Open Draft", command=self.open_draft).pack(side="left", padx=(0, 6))
+        ttk.Button(actions, text="Save Draft", command=self.save_draft).pack(side="left", padx=(0, 6))
         self.count_label = ttk.Label(actions, text="0 items", style="Muted.TLabel")
         self.count_label.pack(side="left")
         self.commit_button = ttk.Button(
@@ -8442,11 +8585,82 @@ class BulkExpenseDialog(tk.Toplevel):
             ("qty", "Qty", 55), ("total", "Total", 95), ("status", "Status", 80),
             ("method", "Payment source", 105)])
         self.allocation_options = {}
-        self.project_changed(); self.update_payment_controls(); self.transient(parent); self.grab_set()
+        self.project_changed(); self.update_payment_controls()
+        if initial:
+            self.restore_snapshot(initial)
+        self.transient(parent); self.grab_set()
         self.bind("<Escape>", lambda _e: self.destroy())
 
     def current_project_id(self):
         return self.projects.get(self.vars["project"].get())
+
+    def snapshot(self):
+        return {
+            "form": {key: var.get() for key, var in self.vars.items()},
+            "items": list(self.items),
+            "import_metadata": dict(self.import_metadata),
+            "draft_id": self.draft_id,
+            "draft_reference": self.draft_reference,
+        }
+
+    def restore_snapshot(self, payload):
+        form = payload.get("form", {}) if isinstance(payload, dict) else {}
+        project_label = form.get("project", "")
+        if project_label in self.projects:
+            self.vars["project"].set(project_label)
+            self.project_changed()
+        for key, value in form.items():
+            if key in self.vars and key != "project":
+                self.vars[key].set(str(value or ""))
+        restored = payload.get("items", []) if isinstance(payload, dict) else []
+        self.items = [dict(item) for item in restored if isinstance(item, dict)]
+        self.import_metadata = dict(payload.get("import_metadata", {}))
+        self.draft_id = payload.get("draft_id")
+        self.draft_reference = payload.get("draft_reference", "")
+        self.widgets["project"].configure(state="disabled" if self.items else "readonly")
+        self.update_payment_controls(); self.redraw_items()
+
+    def save_draft(self):
+        try:
+            saved = self.db.save_workflow_draft(
+                self.current_project_id() or self.context_project_id,
+                "expense_batch", self.snapshot(), self.draft_id,
+            )
+            self.draft_id = saved["id"]; self.draft_reference = saved["reference"]
+            # Persist the newly assigned id/reference in the stored payload as well.
+            saved = self.db.save_workflow_draft(
+                self.current_project_id() or self.context_project_id,
+                "expense_batch", self.snapshot(), self.draft_id,
+            )
+            messagebox.showinfo(
+                APP_TITLE, f"Expense batch draft {saved['reference']} saved.\n\n"
+                "No expense, payment, or cash movement has been recorded yet.", parent=self,
+            )
+        except (ValueError, sqlite3.Error, TypeError) as exc:
+            messagebox.showerror(APP_TITLE, str(exc), parent=self)
+
+    def open_draft(self):
+        drafts = self.db.workflow_drafts("expense_batch", self.context_project_id)
+        if not drafts:
+            messagebox.showinfo(APP_TITLE, "There are no saved expense batch drafts.", parent=self)
+            return
+        picker = WorkflowDraftPicker(self, drafts, "Open Expense Batch Draft")
+        self.wait_window(picker)
+        if not picker.result:
+            return
+        if (self.items or any(var.get().strip() for key, var in self.vars.items()
+                              if key not in {"project", "qty", "expense_date", "status", "payment_method", "bank"})):
+            if not messagebox.askokcancel(
+                APP_TITLE, "Replace the currently staged entries with the selected saved draft?", parent=self,
+            ):
+                return
+        try:
+            row, payload = self.db.load_workflow_draft(picker.result, "expense_batch")
+            payload["draft_id"] = row["id"]
+            payload["draft_reference"] = row["reference"]
+            self.restore_snapshot(payload)
+        except (ValueError, sqlite3.Error) as exc:
+            messagebox.showerror(APP_TITLE, str(exc), parent=self)
 
     def project_changed(self):
         project_id = self.current_project_id()
@@ -8847,6 +9061,7 @@ class BulkExpenseDialog(tk.Toplevel):
         except ValueError as exc:
             messagebox.showerror(APP_TITLE, str(exc), parent=self)
             return
+        self.resume_payload = self.snapshot()
         self.result = list(self.items)
         self.destroy()
 
@@ -9794,15 +10009,16 @@ class ExpensesTab(BaseTab):
         return {row["name"]: row["id"] for row in self.db.all(
             "SELECT id,name FROM phases WHERE project_id=? ORDER BY sort_order,id", (project_id,))}
 
-    def add(self):
+    def add(self, initial=None):
         if not self.db.one("SELECT 1 FROM bank_accounts WHERE active=1 LIMIT 1"):
             messagebox.showerror(APP_TITLE, "Enroll a bank account in Remittances before adding expenses."); return
         if not self.db.one("SELECT 1 FROM projects WHERE status<>'Completed' LIMIT 1"):
             messagebox.showinfo(
                 APP_TITLE, "There are no active projects. Create or reactivate a project before adding expenses."
             ); return
-        win = BulkExpenseDialog(self, self.db, self.project_id); self.wait_window(win)
+        win = BulkExpenseDialog(self, self.db, self.project_id, initial=initial); self.wait_window(win)
         if not win.result: return
+        resume_payload = win.resume_payload
         groups = {}
         for item in win.result: groups.setdefault(item["project_id"], []).append(item)
         try:
@@ -9852,6 +10068,7 @@ class ExpensesTab(BaseTab):
                         "Add expense batch", details, registry_id=registry_id,
                     )
                     if not registered:
+                        self.after(0, lambda payload=resume_payload: self.add(payload))
                         return
                     identity = self.db.project_head_for_registry(registry_id, project_id)
                     if not identity:
@@ -9863,6 +10080,7 @@ class ExpensesTab(BaseTab):
                         project_id, "Add expense batch", details,
                     )
                     if not approvals[project_id]:
+                        self.after(0, lambda payload=resume_payload: self.add(payload))
                         return
             for bank_id in {item.get("bank_account_id") for item in paid_items if item.get("bank_account_id")}:
                 staged_bank = sum(item["payment_amount_cents"] for item in paid_items
@@ -9936,9 +10154,11 @@ class ExpensesTab(BaseTab):
                     self.db.conn.execute("INSERT INTO audit_log(project_id,action,details) VALUES(?,?,?)",
                         (project_id, "EXPENSE_BATCH_ADDED",
                          f"{batch_reference}: {len(items)} item(s) authorized by {approvals[project_id]['name']}"))
+            self.db.commit_workflow_draft(resume_payload.get("draft_id"))
             self.app.refresh_all()
         except (ValueError, sqlite3.Error) as exc:
             messagebox.showerror(APP_TITLE, str(exc))
+            self.after(0, lambda payload=resume_payload: self.add(payload))
 
     def verify_selected(self):
         expense_ids = [int(value) for value in self.tree.selection()]
@@ -11458,11 +11678,14 @@ class CashAdvanceGrantDialog(tk.Toplevel):
 
 class CashAdvanceBatchDialog(tk.Toplevel):
     """Stage multiple Wednesday advances and authorize the batch once."""
-    def __init__(self, parent, employees, banks, allocations):
+    def __init__(self, parent, db, project_id, employees, banks, allocations, initial=None):
         super().__init__(parent)
         self.title("Batch Cash Advance Grant")
         self.geometry("1180x790"); self.minsize(980, 680); self.resizable(True, True)
-        self.result = None
+        self.db, self.project_id, self.result = db, project_id, None
+        self.draft_id = None
+        self.draft_reference = ""
+        self.editing_employee_id = None
         self.employees = {str(row["id"]): row for row in employees}
         self.banks, self.allocations = banks, allocations
         self.staged = {}
@@ -11557,14 +11780,18 @@ class CashAdvanceBatchDialog(tk.Toplevel):
             if key == "weekly_cap": self.cap_widget = widget
         detail_buttons = ttk.Frame(details_frame)
         detail_buttons.grid(row=8, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(detail_buttons, text="Stage Selected Employees", style="Primary.TButton",
-                   command=self.stage_selected).pack(side="left")
+        self.stage_button = ttk.Button(
+            detail_buttons, text="Stage Selected Employees", style="Primary.TButton",
+            command=self.stage_selected,
+        )
+        self.stage_button.pack(side="left")
 
         self.staged_frame = ttk.LabelFrame(body, text="Staged advances", padding=8)
         self.staged_frame.grid(row=4, column=0, sticky="nsew")
         staged_frame = self.staged_frame
         staged_frame.columnconfigure(0, weight=1); staged_frame.rowconfigure(1, weight=1)
         staged_bar = ttk.Frame(staged_frame); staged_bar.grid(row=0, column=0, sticky="ew", pady=(0, 5))
+        ttk.Button(staged_bar, text="Edit Selected", command=self.edit_staged).pack(side="left")
         ttk.Button(staged_bar, text="Remove Selected", command=self.remove_staged).pack(side="left")
         self.expand_staged_button = ttk.Button(
             staged_bar, text="Expand Staged List", command=self.toggle_staged_focus)
@@ -11573,6 +11800,7 @@ class CashAdvanceBatchDialog(tk.Toplevel):
         self.total_label = ttk.Label(staged_bar, text="Entries: 0 | Batch total: 0.00", style="Section.TLabel")
         self.total_label.pack(side="right")
         columns = (("employee", "Employee", 190), ("number", "Employee No.", 110),
+                   ("date", "Effective Date", 105),
                    ("amount", "Amount", 100), ("plan", "Repayment", 125),
                    ("cap", "Weekly Limit", 100), ("reason", "Reason", 260))
         self.staged_tree = ttk.Treeview(
@@ -11590,15 +11818,21 @@ class CashAdvanceBatchDialog(tk.Toplevel):
         ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="right")
         ttk.Button(buttons, text="Review and Authorize Batch", style="Primary.TButton",
                    command=self.save).pack(side="right", padx=(0, 8))
+        ttk.Button(buttons, text="Save Draft", command=self.save_draft).pack(side="left")
+        ttk.Button(buttons, text="Open Draft", command=self.open_draft).pack(side="left", padx=(8, 0))
         self.vars["search"].trace_add("write", self.render_employees)
         self.vars["method"].trace_add("write", self.update_source_state)
         self.vars["repayment_plan"].trace_add("write", self.update_plan_state)
+        self.vars["date"].trace_add("write", lambda *_args: self.refresh_staged())
         self.staged_focus = False
         self.render_employees(); self.update_source_state(); self.update_plan_state()
         if allocations: self.vars["allocation"].set(next(iter(allocations)))
         if banks: self.vars["bank"].set(next(iter(banks)))
+        if initial:
+            self.restore_snapshot(initial)
         self.transient(parent); self.grab_set(); self.bind("<Escape>", lambda _e: self.destroy())
         self.bind("<F11>", lambda _e: self.toggle_maximized())
+        self.staged_tree.bind("<Double-1>", lambda _event: self.edit_staged())
 
     def toggle_maximized(self):
         """Let large employee batches use the complete display without losing form state."""
@@ -11640,8 +11874,79 @@ class CashAdvanceBatchDialog(tk.Toplevel):
         self.cap_widget.configure(state="normal" if salary else "disabled")
         if not salary: self.vars["weekly_cap"].set("")
 
+    def snapshot(self):
+        return {
+            "date": self.vars["date"].get(), "method": self.vars["method"].get(),
+            "allocation": self.vars["allocation"].get(), "bank": self.vars["bank"].get(),
+            "entries": list(self.staged.values()), "draft_id": self.draft_id,
+            "draft_reference": self.draft_reference,
+        }
+
+    def restore_snapshot(self, payload):
+        if not isinstance(payload, dict):
+            return
+        for key in ("date", "method", "allocation", "bank"):
+            if key in payload:
+                self.vars[key].set(str(payload.get(key) or ""))
+        self.staged = {}
+        for row in payload.get("entries", []):
+            employee_id = str(row.get("employee_id", ""))
+            employee = self.employees.get(employee_id)
+            if not employee:
+                continue
+            restored = dict(row)
+            restored.update(
+                employee_id=int(employee_id), employee=employee["name"],
+                employee_no=employee["employee_no"],
+            )
+            self.staged[employee_id] = restored
+        self.draft_id = payload.get("draft_id")
+        self.draft_reference = payload.get("draft_reference", "")
+        self.update_source_state(); self.refresh_staged()
+
+    def save_draft(self):
+        if not self.staged:
+            messagebox.showinfo(APP_TITLE, "Stage at least one employee before saving a draft.", parent=self)
+            return
+        try:
+            saved = self.db.save_workflow_draft(
+                self.project_id, "cash_advance_batch", self.snapshot(), self.draft_id,
+            )
+            self.draft_id = saved["id"]; self.draft_reference = saved["reference"]
+            saved = self.db.save_workflow_draft(
+                self.project_id, "cash_advance_batch", self.snapshot(), self.draft_id,
+            )
+            messagebox.showinfo(
+                APP_TITLE, f"Cash-advance draft {saved['reference']} saved.\n\n"
+                "No advance, expense, bank, or cash movement has been recorded yet.", parent=self,
+            )
+        except (ValueError, sqlite3.Error, TypeError) as exc:
+            messagebox.showerror(APP_TITLE, str(exc), parent=self)
+
+    def open_draft(self):
+        drafts = self.db.workflow_drafts("cash_advance_batch", self.project_id)
+        if not drafts:
+            messagebox.showinfo(APP_TITLE, "There are no saved cash-advance batch drafts.", parent=self)
+            return
+        picker = WorkflowDraftPicker(self, drafts, "Open Cash-Advance Batch Draft")
+        self.wait_window(picker)
+        if not picker.result:
+            return
+        if self.staged and not messagebox.askokcancel(
+            APP_TITLE, "Replace the currently staged advances with the selected saved draft?", parent=self,
+        ):
+            return
+        try:
+            row, payload = self.db.load_workflow_draft(picker.result, "cash_advance_batch")
+            payload["draft_id"] = row["id"]
+            payload["draft_reference"] = row["reference"]
+            self.restore_snapshot(payload)
+        except (ValueError, sqlite3.Error) as exc:
+            messagebox.showerror(APP_TITLE, str(exc), parent=self)
+
     def stage_selected(self):
-        selected = self.employee_tree.selection()
+        selected = ((self.editing_employee_id,) if self.editing_employee_id
+                    else self.employee_tree.selection())
         if not selected:
             messagebox.showerror(APP_TITLE, "Select at least one employee.", parent=self); return
         if flash_missing_fields(self, self.vars, self.widgets, ("amount", "reason", "repayment_plan")):
@@ -11670,10 +11975,39 @@ class CashAdvanceBatchDialog(tk.Toplevel):
                 "repayment_plan": self.vars["repayment_plan"].get(),
                 "weekly_cap_cents": weekly_cap,
             }
+        self.editing_employee_id = None
+        self.stage_button.configure(text="Stage Selected Employees")
         self.refresh_staged()
+
+    def edit_staged(self):
+        selected = self.staged_tree.selection()
+        if len(selected) != 1:
+            messagebox.showinfo(APP_TITLE, "Select one staged advance to edit.", parent=self)
+            return
+        employee_id = selected[0]
+        row = self.staged.get(employee_id)
+        if not row:
+            return
+        self.editing_employee_id = employee_id
+        self.vars["amount"].set(money(row["amount_cents"]))
+        self.vars["reason"].set(row["reason"])
+        self.vars["repayment_plan"].set(row["repayment_plan"])
+        self.vars["weekly_cap"].set(
+            money(row["weekly_cap_cents"]) if row.get("weekly_cap_cents") else ""
+        )
+        self.vars["search"].set("")
+        self.render_employees()
+        if self.employee_tree.exists(employee_id):
+            self.employee_tree.selection_set(employee_id)
+            self.employee_tree.see(employee_id)
+        self.stage_button.configure(text="Apply Changes")
+        self.update_plan_state()
+        self.widgets["amount"].focus_set()
 
     def remove_staged(self):
         for item in self.staged_tree.selection(): self.staged.pop(item, None)
+        self.editing_employee_id = None
+        self.stage_button.configure(text="Stage Selected Employees")
         self.refresh_staged()
 
     def refresh_staged(self):
@@ -11682,7 +12016,7 @@ class CashAdvanceBatchDialog(tk.Toplevel):
         for key, row in self.staged.items():
             total += row["amount_cents"]
             self.staged_tree.insert("", "end", iid=key, values=(
-                row["employee"], row["employee_no"], money(row["amount_cents"]),
+                row["employee"], row["employee_no"], self.vars["date"].get(), money(row["amount_cents"]),
                 row["repayment_plan"], money(row["weekly_cap_cents"]) if row["weekly_cap_cents"] else "No limit",
                 row["reason"]))
         self.total_label.config(text=f"Entries: {len(self.staged)} | Batch total: {money(total)}")
@@ -11704,11 +12038,7 @@ class CashAdvanceBatchDialog(tk.Toplevel):
                 messagebox.showerror(APP_TITLE, "Select a funded bank account.", parent=self); return
         elif self.vars["allocation"].get() not in self.allocations:
             messagebox.showerror(APP_TITLE, "Select an active cash allocation.", parent=self); return
-        self.result = {
-            "date": self.vars["date"].get(), "method": self.vars["method"].get(),
-            "allocation": self.vars["allocation"].get(), "bank": self.vars["bank"].get(),
-            "entries": list(self.staged.values()),
-        }
+        self.result = self.snapshot()
         self.destroy()
 
 
@@ -12684,7 +13014,7 @@ class PayrollTab(BaseTab):
             self.db.audit(self.project_id,"CASH_ADVANCE_GRANTED",f"{reference}: {money(amount)} to {employee['name']} from {allocation['reference'] if allocation else data['bank']}; repayment {data['repayment_plan']}; authorized by {head['name']}"); self.app.refresh_all()
         except (ValueError,sqlite3.Error) as exc:messagebox.showerror(APP_TITLE,str(exc))
 
-    def grant_cash_advance_batch(self):
+    def grant_cash_advance_batch(self, initial=None):
         if not self.require_project(): return
         employees = self.db.employees_deployed_to(self.project_id)
         if not employees:
@@ -12707,7 +13037,9 @@ class PayrollTab(BaseTab):
                 APP_TITLE,
                 "Create an active petty-cash/direct-procurement allocation or enroll a funded bank first.")
             return
-        win = CashAdvanceBatchDialog(self, employees, banks, allocations)
+        win = CashAdvanceBatchDialog(
+            self, self.db, self.project_id, employees, banks, allocations, initial=initial,
+        )
         self.wait_window(win)
         if not win.result: return
         data = win.result
@@ -12728,6 +13060,7 @@ class PayrollTab(BaseTab):
                     "This remains traceable, but petty cash is normally the clearer source.",
                     parent=self,
                 ):
+                    self.after(0, lambda payload=data: self.grant_cash_advance_batch(payload))
                     return
             _deposited, _committed, remaining = self.db.project_commitment_budget(self.project_id)
             if total > remaining:
@@ -12747,7 +13080,9 @@ class PayrollTab(BaseTab):
                     f"{len(data['entries'])} employees; {money(total)} from {source_name}; "
                     f"effective {advance_date}. {employee_preview}",
                     allocation["receiver_registry_id"] or None)
-            if not head: return
+            if not head:
+                self.after(0, lambda payload=data: self.grant_cash_advance_batch(payload))
+                return
             authorizing_head_id = allocation["receiver_head_id"] if allocation else head["id"]
             recorded_at = local_timestamp()
             batch_ref = self.db._next_system_reference(
@@ -12832,6 +13167,7 @@ class PayrollTab(BaseTab):
                      f"{batch_ref}: {len(data['entries'])} advances totaling {money(total)} "
                      f"from {source_name}; authorized by {head['name']}", recorded_at),
                 )
+            self.db.commit_workflow_draft(data.get("draft_id"))
             messagebox.showinfo(
                 APP_TITLE,
                 f"Cash-advance batch {batch_ref} committed.\n\n"
@@ -12839,6 +13175,7 @@ class PayrollTab(BaseTab):
             self.app.refresh_all(); self.lists.select(5)
         except (ValueError, sqlite3.Error) as exc:
             messagebox.showerror(APP_TITLE, str(exc), parent=self)
+            self.after(0, lambda payload=data: self.grant_cash_advance_batch(payload))
 
     def record_recovery(self):
         if not self.require_project():return
@@ -14688,6 +15025,9 @@ if __name__ == "__main__":
     try:
         from app_clean import CleanContractorApp, create_startup_backup
         create_startup_backup(DB_PATH)
-        CleanContractorApp().mainloop()
+        application = CleanContractorApp()
     except ImportError:
-        ContractorApp().mainloop()
+        application = ContractorApp()
+    if os.environ.get("CONTRACTOR_SMOKE_TEST") == "1":
+        application.after(1200, application.on_close)
+    application.mainloop()
