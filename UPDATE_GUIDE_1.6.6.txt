@@ -1,0 +1,45 @@
+ConTracktor_v1 1.6.6 - PAYMENT SOURCES AND PAYROLL PDF OPTIONS
+================================================================
+
+INSTALL ON THE CLIENT COMPUTER
+1. Close ConTracktor completely.
+2. Download ConTracktor_v1_Update_1.6.6_PaymentSources.exe.
+3. Run the updater and confirm installation.
+4. Open ConTracktor normally. Existing records remain in place.
+
+AUTOMATIC SAFETY COPIES
+- Database:
+  %LOCALAPPDATA%\ConTracktor_v1\Data\Backups\Before_v1.6.6_<timestamp>\
+- Previous application:
+  %LOCALAPPDATA%\ConTracktor_v1\AppBackups\Before_v1.6.6_<timestamp>\
+
+PAY ONE EXPENSE FROM MULTIPLE SOURCES
+1. Open Expenses > Expense Ledger and select the expense or committed payroll.
+2. Click Payments / Funding.
+3. Click Add Payment Source and record the first PC, DP, or bank amount.
+4. Repeat Add Payment Source for each additional source.
+5. The window shows the running paid and outstanding totals.
+6. If a source is insufficient, confirm the available partial amount and then
+   add another source for the balance.
+
+CORRECT A WRONG PC, DP, OR BANK SOURCE
+1. Select the expense and click Payments / Funding.
+2. Select the incorrect payment row and click Reassign Selected.
+3. Choose the correct source, enter the correction reason, and authorize it.
+4. The old and new allocation balances and the expense status recalculate
+   automatically; the correction stays visible in the audit history.
+5. If the old allocation has already been surrendered or returned, first open
+   Petty Cash & Direct Procurement and void that cash return. Reassign the
+   payment, then close/surrender the corrected allocation again if appropriate.
+
+EXPORT A PAYROLL PDF
+1. Open Payroll > Committed Weekly Payrolls.
+2. Select a batch and click Export Selected Payroll PDF, or open the batch and
+   click Export Payroll PDF.
+3. Choose Summary Only or Full Ledger + Daily Attendance.
+4. Select the save location.
+
+IMPORTANT
+- Do not uninstall ConTracktor.
+- Do not manually replace contractor_tracker.db.
+- Keep the installer and the automatic backup until the update is verified.

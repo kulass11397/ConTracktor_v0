@@ -655,6 +655,166 @@ class ContractorTrackerTests(unittest.TestCase):
             )
             db.close()
 
+    def test_expense_payment_can_be_reassigned_and_split_across_allocations(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "payment-sources.db")
+            project_id = db.create_project({
+                "name": "Payment Sources", "client": "Client", "contract_value": "100000",
+                "start_date": "2026-09-01", "target_date": "", "address": "", "notes": "",
+                "heads": [
+                    {"name": "Issuer", "position": "Manager", "pin": "0000"},
+                    {"name": "Custodian", "position": "Custodian", "pin": "1111"},
+                ],
+            })
+            issuer, custodian = db.all(
+                "SELECT * FROM project_heads WHERE project_id=? ORDER BY id", (project_id,)
+            )
+            bank_id = db.enroll_bank_account({
+                "bank_name": "Test Bank", "account_name": "Operating",
+                "account_number": "1234", "notes": "",
+            })
+            db.execute(
+                """INSERT INTO remittances(project_id,bank_account_id,type,amount_cents,
+                   txn_date,system_reference) VALUES(?,?,'Deposit',1000000,
+                   '2026-09-01','BD-20260901-0001')""", (project_id, bank_id)
+            )
+            db.execute(
+                """INSERT INTO remittances(project_id,bank_account_id,type,amount_cents,
+                   txn_date,system_reference) VALUES(?,?,'Withdrawal',500000,
+                   '2026-09-01','WD-20260901-0001')""", (project_id, bank_id)
+            )
+            allocation_a = db.create_cash_allocation(
+                project_id=project_id, allocation_type="Petty Cash", amount_cents=200000,
+                allocation_date="2026-09-01", issuer_head_id=issuer["id"],
+                receiver_head_id=custodian["id"], purpose="Payroll source A",
+            )
+            allocation_b = db.create_cash_allocation(
+                project_id=project_id, allocation_type="Petty Cash", amount_cents=200000,
+                allocation_date="2026-09-01", issuer_head_id=issuer["id"],
+                receiver_head_id=custodian["id"], purpose="Payroll source B",
+            )
+            expense_id = db.execute(
+                """INSERT INTO expenses(project_id,name,item,total_cents,unit_price_cents,
+                   expense_date,status) VALUES(?,'Weekly Payroll','Net weekly pay',300000,
+                   300000,'2026-09-04','Partially Paid')""", (project_id,)
+            ).lastrowid
+            payment_id = db.execute(
+                """INSERT INTO payments(expense_id,amount_cents,payment_date,method,
+                   cash_allocation_id,authorized_by_head_id)
+                   VALUES(?,150000,'2026-09-04','Cash',?,?)""",
+                (expense_id, allocation_a, custodian["id"]),
+            ).lastrowid
+            with db.conn:
+                db.register_allocation_payment(
+                    allocation_a, payment_id, expense_id, 150000,
+                    "2026-09-04", custodian["id"],
+                )
+
+            result = db.reassign_expense_payment(
+                payment_id, amount_cents=120000, payment_date="2026-09-04",
+                method="Cash", cash_allocation_id=allocation_b, bank_account_id=None,
+                reference="Corrected source", notes="First payroll portion",
+                correction_reason="Wrong PC reference selected",
+                authorized_by_head_id=issuer["id"],
+            )
+            self.assertEqual(result["old_amount_cents"], 150000)
+            self.assertEqual(db.allocation_balance(allocation_a), 200000)
+            self.assertEqual(db.allocation_balance(allocation_b), 80000)
+            self.assertEqual(
+                db.one("SELECT status FROM expenses WHERE id=?", (expense_id,))["status"],
+                "Partially Paid",
+            )
+            self.assertEqual(
+                db.one(
+                    """SELECT COUNT(*) n FROM cash_allocation_transactions
+                       WHERE payment_id=? AND voided=1""", (payment_id,)
+                )["n"], 1,
+            )
+            second_payment = db.execute(
+                """INSERT INTO payments(expense_id,amount_cents,payment_date,method,
+                   cash_allocation_id,authorized_by_head_id)
+                   VALUES(?,180000,'2026-09-04','Cash',?,?)""",
+                (expense_id, allocation_a, custodian["id"]),
+            ).lastrowid
+            with db.conn:
+                db.register_allocation_payment(
+                    allocation_a, second_payment, expense_id, 180000,
+                    "2026-09-04", custodian["id"],
+                )
+                db._sync_expense_payment_status(expense_id)
+            self.assertEqual(
+                db.one("SELECT status FROM expenses WHERE id=?", (expense_id,))["status"],
+                "Paid",
+            )
+            self.assertEqual(
+                db.one(
+                    "SELECT COUNT(*) n FROM payments WHERE expense_id=? AND accounting_excluded=0",
+                    (expense_id,),
+                )["n"], 2,
+            )
+            self.assertEqual(
+                db.one(
+                    "SELECT COUNT(*) n FROM audit_log WHERE action='EXPENSE_PAYMENT_SOURCE_REASSIGNED'"
+                )["n"], 1,
+            )
+            db.close()
+
+    def test_reassign_payment_requires_cash_surrender_to_be_voided_first(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "payment-source-surrender-guard.db")
+            project_id = db.create_project({
+                "name": "Surrender Guard", "client": "Client", "contract_value": "10000",
+                "start_date": "2026-09-01", "target_date": "", "address": "", "notes": "",
+                "heads": [
+                    {"name": "Issuer", "position": "Manager", "pin": "0000"},
+                    {"name": "Custodian", "position": "Custodian", "pin": "1111"},
+                ],
+            })
+            issuer, custodian = db.all(
+                "SELECT * FROM project_heads WHERE project_id=? ORDER BY id", (project_id,)
+            )
+            bank_id = db.enroll_bank_account({
+                "bank_name": "Test Bank", "account_name": "Operating",
+                "account_number": "5678", "notes": "",
+            })
+            db.execute(
+                """INSERT INTO remittances(project_id,bank_account_id,type,amount_cents,
+                   txn_date,system_reference) VALUES(?,?,'Withdrawal',100000,
+                   '2026-09-01','WD-20260901-0001')""", (project_id, bank_id)
+            )
+            allocation_id = db.create_cash_allocation(
+                project_id=project_id, allocation_type="Petty Cash", amount_cents=100000,
+                allocation_date="2026-09-01", issuer_head_id=issuer["id"],
+                receiver_head_id=custodian["id"], purpose="Site cash",
+            )
+            expense_id = db.execute(
+                """INSERT INTO expenses(project_id,name,total_cents,unit_price_cents,
+                   expense_date,status) VALUES(?,'Expense',60000,60000,'2026-09-02','Paid')""",
+                (project_id,),
+            ).lastrowid
+            payment_id = db.execute(
+                """INSERT INTO payments(expense_id,amount_cents,payment_date,method,
+                   cash_allocation_id,authorized_by_head_id)
+                   VALUES(?,60000,'2026-09-02','Cash',?,?)""",
+                (expense_id, allocation_id, custodian["id"]),
+            ).lastrowid
+            with db.conn:
+                db.register_allocation_payment(
+                    allocation_id, payment_id, expense_id, 60000,
+                    "2026-09-02", custodian["id"],
+                )
+            db.close_cash_allocation(
+                allocation_id, "2026-09-03", custodian["id"], issuer["id"], "Unused cash"
+            )
+            with self.assertRaisesRegex(ValueError, "Void that cash return first"):
+                db.reassign_expense_payment(
+                    payment_id, amount_cents=50000, payment_date="2026-09-02",
+                    method="Cash", cash_allocation_id=allocation_id, bank_account_id=None,
+                    reference="", notes="", correction_reason="Correct amount",
+                    authorized_by_head_id=issuer["id"],
+                )
+            db.close()
+
     def test_withdrawal_fee_repair_keeps_cash_principal_and_committed_surrender_balanced(self):
         with tempfile.TemporaryDirectory() as folder:
             db = Database(Path(folder) / "withdrawal-fee-repair.db")
@@ -1510,6 +1670,16 @@ class ContractorTrackerTests(unittest.TestCase):
             self.assertIn(b"FINANCIAL SUMMARY", payload)
             self.assertIn(b"PAYW-20260810-0001", payload)
             self.assertIn(b"Page 1 of", payload)
+
+            summary_path = Path(folder) / "weekly_payroll_summary.pdf"
+            write_payroll_batch_pdf(
+                summary_path, batch, summary_rows, detail_rows, include_attendance=False
+            )
+            summary_payload = summary_path.read_bytes()
+            self.assertIn(b"EMPLOYEE WEEKLY SUMMARY", summary_payload)
+            self.assertNotIn(b"DAILY ATTENDANCE DETAILS", summary_payload)
+            self.assertNotIn(b"2026-08-10", summary_payload)
+            self.assertTrue(summary_payload.rstrip().endswith(b"%%EOF"))
 
 
 if __name__ == "__main__":

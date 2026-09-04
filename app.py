@@ -470,8 +470,9 @@ def write_expense_ledger_pdf(path: Path | str, filters: list[tuple[str, str]],
 
 
 def write_payroll_batch_pdf(path: Path | str, batch: dict,
-                            summary_rows: list[dict], detail_rows: list[dict]):
-    """Write a polished A4 landscape weekly-payroll report with two sections."""
+                            summary_rows: list[dict], detail_rows: list[dict],
+                            include_attendance: bool = True):
+    """Write a polished payroll summary, optionally followed by attendance details."""
     page_width, page_height = 842, 595
     margin, footer_height = 36, 38
     content_width = page_width - margin * 2
@@ -653,7 +654,8 @@ def write_payroll_batch_pdf(path: Path | str, batch: dict,
                      "No records are available for this section.", size=10)
 
     add_section("EMPLOYEE WEEKLY SUMMARY", summary_columns, summary_rows)
-    add_section("DAILY ATTENDANCE DETAILS", detail_columns, detail_rows)
+    if include_attendance:
+        add_section("DAILY ATTENDANCE DETAILS", detail_columns, detail_rows)
 
     page_count = len(pages)
     for page_number, commands in enumerate(pages, 1):
@@ -704,8 +706,9 @@ def write_payroll_batch_pdf(path: Path | str, batch: dict,
     Path(path).write_bytes(output)
 
 
-def export_payroll_batch_pdf(db, batch_id: int, path: Path | str):
-    """Collect a committed payroll batch and export its summary and attendance details."""
+def export_payroll_batch_pdf(db, batch_id: int, path: Path | str,
+                             include_attendance: bool = True):
+    """Collect and export a committed payroll summary or its full attendance ledger."""
     batch = db.one(
         """SELECT b.*,p.name project,COALESCE(h.name,'Legacy / not recorded') authorized_by
            FROM payroll_batches b JOIN projects p ON p.id=b.project_id
@@ -732,7 +735,7 @@ def export_payroll_batch_pdf(db, batch_id: int, path: Path | str):
         """SELECT a.*,e.name FROM attendance a JOIN employees e ON e.id=a.employee_id
            WHERE a.payroll_batch_id=? ORDER BY e.name COLLATE NOCASE,a.clock_in,a.id""",
         (batch_id,),
-    )
+    ) if include_attendance else []
     for row in attendance:
         rate_used = row["pay_rate_cents"] or db.employee_daily_rate_at(
             row["employee_id"], row["clock_in"][:10], batch["project_id"]
@@ -750,7 +753,10 @@ def export_payroll_batch_pdf(db, batch_id: int, path: Path | str):
                          if row["manual_pay_adjustment_cents"] else "-"),
             "gross": money(row["gross_cents"]), "corrections": row["revision_count"],
         })
-    write_payroll_batch_pdf(path, dict(batch), summary_rows, detail_rows)
+    write_payroll_batch_pdf(
+        path, dict(batch), summary_rows, detail_rows,
+        include_attendance=include_attendance,
+    )
 
 
 def write_cash_advance_pdf(path: Path | str, project_name: str, scope: str,
@@ -4063,6 +4069,197 @@ class Database:
                 "UPDATE cash_allocations SET status='Partially Used' WHERE id=? AND status='Active'",
                 (allocation_id,),
             )
+
+    def _sync_allocation_usage_status(self, allocation_id: int | None):
+        """Keep an open allocation's status aligned with its active payments."""
+        if not allocation_id:
+            return
+        allocation = self.one(
+            "SELECT status,voided FROM cash_allocations WHERE id=?", (allocation_id,)
+        )
+        if not allocation or allocation["voided"]:
+            return
+        # A surrendered/returned allocation has a separate custody workflow and
+        # must not be reopened merely because a payment source was corrected.
+        if allocation["status"] in ("Surrendered", "Returned", "Voided"):
+            return
+        spent = self.allocation_spent(allocation_id)
+        balance = self.allocation_balance(allocation_id)
+        if balance <= 0:
+            self.conn.execute(
+                "UPDATE cash_allocations SET status='Completed' WHERE id=?", (allocation_id,)
+            )
+        elif spent > 0:
+            self.conn.execute(
+                "UPDATE cash_allocations SET status='Partially Used',closed_at='' WHERE id=?",
+                (allocation_id,),
+            )
+        else:
+            self.conn.execute(
+                "UPDATE cash_allocations SET status='Active',closed_at='' WHERE id=?",
+                (allocation_id,),
+            )
+
+    def _sync_expense_payment_status(self, expense_id: int):
+        row = self.one(
+            """SELECT e.total_cents,COALESCE(SUM(CASE WHEN p.accounting_excluded=0
+                       THEN p.amount_cents ELSE 0 END),0) paid
+               FROM expenses e LEFT JOIN payments p ON p.expense_id=e.id
+               WHERE e.id=? GROUP BY e.id""", (expense_id,)
+        )
+        if not row:
+            return
+        status = ("Paid" if row["total_cents"] > 0 and row["paid"] >= row["total_cents"]
+                  else "Partially Paid" if row["paid"] > 0 else "Unpaid")
+        default_allocation = self.one(
+            """SELECT cash_allocation_id FROM payments
+               WHERE expense_id=? AND accounting_excluded=0 AND cash_allocation_id IS NOT NULL
+               ORDER BY id LIMIT 1""", (expense_id,)
+        )
+        self.conn.execute(
+            "UPDATE expenses SET status=?,default_cash_allocation_id=? WHERE id=?",
+            (status, default_allocation["cash_allocation_id"] if default_allocation else None,
+             expense_id),
+        )
+
+    def reassign_expense_payment(self, payment_id: int, *, amount_cents: int,
+                                 payment_date: str, method: str,
+                                 cash_allocation_id: int | None,
+                                 bank_account_id: int | None, reference: str,
+                                 notes: str, correction_reason: str,
+                                 authorized_by_head_id: int) -> dict:
+        """Atomically move an expense payment to the correct funding source."""
+        payment_date = valid_date(payment_date, True)
+        correction_reason = correction_reason.strip()
+        if not correction_reason:
+            raise ValueError("Enter a correction reason.")
+        row = self.one(
+            """SELECT p.*,e.project_id,e.total_cents,e.voided expense_voided,e.name expense_name,
+                      COALESCE(ca.reference,'') old_allocation_reference,
+                      COALESCE(ba.bank_name,'') old_bank_name
+               FROM payments p JOIN expenses e ON e.id=p.expense_id
+               LEFT JOIN cash_allocations ca ON ca.id=p.cash_allocation_id
+               LEFT JOIN bank_accounts ba ON ba.id=p.bank_account_id
+               WHERE p.id=?""", (payment_id,)
+        )
+        if not row or row["accounting_excluded"]:
+            raise ValueError("The selected active payment no longer exists.")
+        if row["expense_voided"]:
+            raise ValueError("Restore the expense before changing its payment source.")
+        if amount_cents <= 0:
+            raise ValueError("Payment amount must be positive.")
+        other_paid = self.one(
+            """SELECT COALESCE(SUM(amount_cents),0) total FROM payments
+               WHERE expense_id=? AND accounting_excluded=0 AND id<>?""",
+            (row["expense_id"], payment_id),
+        )["total"]
+        maximum = max(0, row["total_cents"] - other_paid)
+        if amount_cents > maximum:
+            raise ValueError(
+                f"This payment cannot exceed the expense's remaining assignable amount of {money(maximum)}."
+            )
+
+        normalized = method.strip().lower()
+        is_bank = "bank" in normalized
+        if is_bank:
+            if not bank_account_id:
+                raise ValueError("Select the bank account used for this transfer.")
+            cash_allocation_id = None
+            available = self.bank_balance(bank_account_id)
+            if row["bank_account_id"] == bank_account_id:
+                available += row["amount_cents"]
+            if amount_cents > available:
+                raise ValueError(
+                    f"The selected bank account can cover only {money(max(0, available))}."
+                )
+        else:
+            bank_account_id = None
+            if not cash_allocation_id:
+                raise ValueError("Select a Petty Cash or Direct Procurement reference.")
+            allocation = self.one(
+                """SELECT reference,voided,status FROM cash_allocations WHERE id=?""",
+                (cash_allocation_id,),
+            )
+            if not allocation or allocation["voided"]:
+                raise ValueError("The selected cash allocation no longer exists.")
+            available = self.allocation_balance(cash_allocation_id)
+            if row["cash_allocation_id"] == cash_allocation_id:
+                available += row["amount_cents"]
+            cash_available = self.cash_summary()[2]
+            if "bank" not in (row["method"] or "").lower():
+                cash_available += row["amount_cents"]
+            available = min(available, cash_available)
+            if amount_cents > available:
+                raise ValueError(
+                    f"The selected cash source can cover only {money(max(0, available))}."
+                )
+
+        old_allocation_id = row["cash_allocation_id"]
+        changes_cash_source = (
+            old_allocation_id and
+            (old_allocation_id != cash_allocation_id or amount_cents != row["amount_cents"] or is_bank)
+        )
+        if changes_cash_source:
+            active_return = self.one(
+                """SELECT id FROM cash_allocation_transactions
+                   WHERE allocation_id=? AND txn_type IN ('Surrendered','Returned') AND voided=0
+                   LIMIT 1""", (old_allocation_id,)
+            )
+            if active_return:
+                raise ValueError(
+                    "This payment belongs to an allocation with a committed surrender/return. "
+                    "Void that cash return first, then change the payment source."
+                )
+
+        new_bank = self.one("SELECT bank_name FROM bank_accounts WHERE id=?", (bank_account_id,)) if bank_account_id else None
+        new_allocation = self.one("SELECT reference FROM cash_allocations WHERE id=?", (cash_allocation_id,)) if cash_allocation_id else None
+        old_source = row["old_allocation_reference"] or row["old_bank_name"] or row["method"] or "Unlinked"
+        new_source = ((new_allocation["reference"] if new_allocation else "") or
+                      (new_bank["bank_name"] if new_bank else "") or method)
+        with self.conn:
+            self.conn.execute(
+                """UPDATE cash_allocation_transactions SET voided=1,voided_at=?,
+                   void_reason=?,voided_by_head_id=?,
+                   notes=TRIM(notes || ' | PAYMENT SOURCE CORRECTED: ' || ?)
+                   WHERE payment_id=? AND txn_type='Expense Payment' AND voided=0""",
+                (local_timestamp(), correction_reason, authorized_by_head_id,
+                 correction_reason, payment_id),
+            )
+            system_reference = row["system_reference"]
+            if is_bank and not system_reference:
+                system_reference = self._next_system_reference(
+                    "BT", "payments", "system_reference", payment_date
+                )
+            if not is_bank:
+                system_reference = ""
+            self.conn.execute(
+                """UPDATE payments SET amount_cents=?,payment_date=?,method=?,reference=?,notes=?,
+                   bank_account_id=?,cash_allocation_id=?,authorized_by_head_id=?,
+                   system_reference=?,transaction_time=? WHERE id=?""",
+                (amount_cents, payment_date, method, reference.strip(), notes.strip(),
+                 bank_account_id, cash_allocation_id, authorized_by_head_id,
+                 system_reference, local_timestamp(), payment_id),
+            )
+            if cash_allocation_id:
+                self.register_allocation_payment(
+                    cash_allocation_id, payment_id, row["expense_id"], amount_cents,
+                    payment_date, authorized_by_head_id,
+                )
+            self._sync_allocation_usage_status(old_allocation_id)
+            self._sync_allocation_usage_status(cash_allocation_id)
+            self._sync_expense_payment_status(row["expense_id"])
+            self.conn.execute(
+                "INSERT INTO audit_log(project_id,action,details) VALUES(?,?,?)",
+                (row["project_id"], "EXPENSE_PAYMENT_SOURCE_REASSIGNED",
+                 f"Expense #{row['expense_id']} payment #{payment_id}: "
+                 f"{money(row['amount_cents'])} from {old_source} changed to "
+                 f"{money(amount_cents)} from {new_source}; reason: {correction_reason}"),
+            )
+        return {
+            "expense_id": row["expense_id"], "payment_id": payment_id,
+            "old_source": old_source, "new_source": new_source,
+            "old_amount_cents": row["amount_cents"], "amount_cents": amount_cents,
+        }
 
     def active_allocation_options(self, project_id: int | None = None) -> dict:
         options = {}
@@ -9122,6 +9319,93 @@ class PaymentHistoryDialog(tk.Toplevel):
         self.after_idle(lambda: center_toplevel(self))
 
 
+class PaymentSourcesDialog(tk.Toplevel):
+    """Manage every funding source applied to a single expense."""
+    def __init__(self, parent, db, expense_id, add_callback, reassign_callback):
+        super().__init__(parent)
+        self.db = db
+        self.expense_id = expense_id
+        self.add_callback = add_callback
+        self.reassign_callback = reassign_callback
+        self.title("Expense Payments / Funding Sources")
+        self.geometry("980x500")
+        self.minsize(820, 420)
+        body = ttk.Frame(self, padding=20); body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Payments and funding sources",
+                  style="DialogTitle.TLabel").pack(anchor="w")
+        self.summary = ttk.Label(body, style="Muted.TLabel")
+        self.summary.pack(anchor="w", pady=(3, 12))
+        columns = (("date", "Date", 95), ("amount", "Amount", 105),
+                   ("method", "MOP", 105), ("source", "Funding source", 210),
+                   ("authorized", "Authorized by", 145),
+                   ("reference", "Reference", 130), ("notes", "Notes", 190))
+        table = ttk.Frame(body); table.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(table, columns=[column[0] for column in columns],
+                                 show="headings", selectmode="browse")
+        for key, label, width in columns:
+            self.tree.heading(key, text=label)
+            self.tree.column(key, width=width, minwidth=70, stretch=True)
+        sy = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
+        sx = ttk.Scrollbar(table, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=sy.set, xscrollcommand=sx.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        sy.grid(row=0, column=1, sticky="ns"); sx.grid(row=1, column=0, sticky="ew")
+        table.rowconfigure(0, weight=1); table.columnconfigure(0, weight=1)
+        buttons = ttk.Frame(body); buttons.pack(fill="x", pady=(12, 0))
+        ttk.Button(buttons, text="Add Payment Source", style="Primary.TButton",
+                   command=self.add_source).pack(side="left")
+        ttk.Button(buttons, text="Reassign Selected", command=self.reassign_selected).pack(
+            side="left", padx=(8, 0))
+        ttk.Button(buttons, text="Close", command=self.destroy).pack(side="right")
+        self.tree.bind("<Double-1>", self.reassign_selected)
+        self.refresh()
+        self.transient(parent); self.grab_set(); self.bind("<Escape>", lambda _e: self.destroy())
+        self.after_idle(lambda: center_toplevel(self))
+
+    def refresh(self):
+        expense = self.db.one(
+            "SELECT name,item,total_cents,voided FROM expenses WHERE id=?", (self.expense_id,)
+        )
+        if not expense:
+            self.destroy(); return
+        rows = self.db.all(
+            """SELECT p.*,COALESCE(h.name,'Legacy / not recorded') authorized_by,
+                      CASE WHEN ca.id IS NOT NULL THEN ca.reference
+                           WHEN ba.id IS NOT NULL THEN ba.bank_name || ' - ' ||
+                                COALESCE(NULLIF(ba.account_name,''),ba.account_number)
+                           ELSE 'Legacy / Unlinked' END source
+               FROM payments p
+               LEFT JOIN project_heads h ON h.id=p.authorized_by_head_id
+               LEFT JOIN cash_allocations ca ON ca.id=p.cash_allocation_id
+               LEFT JOIN bank_accounts ba ON ba.id=p.bank_account_id
+               WHERE p.expense_id=? AND p.accounting_excluded=0
+               ORDER BY p.payment_date,p.id""", (self.expense_id,)
+        )
+        self.tree.delete(*self.tree.get_children())
+        for row in rows:
+            self.tree.insert("", "end", iid=str(row["id"]), values=(
+                row["payment_date"], money(row["amount_cents"]), row["method"],
+                row["source"], row["authorized_by"], row["reference"], row["notes"],
+            ))
+        paid = sum(row["amount_cents"] for row in rows)
+        self.summary.configure(
+            text=(f"{expense['name']} / {expense['item']}  |  Total {money(expense['total_cents'])}  |  "
+                  f"Paid {money(paid)}  |  Outstanding {money(max(0, expense['total_cents']-paid))}")
+        )
+
+    def add_source(self):
+        if self.add_callback(self.expense_id, self):
+            self.refresh()
+
+    def reassign_selected(self, _event=None):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showinfo(APP_TITLE, "Select a payment source first.", parent=self)
+            return
+        if self.reassign_callback(self.expense_id, int(selected[0]), self):
+            self.refresh()
+
+
 class ExpenseDetailsDialog(tk.Toplevel):
     """Read-only expense card opened by double-clicking a ledger row."""
     def __init__(self, parent, db, expense_id, edit_callback):
@@ -9441,7 +9725,7 @@ class ExpensesTab(BaseTab):
         ttk.Button(date_filters, text="All Dates", command=self.clear_date_filters).pack(side="left", padx=12)
         controls = ttk.Frame(self.ledger_page); controls.pack(fill="x", pady=(4, 0))
         ttk.Button(controls, text="Edit (all heads)", command=self.edit).pack(side="left")
-        ttk.Button(controls, text="Record Payment", command=self.pay).pack(side="left", padx=5)
+        ttk.Button(controls, text="Payments / Funding", command=self.pay).pack(side="left", padx=5)
         ttk.Button(controls, text="Verify Selected", command=self.verify_selected).pack(side="left")
         ttk.Button(controls, text="Batch Verify Unverified",
                    command=self.verify_all_unverified).pack(side="left", padx=(5, 0))
@@ -10301,14 +10585,28 @@ class ExpensesTab(BaseTab):
 
     def pay(self):
         expense_id = self.selected_id(self.tree)
+        if not expense_id:
+            return
+        PaymentSourcesDialog(
+            self, self.db, expense_id,
+            add_callback=self._record_payment_source,
+            reassign_callback=self._reassign_payment_source,
+        )
+
+    def _record_payment_source(self, expense_id=None, parent=None):
+        parent = parent or self
+        expense_id = expense_id or self.selected_id(self.tree)
         if not expense_id: return
         row = self.db.one("""SELECT e.*,COALESCE(SUM(p.amount_cents),0) paid FROM expenses e
             LEFT JOIN payments p ON p.expense_id=e.id AND p.accounting_excluded=0
             WHERE e.id=? GROUP BY e.id""", (expense_id,))
-        if row["voided"]: messagebox.showerror(APP_TITLE, "Restore this expense before recording payment."); return
+        if row["voided"]:
+            messagebox.showerror(APP_TITLE, "Restore this expense before recording payment.", parent=parent)
+            return False
         balance = max(0, row["total_cents"] - row["paid"])
         if balance <= 0:
-            messagebox.showinfo(APP_TITLE, "This expense is already paid in full."); return
+            messagebox.showinfo(APP_TITLE, "This expense is already paid in full.", parent=parent)
+            return False
         _deposited, _paid, available = self.db.project_budget(row["project_id"])
         _withdrawn, _cash_spent, cash_available = self.db.cash_summary()
         banks = {f"{bank['bank_name']} — {bank['account_name'] or bank['account_number']} (••{bank['account_number'][-4:]})": bank["id"]
@@ -10317,7 +10615,7 @@ class ExpensesTab(BaseTab):
         # before confirmation; the selected source determines which holder is
         # recorded for the completed form.
         allocation_lookup = self.db.active_allocation_options()
-        data = dialog(self, "Record Payment", [
+        data = dialog(parent, "Add Payment Source", [
             ("_cash_available", "Shared cash on-hand", None, "display"),
             ("_unallocated", "Unallocated cash", None, "display"),
             ("_project_budget", "Project payment budget", None, "display"),
@@ -10328,14 +10626,38 @@ class ExpensesTab(BaseTab):
             ("reference", "Reference"), ("notes", "Notes")],
             {"_cash_available": money(cash_available), "_unallocated": money(self.db.unallocated_cash()),
              "_project_budget": money(available),
-             "amount": money(balance), "payment_date": date.today().isoformat()})
-        if not data: return
+             "amount": money(balance), "payment_date": date.today().isoformat()},
+            required_keys=("amount", "payment_date", "method"))
+        if not data: return False
         try:
             amount = cents(data["amount"])
             if amount <= 0 or amount > balance: raise ValueError("Payment must be positive and no more than the balance.")
             bank_account_id = banks.get(data["bank"]) if "bank" in data["method"].lower() else None
             cash_allocation_id = allocation_lookup.get(data["allocation"]) if data["method"] == "Cash" else None
             payment_date = valid_date(data["payment_date"], True)
+            source_available = available
+            if "bank" in data["method"].lower():
+                if not bank_account_id:
+                    raise ValueError("Select the bank account used for this bank transfer.")
+                source_available = min(source_available, self.db.bank_balance(bank_account_id))
+            else:
+                if not cash_allocation_id:
+                    raise ValueError("Select a Petty Cash or Direct Procurement reference.")
+                source_available = min(
+                    source_available, cash_available,
+                    self.db.allocation_balance(cash_allocation_id),
+                )
+            if amount > source_available:
+                if source_available <= 0:
+                    raise ValueError("The selected funding source has no available balance.")
+                if not messagebox.askyesno(
+                    "Insufficient funding source",
+                    f"The selected source can cover only {money(source_available)}.\n\n"
+                    "Apply that amount and leave the expense partially paid?",
+                    parent=parent,
+                ):
+                    return False
+                amount = source_available
             self.db.validate_payment_source(
                 row["project_id"], amount, data["method"], bank_account_id,
                 cash_allocation_id, require_cash_allocation=(data["method"] == "Cash"),
@@ -10358,7 +10680,7 @@ class ExpensesTab(BaseTab):
                     registry_id=custody["holder_registry"],
                 )
                 if not payment_authorizer:
-                    return
+                    return False
                 authorizing_identity = self.db.project_head_for_registry(
                     custody["holder_registry"], row["project_id"]
                 )
@@ -10371,7 +10693,7 @@ class ExpensesTab(BaseTab):
                     f"Expense #{expense_id}: {row['name']} — {money(amount)} from {data['bank']}.",
                 )
                 if not payment_authorizer:
-                    return
+                    return False
                 authorizing_identity = payment_authorizer
 
             # Recheck immediately before committing in case a selected balance
@@ -10406,7 +10728,126 @@ class ExpensesTab(BaseTab):
                           f"Expense #{expense_id}: {money(amount)} via {data['method']} authorized by "
                           f"{payment_authorizer['name']}")
             self.app.refresh_all()
-        except (ValueError, sqlite3.Error) as exc: messagebox.showerror(APP_TITLE, str(exc))
+            return True
+        except (ValueError, sqlite3.Error) as exc:
+            messagebox.showerror(APP_TITLE, str(exc), parent=parent)
+            return False
+
+    def _reassign_payment_source(self, expense_id, payment_id, parent=None):
+        parent = parent or self
+        row = self.db.one(
+            """SELECT p.*,e.project_id,e.total_cents,e.name expense_name,
+                      COALESCE(ca.reference,'') allocation_reference
+               FROM payments p JOIN expenses e ON e.id=p.expense_id
+               LEFT JOIN cash_allocations ca ON ca.id=p.cash_allocation_id
+               WHERE p.id=? AND p.expense_id=? AND p.accounting_excluded=0""",
+            (payment_id, expense_id),
+        )
+        if not row:
+            messagebox.showerror(APP_TITLE, "The selected payment no longer exists.", parent=parent)
+            return False
+        banks = {
+            f"{bank['bank_name']} — {bank['account_name'] or bank['account_number']} (••{bank['account_number'][-4:]})": bank["id"]
+            for bank in self.db.all("SELECT * FROM bank_accounts WHERE active=1 ORDER BY bank_name,account_name")
+        }
+        allocations = {}
+        for allocation in self.db.cash_allocation_rows(None, active_only=False):
+            if allocation["voided"]:
+                continue
+            available_amount = self.db.allocation_balance(allocation["id"])
+            if allocation["id"] == row["cash_allocation_id"]:
+                available_amount += row["amount_cents"]
+            if available_amount <= 0:
+                continue
+            holder = allocation["holder"] or allocation["supplier"] or "Unassigned"
+            label = (f"{allocation['reference']} | {allocation['allocation_type']} | "
+                     f"{holder} | {money(available_amount)} available")
+            allocations[label] = allocation["id"]
+        initial_allocation = next(
+            (label for label, allocation_id in allocations.items()
+             if allocation_id == row["cash_allocation_id"]), ""
+        )
+        initial_bank = next(
+            (label for label, bank_id in banks.items() if bank_id == row["bank_account_id"]), ""
+        )
+        initial = {
+            "amount": money(row["amount_cents"]), "payment_date": row["payment_date"],
+            "method": "Bank Transfer" if "bank" in (row["method"] or "").lower() else "Cash",
+            "allocation": initial_allocation, "bank": initial_bank,
+            "reference": row["reference"], "notes": row["notes"], "reason": "",
+        }
+        while True:
+            data = dialog(parent, "Reassign Payment Source", [
+                ("amount", "Amount"), ("payment_date", "Payment date"),
+                ("method", "Method", ["Cash", "Bank Transfer"]),
+                ("allocation", "Petty cash / direct procurement ref.", [""] + list(allocations)),
+                ("bank", "Bank account for transfer", [""] + list(banks)),
+                ("reference", "Reference"), ("notes", "Notes"),
+                ("reason", "Correction reason"),
+            ], initial, required_keys=("amount", "payment_date", "method", "reason"))
+            if not data:
+                return False
+            initial = data
+            try:
+                amount = cents(data["amount"])
+                if amount <= 0:
+                    raise ValueError("Payment amount must be positive.")
+                is_bank = "bank" in data["method"].lower()
+                bank_account_id = banks.get(data["bank"]) if is_bank else None
+                allocation_id = allocations.get(data["allocation"]) if not is_bank else None
+                if is_bank:
+                    if not bank_account_id:
+                        raise ValueError("Select the bank account used for this transfer.")
+                    source_available = self.db.bank_balance(bank_account_id)
+                    if bank_account_id == row["bank_account_id"]:
+                        source_available += row["amount_cents"]
+                else:
+                    if not allocation_id:
+                        raise ValueError("Select a Petty Cash or Direct Procurement reference.")
+                    source_available = self.db.allocation_balance(allocation_id)
+                    if allocation_id == row["cash_allocation_id"]:
+                        source_available += row["amount_cents"]
+                    cash_available = self.db.cash_summary()[2]
+                    if "bank" not in (row["method"] or "").lower():
+                        cash_available += row["amount_cents"]
+                    source_available = min(source_available, cash_available)
+                if amount > source_available:
+                    if source_available <= 0:
+                        raise ValueError("The selected funding source has no available balance.")
+                    if not messagebox.askyesno(
+                        "Insufficient funding source",
+                        f"The selected source can cover only {money(source_available)}.\n\n"
+                        "Apply that amount and leave the expense partially paid?",
+                        parent=parent,
+                    ):
+                        continue
+                    amount = source_available
+                summary_source = data["bank"] if is_bank else data["allocation"]
+                head = self.app.authorize_for_project(
+                    row["project_id"], "Modify expense payment source",
+                    f"Expense #{expense_id}: change payment #{payment_id} to "
+                    f"{money(amount)} from {summary_source}.\nReason: {data['reason']}",
+                )
+                if not head:
+                    continue
+                self.db.reassign_expense_payment(
+                    payment_id, amount_cents=amount,
+                    payment_date=valid_date(data["payment_date"], True),
+                    method=data["method"], cash_allocation_id=allocation_id,
+                    bank_account_id=bank_account_id, reference=data["reference"],
+                    notes=data["notes"], correction_reason=data["reason"],
+                    authorized_by_head_id=head["id"],
+                )
+                messagebox.showinfo(
+                    APP_TITLE,
+                    "The payment source was corrected. Allocation balances and the "
+                    "expense's paid/outstanding amounts were recalculated.",
+                    parent=parent,
+                )
+                self.app.refresh_all()
+                return True
+            except (ValueError, sqlite3.Error) as exc:
+                messagebox.showerror(APP_TITLE, str(exc), parent=parent)
 
     def void(self):
         expense_id = self.selected_id(self.tree)
@@ -12309,6 +12750,37 @@ class WeeklyEmployeeDetailsDialog(tk.Toplevel):
         if self.parent_tab.edit_attendance_id(int(selected[0])):self.refresh()
 
 
+class PayrollExportOptionsDialog(tk.Toplevel):
+    """Choose whether a payroll PDF contains the summary or the complete ledger."""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.result = None
+        self.title("Payroll PDF Contents")
+        self.resizable(False, False)
+        body = ttk.Frame(self, padding=22); body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Choose what to include",
+                  style="DialogTitle.TLabel").pack(anchor="w")
+        ttk.Label(
+            body,
+            text=("Summary only exports one consolidated row per employee.\n"
+                  "Full ledger adds every daily attendance record after the summary."),
+            style="Muted.TLabel", justify="left",
+        ).pack(anchor="w", pady=(5, 16))
+        buttons = ttk.Frame(body); buttons.pack(fill="x")
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(buttons, text="Full Ledger + Daily Attendance",
+                   style="Primary.TButton", command=lambda: self.choose(True)).pack(
+            side="right", padx=(8, 8))
+        ttk.Button(buttons, text="Summary Only", command=lambda: self.choose(False)).pack(
+            side="right")
+        self.transient(parent); self.grab_set(); self.bind("<Escape>", lambda _e: self.destroy())
+        self.after_idle(lambda: center_toplevel(self))
+
+    def choose(self, include_attendance):
+        self.result = bool(include_attendance)
+        self.destroy()
+
+
 class PayrollBatchDetailsDialog(tk.Toplevel):
     def __init__(self,parent,db,batch_id):
         super().__init__(parent); self.db=db; self.batch_id=batch_id
@@ -12378,7 +12850,7 @@ class PayrollBatchDetailsDialog(tk.Toplevel):
                 if selected and parent.edit_attendance_id(int(selected[0])):self.destroy()
             tree.bind("<Double-1>",edit_committed_attendance)
         footer=ttk.Frame(body); footer.pack(fill="x",pady=(10,0))
-        ttk.Label(footer,text="PDF export includes both weekly summary and daily attendance details.",
+        ttk.Label(footer,text="PDF export can include the summary only or the complete daily ledger.",
                   style="Muted.TLabel").pack(side="left")
         ttk.Button(footer,text="Close",command=self.destroy).pack(side="right")
         ttk.Button(footer,text="Export Payroll PDF",style="Primary.TButton",
@@ -12389,12 +12861,18 @@ class PayrollBatchDetailsDialog(tk.Toplevel):
         batch=self.db.one("SELECT batch_ref FROM payroll_batches WHERE id=?",(self.batch_id,))
         if not batch:
             messagebox.showerror(APP_TITLE,"The selected payroll batch no longer exists.",parent=self);return
+        scope=PayrollExportOptionsDialog(self); self.wait_window(scope)
+        if scope.result is None:return
+        include_attendance=scope.result
         destination=filedialog.asksaveasfilename(parent=self,title="Export weekly payroll to PDF",
             defaultextension=".pdf",filetypes=[("PDF document","*.pdf")],
-            initialfile=f"{batch['batch_ref']}_weekly_payroll.pdf")
+            initialfile=(f"{batch['batch_ref']}_full_payroll_ledger.pdf" if include_attendance
+                         else f"{batch['batch_ref']}_payroll_summary.pdf"))
         if not destination:return
         try:
-            export_payroll_batch_pdf(self.db,self.batch_id,destination)
+            export_payroll_batch_pdf(
+                self.db,self.batch_id,destination,include_attendance=include_attendance
+            )
             messagebox.showinfo(APP_TITLE,f"Weekly payroll PDF saved:\n{destination}",parent=self)
         except (ValueError,OSError,sqlite3.Error) as exc:
             messagebox.showerror(APP_TITLE,str(exc),parent=self)
@@ -12765,12 +13243,18 @@ class PayrollTab(BaseTab):
         batch=self.db.one("SELECT batch_ref FROM payroll_batches WHERE id=?",(batch_id,))
         if not batch:
             messagebox.showerror(APP_TITLE,"The selected payroll batch no longer exists.",parent=self);return
+        scope=PayrollExportOptionsDialog(self); self.wait_window(scope)
+        if scope.result is None:return
+        include_attendance=scope.result
         destination=filedialog.asksaveasfilename(parent=self,title="Export weekly payroll to PDF",
             defaultextension=".pdf",filetypes=[("PDF document","*.pdf")],
-            initialfile=f"{batch['batch_ref']}_weekly_payroll.pdf")
+            initialfile=(f"{batch['batch_ref']}_full_payroll_ledger.pdf" if include_attendance
+                         else f"{batch['batch_ref']}_payroll_summary.pdf"))
         if not destination:return
         try:
-            export_payroll_batch_pdf(self.db,batch_id,destination)
+            export_payroll_batch_pdf(
+                self.db,batch_id,destination,include_attendance=include_attendance
+            )
             messagebox.showinfo(APP_TITLE,f"Weekly payroll PDF saved:\n{destination}",parent=self)
         except (ValueError,OSError,sqlite3.Error) as exc:
             messagebox.showerror(APP_TITLE,str(exc),parent=self)
