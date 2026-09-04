@@ -10,7 +10,8 @@ from app import (Database, PayrollTab, cents, hash_pin, money, resolve_db_path,
                  verify_pin, payroll_week_bounds, write_expense_ledger_pdf,
                  write_simple_pdf, write_payroll_batch_pdf, read_expense_import_form,
                  write_expense_import_form, write_expense_import_xlsx,
-                 cash_allocation_approval_mode, EXPENSE_IMPORT_REQUIRED_FIELDS)
+                 export_cash_advance_pdf, cash_allocation_approval_mode,
+                 EXPENSE_IMPORT_REQUIRED_FIELDS)
 
 
 class ContractorTrackerTests(unittest.TestCase):
@@ -1342,6 +1343,90 @@ class ContractorTrackerTests(unittest.TestCase):
             self.assertIn(b"UNPAID SUBTOTAL", payload)
             self.assertIn(b"PARTIALLY PAID SUBTOTAL", payload)
             self.assertIn(b"OVERALL TOTAL", payload)
+
+    def test_cash_advance_pdf_can_filter_salary_deductions_or_all_methods(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "cash-advance-pdf.db")
+            project_id = db.create_project({
+                "name": "PROJECT OASIS", "client": "Client", "contract_value": "100000",
+                "start_date": "2026-08-01", "target_date": "", "address": "", "notes": "",
+                "heads": [{"name": "Kent Fajardo", "position": "Manager", "pin": "0000"}],
+            })
+            head = db.one("SELECT * FROM project_heads WHERE project_id=?", (project_id,))
+            salt, digest = hash_pin("1111")
+            alice_id = db.execute(
+                """INSERT INTO employees(project_id,employee_no,pin_salt,pin_hash,name,position,
+                   class,pay_basis,rate_cents,daily_rate_cents,standard_hours)
+                   VALUES(?,?,?,?,?,'Painter','Skilled','Daily',80000,80000,'8')""",
+                (project_id, "OASIS-001", salt, digest, "Alice Salary"),
+            ).lastrowid
+            bob_id = db.execute(
+                """INSERT INTO employees(project_id,employee_no,pin_salt,pin_hash,name,position,
+                   class,pay_basis,rate_cents,daily_rate_cents,standard_hours)
+                   VALUES(?,?,?,?,?,'Mason','Skilled','Daily',80000,80000,'8')""",
+                (project_id, "OASIS-002", salt, digest, "Bob Cash"),
+            ).lastrowid
+            salary_id = db.execute(
+                """INSERT INTO cash_advances(project_id,employee_id,original_cents,advance_date,
+                   reason,method,repayment_plan,system_reference,authorized_by_head_id)
+                   VALUES(?,?,100000,'2026-08-05','Medical','Cash','Salary Deduction',
+                   'CA-20260805-0001',?)""", (project_id, alice_id, head["id"]),
+            ).lastrowid
+            cash_id = db.execute(
+                """INSERT INTO cash_advances(project_id,employee_id,original_cents,advance_date,
+                   reason,method,repayment_plan,system_reference,authorized_by_head_id)
+                   VALUES(?,?,50000,'2026-08-06','Transport','Cash','Cash Repayment',
+                   'CA-20260806-0002',?)""", (project_id, bob_id, head["id"]),
+            ).lastrowid
+            db.execute(
+                """INSERT INTO cash_advance_transactions(advance_id,txn_type,amount_cents,
+                   txn_date,method,posted,authorized_by_head_id)
+                   VALUES(?,'Salary Deduction',30000,'2026-08-07','Salary Deduction',1,?)""",
+                (salary_id, head["id"]),
+            )
+            db.execute(
+                """INSERT INTO cash_advance_transactions(advance_id,txn_type,amount_cents,
+                   txn_date,method,posted,authorized_by_head_id)
+                   VALUES(?,'Salary Deduction',20000,'2026-08-14','Salary Deduction',0,?)""",
+                (salary_id, head["id"]),
+            )
+            db.execute(
+                """INSERT INTO cash_advance_transactions(advance_id,txn_type,amount_cents,
+                   txn_date,method,posted,authorized_by_head_id)
+                   VALUES(?,'Cash Repayment',50000,'2026-08-07','Cash Repayment',1,?)""",
+                (cash_id, head["id"]),
+            )
+
+            salary_path = Path(folder) / "salary-deduction.pdf"
+            export_cash_advance_pdf(db, project_id, ["Salary Deduction"], salary_path)
+            salary_payload = salary_path.read_bytes()
+            self.assertTrue(salary_payload.startswith(b"%PDF-1.4"))
+            self.assertIn(b"Salary Deduction only", salary_payload)
+            self.assertIn(b"Alice Salary", salary_payload)
+            self.assertNotIn(b"Bob Cash", salary_payload)
+            self.assertIn(b"Pending salary deductions 200.00", salary_payload)
+            self.assertIn(b"ADVANCE RECOVERY TRANSACTIONS", salary_payload)
+
+            cash_path = Path(folder) / "cash-repayment.pdf"
+            export_cash_advance_pdf(db, project_id, ["Cash Repayment"], cash_path)
+            cash_payload = cash_path.read_bytes()
+            self.assertIn(b"Cash Repayment only", cash_payload)
+            self.assertIn(b"Bob Cash", cash_payload)
+            self.assertNotIn(b"Alice Salary", cash_payload)
+
+            all_path = Path(folder) / "all-methods.pdf"
+            export_cash_advance_pdf(
+                db, project_id,
+                ["Salary Deduction", "Cash Repayment", "Bank Repayment", "Manual / Mixed"],
+                all_path,
+            )
+            all_payload = all_path.read_bytes()
+            self.assertIn(b"Alice Salary", all_payload)
+            self.assertIn(b"Bob Cash", all_payload)
+            self.assertIn(b"Cash Repayment", all_payload)
+            self.assertIn(b"Advanced 1,500.00", all_payload)
+            self.assertTrue(all_payload.rstrip().endswith(b"%%EOF"))
+            db.close()
 
     def test_weekly_payroll_pdf_has_summary_details_and_page_footer(self):
         with tempfile.TemporaryDirectory() as folder:

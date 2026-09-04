@@ -752,6 +752,296 @@ def export_payroll_batch_pdf(db, batch_id: int, path: Path | str):
     write_payroll_batch_pdf(path, dict(batch), summary_rows, detail_rows)
 
 
+def write_cash_advance_pdf(path: Path | str, project_name: str, scope: str,
+                           summary: dict, advance_rows: list[dict],
+                           transaction_rows: list[dict]):
+    """Write a searchable A4 landscape cash-advance balance and recovery report."""
+    page_width, page_height = 842, 595
+    margin, footer_height = 36, 38
+    content_width = page_width - margin * 2
+    leading = 11
+    balance_columns = [
+        ("date", "DATE", 58, "left"), ("reference", "ADVANCE REF.", 82, "left"),
+        ("employee", "EMPLOYEE", 92, "left"), ("original", "ORIGINAL", 62, "right"),
+        ("recovered", "RECOVERED", 62, "right"),
+        ("outstanding", "OUTSTANDING", 67, "right"),
+        ("funding", "FUNDING SOURCE", 78, "left"),
+        ("plan", "REPAYMENT PLAN", 82, "left"), ("status", "STATUS", 70, "left"),
+        ("reason", "REASON", 117, "left"),
+    ]
+    transaction_columns = [
+        ("date", "DATE", 62, "left"), ("reference", "ADVANCE REF.", 90, "left"),
+        ("employee", "EMPLOYEE", 105, "left"), ("transaction", "TRANSACTION", 93, "left"),
+        ("amount", "AMOUNT", 68, "right"), ("method", "METHOD", 90, "left"),
+        ("user_reference", "USER / SYSTEM REF.", 100, "left"),
+        ("authorized", "AUTHORIZED BY", 92, "left"), ("status", "STATUS", 70, "left"),
+    ]
+    if (sum(column[2] for column in balance_columns) != content_width or
+            sum(column[2] for column in transaction_columns) != content_width):
+        raise ValueError("Cash-advance PDF columns must fill the printable page width.")
+
+    def clean(value):
+        return (str(value or "").replace("\u2013", "-").replace("\u2014", "-")
+                .replace("\u2011", "-").replace("\u2022", "-")
+                .encode("latin-1", "replace").decode("latin-1"))
+
+    def escape(value):
+        return clean(value).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+    def text_width(value, size=9, bold=False):
+        total = 0.0
+        for character in clean(value):
+            if character == " ": factor = .278
+            elif character in "ilI.,:;'|!": factor = .278
+            elif character in "mwMW@%": factor = .89
+            elif character.isupper(): factor = .69
+            elif character.isdigit(): factor = .556
+            else: factor = .53
+            total += factor * size
+        return total * (1.04 if bold else 1)
+
+    def wrap_cell(value, width, bold=False):
+        available = max(10, width - 8)
+        words = clean(value).replace("\r", " ").replace("\n", " ").split()
+        if not words:
+            return [""]
+        lines, current = [], ""
+        for word in words:
+            candidate = f"{current} {word}".strip()
+            if text_width(candidate, bold=bold) <= available:
+                current = candidate
+                continue
+            if current:
+                lines.append(current)
+                current = ""
+            fragment = ""
+            for character in word:
+                if fragment and text_width(fragment + character, bold=bold) > available:
+                    lines.append(fragment)
+                    fragment = character
+                else:
+                    fragment += character
+            current = fragment
+        if current or not lines:
+            lines.append(current)
+        return lines
+
+    def add_text(commands, x, y, value, font="F1", size=9,
+                 color="0.08 0.11 0.16", align="left", max_width=None):
+        rendered = clean(value)
+        if align == "center" and max_width is not None:
+            x += max(0, (max_width - text_width(rendered, size, font == "F2")) / 2)
+        elif align == "right" and max_width is not None:
+            x += max_width - text_width(rendered, size, font == "F2")
+        commands.append(
+            f"BT {color} rg /{font} {size} Tf 1 0 0 1 {x:.2f} {y:.2f} Tm "
+            f"({escape(rendered)}) Tj ET"
+        )
+
+    pages = []
+    summary_line = (
+        f"Advances {summary.get('count', 0)}  |  Advanced {money(summary.get('advanced'))}  |  "
+        f"Recovered {money(summary.get('recovered'))}  |  "
+        f"Outstanding {money(summary.get('outstanding'))}  |  "
+        f"Pending salary deductions {money(summary.get('pending_salary'))}"
+    )
+
+    def start_page(section_title, columns, continued=False):
+        commands = []
+        add_text(commands, margin, page_height - 42,
+                 "ConTracktor_v1 - Cash Advance Ledger" + (" (continued)" if continued else ""),
+                 font="F2", size=16)
+        add_text(commands, margin, page_height - 62, f"Project: {clean(project_name)}", font="F2", size=10)
+        add_text(commands, margin, page_height - 78, f"Report scope: {clean(scope)}",
+                 size=10, color="0.35 0.39 0.45")
+        add_text(commands, page_width - margin - 170, page_height - 42,
+                 f"Exported {datetime.now():%Y-%m-%d %H:%M}", size=9,
+                 color="0.35 0.39 0.45", align="right", max_width=170)
+        add_text(commands, margin, page_height - 101, "FINANCIAL SUMMARY", font="F2", size=10)
+        add_text(commands, margin, page_height - 117, summary_line, size=9)
+        add_text(commands, margin, page_height - 142, section_title, font="F2", size=12)
+        y, header_height = page_height - 152, 31
+        commands.append(
+            f"q 0.07 0.12 0.22 rg {margin} {y-header_height:.2f} {content_width} {header_height} re f Q"
+        )
+        x = margin
+        for _key, heading, width, align in columns:
+            heading_lines = wrap_cell(heading, width, bold=True)[:2]
+            baseline = y - 12 if len(heading_lines) == 1 else y - 10
+            for line in heading_lines:
+                add_text(commands, x + 4, baseline, line, font="F2", size=8.5,
+                         color="1 1 1", align=align, max_width=width - 8)
+                baseline -= 10
+            commands.append(
+                f"0.65 0.69 0.76 RG 0.5 w {x:.2f} {y-header_height:.2f} "
+                f"{width:.2f} {header_height:.2f} re S"
+            )
+            x += width
+        pages.append(commands)
+        return commands, y - header_height
+
+    def add_section(title, columns, rows):
+        commands, y = start_page(title, columns)
+        for row_index, row in enumerate(rows):
+            wrapped = {key: wrap_cell(row.get(key, ""), width)
+                       for key, _heading, width, _align in columns}
+            row_height = max(25, max(len(lines) for lines in wrapped.values()) * leading + 8)
+            if y - row_height < footer_height + 12:
+                commands, y = start_page(title, columns, continued=True)
+            row_bottom = y - row_height
+            if row_index % 2:
+                commands.append(
+                    f"q 0.96 0.97 0.98 rg {margin} {row_bottom:.2f} "
+                    f"{content_width} {row_height:.2f} re f Q"
+                )
+            x = margin
+            for key, _heading, width, align in columns:
+                commands.append(
+                    f"q {x+1:.2f} {row_bottom+1:.2f} {width-2:.2f} {row_height-2:.2f} re W n"
+                )
+                baseline = y - 14
+                for line in wrapped[key]:
+                    add_text(commands, x + 4, baseline, line, size=8.5,
+                             align=align, max_width=width - 8)
+                    baseline -= leading
+                commands.append("Q")
+                commands.append(
+                    f"0.78 0.81 0.85 RG 0.45 w {x:.2f} {row_bottom:.2f} "
+                    f"{width:.2f} {row_height:.2f} re S"
+                )
+                x += width
+            y = row_bottom
+        if not rows:
+            add_text(commands, margin + 8, y - 24, "No records match this report scope.", size=10)
+
+    add_section("CASH ADVANCE BALANCES", balance_columns, advance_rows)
+    add_section("ADVANCE RECOVERY TRANSACTIONS", transaction_columns, transaction_rows)
+    page_count = len(pages)
+    for page_number, commands in enumerate(pages, 1):
+        commands.append(f"0.65 0.69 0.76 RG 0.5 w {margin} 30 m {page_width-margin} 30 l S")
+        footer = f"ConTracktor_v1 | Cash Advances | Page {page_number} of {page_count}"
+        add_text(commands, (page_width - text_width(footer, 9)) / 2, 16, footer,
+                 size=9, color="0.35 0.39 0.45")
+
+    regular_font_id = 3 + len(pages) * 2
+    bold_font_id = regular_font_id + 1
+    objects, page_ids = [None, None], []
+    for page_index, commands in enumerate(pages):
+        page_id, content_id = 3 + page_index * 2, 4 + page_index * 2
+        page_ids.append(page_id)
+        stream = "\n".join(commands).encode("latin-1", "replace")
+        objects.append(
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_width} {page_height}] "
+            f"/Resources << /Font << /F1 {regular_font_id} 0 R /F2 {bold_font_id} 0 R >> >> "
+            f"/Contents {content_id} 0 R >>"
+        )
+        objects.append(b"<< /Length " + str(len(stream)).encode() + b">>\nstream\n" + stream + b"\nendstream")
+    objects.append("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    objects.append("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>")
+    objects[0] = "<< /Type /Catalog /Pages 2 0 R >>"
+    objects[1] = f"<< /Type /Pages /Kids [{' '.join(f'{item} 0 R' for item in page_ids)}] /Count {len(page_ids)} >>"
+    output, offsets = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"), [0]
+    for object_id, value in enumerate(objects, 1):
+        offsets.append(len(output))
+        payload = value if isinstance(value, bytes) else value.encode("latin-1")
+        output.extend(f"{object_id} 0 obj\n".encode() + payload + b"\nendobj\n")
+    xref = len(output)
+    output.extend(f"xref\n0 {len(objects)+1}\n0000000000 65535 f \n".encode())
+    for offset in offsets[1:]:
+        output.extend(f"{offset:010d} 00000 n \n".encode())
+    output.extend(
+        f"trailer\n<< /Size {len(objects)+1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+    )
+    Path(path).write_bytes(output)
+
+
+def export_cash_advance_pdf(db, project_id: int, scope, path: Path | str):
+    """Collect active cash advances and their recovery history for PDF export."""
+    project = db.one("SELECT name FROM projects WHERE id=?", (project_id,))
+    if not project:
+        raise ValueError("Select a project before exporting cash advances.")
+    known_methods = ("Salary Deduction", "Cash Repayment", "Bank Repayment", "Manual / Mixed")
+    if isinstance(scope, str):
+        normalized = scope.strip().lower()
+        selected_methods = (known_methods if normalized.startswith("all") else
+                            tuple(method for method in known_methods if method.lower() in normalized))
+    else:
+        requested = {str(method).strip().lower() for method in (scope or [])}
+        selected_methods = tuple(method for method in known_methods if method.lower() in requested)
+    if not selected_methods:
+        raise ValueError("Select at least one repayment method for the cash-advance report.")
+    all_methods = len(selected_methods) == len(known_methods)
+    scope_clause = ""
+    scope_params = ()
+    if not all_methods:
+        placeholders = ",".join("?" for _ in selected_methods)
+        scope_clause = (
+            f" AND COALESCE(NULLIF(TRIM(a.repayment_plan),''),'Manual / Mixed') IN ({placeholders})"
+        )
+        scope_params = tuple(selected_methods)
+    advances = db.all(
+        f"""SELECT a.*,e.name employee,
+            COALESCE(NULLIF(a.system_reference,''),'CA-LEGACY-' || PRINTF('%06d',a.id)) reference,
+            COALESCE((SELECT SUM(t.amount_cents) FROM cash_advance_transactions t
+                      WHERE t.advance_id=a.id AND t.posted=1 AND t.voided=0
+                        AND t.txn_type<>'Advance'),0) recovered
+            FROM cash_advances a JOIN employees e ON e.id=a.employee_id
+            WHERE a.project_id=? AND a.voided=0{scope_clause}
+            ORDER BY a.advance_date,e.name COLLATE NOCASE,a.id""",
+        (project_id, *scope_params),
+    )
+    advance_rows = []
+    for row in advances:
+        outstanding = max(0, row["original_cents"] - row["recovered"])
+        status = "Settled" if not outstanding else "Partially Recovered" if row["recovered"] else "Outstanding"
+        advance_rows.append({
+            "date": row["advance_date"], "reference": row["reference"],
+            "employee": row["employee"], "original": money(row["original_cents"]),
+            "recovered": money(row["recovered"]), "outstanding": money(outstanding),
+            "funding": row["method"], "plan": row["repayment_plan"],
+            "status": status, "reason": row["reason"],
+        })
+    transactions = db.all(
+        f"""SELECT t.*,a.system_reference advance_reference,e.name employee,
+            COALESCE(h.name,'Legacy / not recorded') authorized
+            FROM cash_advance_transactions t
+            JOIN cash_advances a ON a.id=t.advance_id
+            JOIN employees e ON e.id=a.employee_id
+            LEFT JOIN project_heads h ON h.id=t.authorized_by_head_id
+            WHERE a.project_id=? AND a.voided=0 AND t.voided=0
+              AND t.txn_type<>'Advance'{scope_clause}
+            ORDER BY t.txn_date,t.id""", (project_id, *scope_params)
+    )
+    transaction_rows = [{
+        "date": row["txn_date"], "reference": row["advance_reference"] or f"CA-LEGACY-{row['advance_id']:06d}",
+        "employee": row["employee"], "transaction": row["txn_type"],
+        "amount": money(row["amount_cents"]), "method": row["method"],
+        "user_reference": row["reference"], "authorized": row["authorized"],
+        "status": "Posted" if row["posted"] else "Pending",
+    } for row in transactions]
+    advanced = sum(row["original_cents"] for row in advances)
+    recovered = sum(row["recovered"] for row in advances)
+    advance_ids = [row["id"] for row in advances]
+    pending_salary = 0
+    if advance_ids:
+        placeholders = ",".join("?" for _ in advance_ids)
+        pending_salary = db.one(
+            f"""SELECT COALESCE(SUM(amount_cents),0) total FROM cash_advance_transactions
+                WHERE advance_id IN ({placeholders}) AND voided=0 AND posted=0
+                  AND txn_type='Salary Deduction'""", tuple(advance_ids)
+        )["total"]
+    if all_methods:
+        report_scope = "All repayment methods"
+    elif len(selected_methods) == 1:
+        report_scope = f"{selected_methods[0]} only"
+    else:
+        report_scope = "Selected methods: " + ", ".join(selected_methods)
+    write_cash_advance_pdf(path, project["name"], report_scope, {
+        "count": len(advances), "advanced": advanced, "recovered": recovered,
+        "outstanding": max(0, advanced - recovered), "pending_salary": pending_salary,
+    }, advance_rows, transaction_rows)
+
+
 def qty_decimal(value: str) -> Decimal:
     try:
         result = Decimal(value.strip() or "0")
@@ -11490,6 +11780,69 @@ class CashAdvanceRecoveryDialog(tk.Toplevel):
         self.result={key:value.get().strip() for key,value in self.vars.items()}; self.destroy()
 
 
+class CashAdvanceExportDialog(tk.Toplevel):
+    METHODS = ("Salary Deduction", "Cash Repayment", "Bank Repayment", "Manual / Mixed")
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Export Cash Advances")
+        self.resizable(False, False)
+        self.result = None
+        body = ttk.Frame(self, padding=20)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Cash advance PDF report", style="DialogTitle.TLabel").pack(anchor="w")
+        ttk.Label(
+            body,
+            text="Choose whether to include every repayment method or only advances assigned to salary deduction.",
+            style="Muted.TLabel", wraplength=480,
+        ).pack(anchor="w", pady=(3, 14))
+        ttk.Label(body, text="Repayment methods to include").pack(anchor="w")
+        choices = ttk.Frame(body)
+        choices.pack(fill="x", pady=(4, 8))
+        self.method_vars = {}
+        for index, method in enumerate(self.METHODS):
+            variable = tk.BooleanVar(value=True)
+            self.method_vars[method] = variable
+            ttk.Checkbutton(choices, text=method, variable=variable).grid(
+                row=index // 2, column=index % 2, sticky="w", padx=(0, 24), pady=3
+            )
+        selection_buttons = ttk.Frame(body)
+        selection_buttons.pack(fill="x", pady=(0, 8))
+        ttk.Button(selection_buttons, text="Select All", command=lambda: self.set_all(True)).pack(side="left")
+        ttk.Button(selection_buttons, text="Clear", command=lambda: self.set_all(False)).pack(side="left", padx=5)
+        self.error_label = ttk.Label(selection_buttons, text="", foreground="#DC2626")
+        self.error_label.pack(side="left", padx=8)
+        ttk.Label(
+            body,
+            text="The PDF includes current balances plus the applicable advance-recovery transaction history.",
+            style="Muted.TLabel", wraplength=480,
+        ).pack(anchor="w", pady=(2, 12))
+        buttons = ttk.Frame(body)
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(
+            buttons, text="Export PDF", style="Primary.TButton", command=self.save
+        ).pack(side="right", padx=(0, 8))
+        self.transient(parent)
+        self.grab_set()
+        self.bind("<Escape>", lambda _event: self.destroy())
+        self.wait_visibility()
+        center_toplevel(self)
+
+    def save(self):
+        self.result = [method for method, variable in self.method_vars.items() if variable.get()]
+        if not self.result:
+            self.error_label.config(text="Select at least one method.")
+            self.bell()
+            return
+        self.destroy()
+
+    def set_all(self, selected):
+        for variable in self.method_vars.values():
+            variable.set(selected)
+        self.error_label.config(text="")
+
+
 class AttendanceEditDialog(tk.Toplevel):
     def __init__(self, parent, attendance):
         super().__init__(parent); self.title("Correct Attendance"); self.result=None
@@ -11795,6 +12148,8 @@ class PayrollTab(BaseTab):
         ttk.Button(advance_actions,text="Void Selected Advance",
                    command=self.void_selected_cash_advance).pack(side="left",padx=5)
         self.advance_summary=ttk.Label(advance_actions,style="Section.TLabel"); self.advance_summary.pack(side="right")
+        ttk.Button(advance_actions,text="Export Advances PDF",
+                   command=self.export_cash_advances_pdf).pack(side="right",padx=(5,10))
         pane=ttk.Panedwindow(advance_page,orient="vertical"); pane.pack(fill="both",expand=True)
         advances_frame=ttk.Frame(pane); transactions_frame=ttk.Frame(pane); pane.add(advances_frame,weight=1); pane.add(transactions_frame,weight=1)
         ttk.Label(advances_frame,text="Employee advances",style="Section.TLabel").pack(anchor="w")
@@ -12087,6 +12442,25 @@ class PayrollTab(BaseTab):
         try:
             export_payroll_batch_pdf(self.db,batch_id,destination)
             messagebox.showinfo(APP_TITLE,f"Weekly payroll PDF saved:\n{destination}",parent=self)
+        except (ValueError,OSError,sqlite3.Error) as exc:
+            messagebox.showerror(APP_TITLE,str(exc),parent=self)
+    def export_cash_advances_pdf(self):
+        if not self.require_project(): return
+        selector=CashAdvanceExportDialog(self); self.wait_window(selector)
+        if not selector.result:return
+        project=self.db.one("SELECT name FROM projects WHERE id=?",(self.project_id,))
+        safe_project="".join(character if character.isalnum() or character in "-_" else "_"
+                             for character in project["name"]).strip("_") or "project"
+        scope_name=("all_methods" if len(selector.result)==len(CashAdvanceExportDialog.METHODS)
+                    else "_".join(method.lower().replace(" / ", "_").replace(" ", "_")
+                                  for method in selector.result))
+        destination=filedialog.asksaveasfilename(parent=self,title="Export cash advances to PDF",
+            defaultextension=".pdf",filetypes=[("PDF document","*.pdf")],
+            initialfile=f"{safe_project}_cash_advances_{scope_name}.pdf")
+        if not destination:return
+        try:
+            export_cash_advance_pdf(self.db,self.project_id,selector.result,destination)
+            messagebox.showinfo(APP_TITLE,f"Cash advance PDF saved:\n{destination}",parent=self)
         except (ValueError,OSError,sqlite3.Error) as exc:
             messagebox.showerror(APP_TITLE,str(exc),parent=self)
     def open_kiosk(self):
