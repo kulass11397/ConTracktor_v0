@@ -1,0 +1,53 @@
+ConTracktor v1.6.10 - Client Update Guide
+=========================================
+
+Installer:
+ConTracktor_v1_Update_1.6.10_PoolReturns.exe
+
+Before updating
+---------------
+1. Finish and close ConTracktor on the client computer.
+2. Keep the computer connected to power.
+3. Do not rename, move, or delete the existing ConTracktor Data folder.
+4. Keep the client's most recent manual .db backup as an additional safety copy.
+
+Install
+-------
+1. Download the v1.6.10 EXE from the GitHub release.
+2. If Windows shows a SmartScreen notice, select More info, verify the publisher/source and file checksum, then select Run anyway.
+3. Open the installer and select OK/Install when prompted.
+4. Wait for the success message, then start ConTracktor from the existing shortcut.
+
+Record protection
+-----------------
+- The updater changes application files only.
+- It does not contain or replace a contractor_tracker.db file.
+- It creates a timestamped backup of the existing application and SQLite database before updating.
+- Required database structure is added automatically when v1.6.10 opens.
+
+First checks after updating
+---------------------------
+1. Confirm the Dashboard totals match the values immediately before the update.
+2. Open Expenses > Petty Cash & Direct Procurement.
+3. Confirm existing allocation and activity rows are visible.
+4. Select an active PC or DP allocation, then open Allocation Actions.
+5. Confirm “Return unused cash to shared pool” is present.
+6. Open an expense funding-source selector and confirm DP labels no longer show a restrictive project name.
+
+Using Return to Shared Pool
+---------------------------
+1. Select the PC or DP allocation.
+2. Open Allocation Actions > Return unused cash to shared pool.
+3. Enter the full or partial amount, date, and reason.
+4. Review the one-line confirmation and select Confirm.
+5. Verify the allocation balance decreased and Shared Unallocated Cash increased by the same amount.
+
+Correcting a pool return
+------------------------
+1. Select the allocation.
+2. Select its “Returned to Shared Pool” activity row.
+3. Open Allocation Actions > Void / restore selected pool return.
+4. Enter the correction reason and confirm.
+
+The system will refuse an undo if the cash has already been reallocated or if reopening a fully returned PC would create a third active PC account. Correct the later allocation first, then retry.
+
