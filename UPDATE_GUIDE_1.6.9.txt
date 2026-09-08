@@ -1,0 +1,42 @@
+ConTracktor v1.6.9 - Client Update Guide
+========================================
+
+Installer:
+ConTracktor_v1_Update_1.6.9_PettyCashContacts.exe
+
+Before updating
+---------------
+1. Close ConTracktor completely.
+2. Stay signed in to the same Windows user account used by ConTracktor.
+3. Run the downloaded updater. Do not uninstall the existing application.
+4. Review the installer summary and choose OK/Install.
+
+Record safety
+-------------
+- The updater contains no contractor_tracker.db file.
+- The existing database remains in:
+  %LOCALAPPDATA%\ConTracktor_v1\Data\contractor_tracker.db
+- A timestamped database backup is created in:
+  %LOCALAPPDATA%\ConTracktor_v1\Data\Backups\Before_v1.6.9_TIMESTAMP\
+- Existing application files are backed up in:
+  %LOCALAPPDATA%\ConTracktor_v1\AppBackups\Before_v1.6.9_TIMESTAMP\
+
+Petty Cash behavior
+-------------------
+- A project head may have up to two active Petty Cash accounts across projects.
+- Direct Procurement allocations do not count toward those two PC accounts.
+- If two PC accounts remain active, close or settle one before issuing a third.
+
+Supplier contacts
+-----------------
+1. Open Contacts and select the project.
+2. Existing suppliers from qualifying expenses and DP allocations appear automatically.
+3. Use Add Contact or Edit for manual directory details.
+4. Use Delete / Restore to remove a contact from the active list without changing transaction history.
+5. Enable Show deleted when a removed contact needs to be reviewed or restored.
+
+If Windows warns about the installer
+--------------------------------------
+This is an unsigned in-house Windows application, so SmartScreen or antivirus may show a
+reputation warning. Confirm that the SHA-256 value matches SHA256SUMS.txt on the GitHub
+release page. Do not disable antivirus protection globally.
