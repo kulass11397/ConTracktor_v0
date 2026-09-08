@@ -105,6 +105,143 @@ class ContractorTrackerTests(unittest.TestCase):
             ))
             db.close()
 
+    def test_pc_and_dp_unused_cash_can_return_to_shared_pool_and_be_reallocated(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "pool-return.db")
+            project_id = db.create_project({
+                "name": "Pool Return Project", "client": "Client", "contract_value": "100000",
+                "start_date": "2026-09-01", "target_date": "", "address": "Site", "notes": "",
+                "heads": [
+                    {"name": "Pool Issuer", "position": "Manager", "pin": "0000"},
+                    {"name": "Pool Receiver", "position": "Custodian", "pin": "0000"},
+                ],
+            })
+            issuer, receiver = db.all(
+                "SELECT * FROM project_heads WHERE project_id=? ORDER BY id", (project_id,)
+            )
+            withdrawal_id = db.execute(
+                """INSERT INTO remittances(project_id,type,amount_cents,txn_date,shared_cash,
+                   system_reference) VALUES(?,'Withdrawal',500000,'2026-09-08',1,
+                   'WD-20260908-TEST')""", (project_id,),
+            ).lastrowid
+            petty_id = db.create_cash_allocation(
+                project_id=project_id, allocation_type="Petty Cash", amount_cents=100000,
+                allocation_date="2026-09-08", issuer_head_id=issuer["id"],
+                receiver_head_id=receiver["id"], purpose="Petty cash",
+            )
+            direct_id = db.create_cash_allocation(
+                project_id=project_id, allocation_type="Direct Procurement", amount_cents=100000,
+                allocation_date="2026-09-08", issuer_head_id=issuer["id"],
+                receiver_head_id=receiver["id"], purpose="Direct materials", supplier="Vendor One",
+            )
+            direct_label = next(
+                label for label, allocation_id in db.active_allocation_options().items()
+                if allocation_id == direct_id
+            )
+            self.assertIn("Vendor One", direct_label)
+            self.assertIn("1,000.00 remaining", direct_label)
+            self.assertNotIn("Pool Return Project", direct_label)
+            self.assertEqual(db.unallocated_cash(), 300000)
+            petty_return = db.return_cash_allocation_to_pool(
+                petty_id, 40000, "2026-09-08", "Wrong custodian amount", issuer["id"]
+            )
+            self.assertTrue(petty_return["reference"].startswith("PR-20260908-"))
+            self.assertEqual(db.allocation_balance(petty_id), 60000)
+            self.assertEqual(db.unallocated_cash(), 340000)
+            self.assertEqual(db.withdrawal_available(withdrawal_id), 340000)
+            self.assertEqual(db.surrendered_awaiting_deposit(), 0)
+
+            db.set_pool_return_voided(
+                petty_return["id"], True, "Return entered in error", issuer["id"]
+            )
+            self.assertEqual(db.allocation_balance(petty_id), 100000)
+            self.assertEqual(db.unallocated_cash(), 300000)
+            db.set_pool_return_voided(
+                petty_return["id"], False, "Confirmed return is correct", issuer["id"]
+            )
+            self.assertEqual(db.allocation_balance(petty_id), 60000)
+
+            direct_return = db.return_cash_allocation_to_pool(
+                direct_id, 100000, "2026-09-08", "Wrong DP payee", issuer["id"]
+            )
+            self.assertEqual(db.allocation_balance(direct_id), 0)
+            self.assertEqual(
+                db.one("SELECT status FROM cash_allocations WHERE id=?", (direct_id,))["status"],
+                "Returned to Shared Pool",
+            )
+            self.assertEqual(db.unallocated_cash(), 440000)
+            second_pc = db.create_cash_allocation(
+                project_id=project_id, allocation_type="Petty Cash", amount_cents=350000,
+                allocation_date="2026-09-08", issuer_head_id=issuer["id"],
+                receiver_head_id=receiver["id"], purpose="Correct allocation",
+            )
+            self.assertTrue(second_pc)
+            self.assertEqual(db.unallocated_cash(), 90000)
+            with self.assertRaisesRegex(ValueError, "no longer available"):
+                db.set_pool_return_voided(
+                    direct_return["id"], True, "Attempt after reuse", issuer["id"]
+                )
+
+            db.return_cash_allocation_to_pool(
+                petty_id, 60000, "2026-09-08", "Close incorrect allocation", issuer["id"]
+            )
+            third_pc = db.create_cash_allocation(
+                project_id=project_id, allocation_type="Petty Cash", amount_cents=100000,
+                allocation_date="2026-09-08", issuer_head_id=issuer["id"],
+                receiver_head_id=receiver["id"], purpose="Replacement PC",
+            )
+            self.assertTrue(third_pc)
+            final_return = db.one(
+                """SELECT id FROM cash_allocation_transactions
+                   WHERE allocation_id=? AND txn_type='Returned to Shared Pool'
+                   ORDER BY id DESC LIMIT 1""", (petty_id,),
+            )
+            with self.assertRaisesRegex(ValueError, "two other active Petty Cash accounts"):
+                db.set_pool_return_voided(
+                    final_return["id"], True, "Would reopen a third PC", issuer["id"]
+                )
+            self.assertEqual(
+                db.one("SELECT COUNT(*) n FROM cash_pool_return_sources")["n"], 3
+            )
+            db.close()
+
+    def test_pool_return_is_separate_from_surrendered_cash(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "pool-versus-surrender.db")
+            project_id = db.create_project({
+                "name": "Cash Custody Project", "client": "Client", "contract_value": "100000",
+                "start_date": "2026-09-01", "target_date": "", "address": "Site", "notes": "",
+                "heads": [
+                    {"name": "Custody Issuer", "position": "Manager", "pin": "0000"},
+                    {"name": "Custody Receiver", "position": "Custodian", "pin": "0000"},
+                ],
+            })
+            issuer, receiver = db.all(
+                "SELECT * FROM project_heads WHERE project_id=? ORDER BY id", (project_id,)
+            )
+            db.execute(
+                """INSERT INTO remittances(project_id,type,amount_cents,txn_date,shared_cash,
+                   system_reference) VALUES(?,'Withdrawal',500000,'2026-09-08',1,
+                   'WD-20260908-SEPARATE')""", (project_id,),
+            )
+            allocation_id = db.create_cash_allocation(
+                project_id=project_id, allocation_type="Petty Cash", amount_cents=100000,
+                allocation_date="2026-09-08", issuer_head_id=issuer["id"],
+                receiver_head_id=receiver["id"], purpose="Custody test",
+            )
+            db.return_cash_allocation_to_pool(
+                allocation_id, 40000, "2026-09-08", "Internal reassignment", issuer["id"]
+            )
+            self.assertEqual(db.surrendered_awaiting_deposit(), 0)
+            surrendered = db.close_cash_allocation(
+                allocation_id, "2026-09-08", receiver["id"], issuer["id"],
+                "Physical cash handed back",
+            )
+            self.assertEqual(surrendered, 60000)
+            self.assertEqual(db.surrendered_awaiting_deposit(), 60000)
+            self.assertEqual(db.unallocated_cash(), 440000)
+            db.close()
+
     def test_inventory_consumables_track_opening_restock_and_employee_usage(self):
         with tempfile.TemporaryDirectory() as folder:
             db = Database(Path(folder) / "inventory-consumables.db")
@@ -988,7 +1125,8 @@ class ContractorTrackerTests(unittest.TestCase):
             self.assertIn(allocation_id, options.values())
             label = next(label for label, value in options.items() if value == allocation_id)
             self.assertIn("1,000.00 remaining", label)
-            self.assertIn("Allocation Visibility", label)
+            self.assertIn("Petty Cash", label)
+            self.assertNotIn("Allocation Visibility", label)
             db.close()
 
     def test_reassign_payment_requires_cash_surrender_to_be_voided_first(self):

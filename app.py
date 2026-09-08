@@ -1963,6 +1963,12 @@ class Database:
             amount_cents INTEGER NOT NULL CHECK(amount_cents > 0),
             PRIMARY KEY(allocation_id,withdrawal_id)
         );
+        CREATE TABLE IF NOT EXISTS cash_pool_return_sources (
+            transaction_id INTEGER NOT NULL REFERENCES cash_allocation_transactions(id) ON DELETE CASCADE,
+            withdrawal_id INTEGER NOT NULL REFERENCES remittances(id),
+            amount_cents INTEGER NOT NULL CHECK(amount_cents > 0),
+            PRIMARY KEY(transaction_id,withdrawal_id)
+        );
         CREATE TABLE IF NOT EXISTS cash_redeposits (
             id INTEGER PRIMARY KEY,
             reference TEXT NOT NULL UNIQUE,
@@ -2170,6 +2176,8 @@ class Database:
         CREATE INDEX IF NOT EXISTS idx_cash_alloc_project ON cash_allocations(project_id,status);
         CREATE INDEX IF NOT EXISTS idx_cash_alloc_txn ON cash_allocation_transactions(allocation_id,txn_date);
         CREATE INDEX IF NOT EXISTS idx_cash_alloc_source_withdrawal ON cash_allocation_sources(withdrawal_id);
+        CREATE INDEX IF NOT EXISTS idx_cash_pool_return_source_withdrawal
+            ON cash_pool_return_sources(withdrawal_id);
         CREATE INDEX IF NOT EXISTS idx_cash_redeposit_bank ON cash_redeposits(bank_account_id,deposit_date);
         CREATE INDEX IF NOT EXISTS idx_cash_redeposit_source_withdrawal ON cash_redeposit_sources(withdrawal_id);
         CREATE INDEX IF NOT EXISTS idx_bank_transfer_source
@@ -3475,7 +3483,8 @@ class Database:
         row = self.one(
             """SELECT COALESCE(SUM(amount_cents),0) total
                FROM cash_allocation_transactions
-               WHERE allocation_id=? AND txn_type IN ('Surrendered','Returned')
+               WHERE allocation_id=?
+                 AND txn_type IN ('Surrendered','Returned','Returned to Shared Pool')
                  AND voided=0""",
             (allocation_id,),
         )
@@ -3511,7 +3520,16 @@ class Database:
                FROM cash_allocation_sources s JOIN cash_allocations a ON a.id=s.allocation_id
                WHERE s.withdrawal_id=? AND a.voided=0""", (withdrawal_id,)
         )["total"]
-        return max(0, withdrawal["amount_cents"] - allocated)
+        released = self.one(
+            """SELECT COALESCE(SUM(s.amount_cents),0) total
+               FROM cash_pool_return_sources s
+               JOIN cash_allocation_transactions t ON t.id=s.transaction_id
+               JOIN cash_allocations a ON a.id=t.allocation_id
+               WHERE s.withdrawal_id=? AND a.voided=0 AND t.voided=0
+                 AND t.txn_type='Returned to Shared Pool'""",
+            (withdrawal_id,),
+        )["total"]
+        return max(0, withdrawal["amount_cents"] - allocated + released)
 
     def fifo_withdrawal_sources(self, amount_cents: int):
         """Reserve an amount across the oldest withdrawals with remaining capacity."""
@@ -3564,7 +3582,8 @@ class Database:
                          WHERE p.cash_allocation_id=a.id AND e.voided=0
                            AND p.accounting_excluded=0),0) spent_cents,
                        COALESCE((SELECT SUM(t.amount_cents) FROM cash_allocation_transactions t
-                         WHERE t.allocation_id=a.id AND t.txn_type IN ('Surrendered','Returned')
+                         WHERE t.allocation_id=a.id
+                           AND t.txn_type IN ('Surrendered','Returned','Returned to Shared Pool')
                            AND t.voided=0),0) returned_cents,
                        COALESCE((SELECT SUM(s.amount_cents) FROM cash_repayment_surrenders s
                          WHERE s.cash_allocation_id=a.id AND s.status<>'Voided'),0) repayment_surrendered_cents
@@ -3763,6 +3782,188 @@ class Database:
                  f"{correction_reason.strip()}; authorized by {head['name']}"),
             )
 
+    def return_cash_allocation_to_pool(self, allocation_id: int, amount_cents: int,
+                                       return_date: str, reason: str,
+                                       authorized_by_head_id: int) -> dict:
+        """Release unused PC/DP custody back to reusable shared cash."""
+        row = self.one(
+            "SELECT * FROM cash_allocations WHERE id=? AND voided=0", (allocation_id,)
+        )
+        if not row or row["status"] not in {"Active", "Partially Used", "Open"}:
+            raise ValueError("Select an active Petty Cash or Direct Procurement allocation.")
+        amount_cents = int(amount_cents or 0)
+        if amount_cents <= 0:
+            raise ValueError("The return-to-pool amount must be positive.")
+        return_date = valid_date(return_date, True)
+        reason = reason.strip()
+        if not reason:
+            raise ValueError("Enter why this allocation is being returned to the shared pool.")
+        available = self.allocation_balance(allocation_id)
+        if amount_cents > available:
+            raise ValueError(
+                f"Only the unused balance of {money(available)} can be returned to the shared pool."
+            )
+        head = self.one(
+            "SELECT id,name FROM project_heads WHERE id=? AND project_id=? AND active=1",
+            (authorized_by_head_id, row["project_id"]),
+        )
+        if not head:
+            raise ValueError("An active project head for the allocation project must record this return.")
+        source_capacity = self._allocation_unspent_sources(allocation_id)
+        if sum(value for _withdrawal_id, value in source_capacity) < amount_cents:
+            raise ValueError(
+                "The unused withdrawal-source trail cannot cover this return. Review the allocation "
+                "before continuing."
+            )
+        remaining = amount_cents
+        source_lines = []
+        # Release the newest still-unused source first. Earlier withdrawal sources
+        # remain attached to recorded expenses, preserving FIFO spending history.
+        for withdrawal_id, source_available in reversed(source_capacity):
+            take = min(remaining, source_available)
+            if take:
+                source_lines.append((withdrawal_id, take))
+                remaining -= take
+            if remaining <= 0:
+                break
+        reference = self._next_system_reference(
+            "PR", "cash_allocation_transactions", "system_reference", return_date
+        )
+        stamp = local_timestamp()
+        with self.conn:
+            transaction_id = self.conn.execute(
+                """INSERT INTO cash_allocation_transactions(
+                   allocation_id,txn_type,amount_cents,txn_date,actor_head_id,notes,
+                   system_reference,transaction_time)
+                   VALUES(?,'Returned to Shared Pool',?,?,?,?,?,?)""",
+                (allocation_id, amount_cents, return_date, authorized_by_head_id,
+                 reason, reference, stamp),
+            ).lastrowid
+            self.conn.executemany(
+                """INSERT INTO cash_pool_return_sources(
+                   transaction_id,withdrawal_id,amount_cents) VALUES(?,?,?)""",
+                [(transaction_id, withdrawal_id, value)
+                 for withdrawal_id, value in source_lines],
+            )
+            balance = self.allocation_balance(allocation_id)
+            status = "Returned to Shared Pool" if balance <= 0 else "Partially Used"
+            self.conn.execute(
+                "UPDATE cash_allocations SET status=?,closed_at=? WHERE id=?",
+                (status, return_date if balance <= 0 else "", allocation_id),
+            )
+            self.conn.execute(
+                "INSERT INTO audit_log(project_id,action,details,created_at) VALUES(?,?,?,?)",
+                (row["project_id"], "CASH_ALLOCATION_RETURNED_TO_POOL",
+                 f"{reference}: {row['reference']} returned {money(amount_cents)} to shared "
+                 f"unallocated cash; reason: {reason}; recorded by {head['name']}", stamp),
+            )
+        return {
+            "id": transaction_id, "reference": reference,
+            "allocation_reference": row["reference"], "amount_cents": amount_cents,
+            "remaining_cents": balance, "status": status,
+        }
+
+    def set_pool_return_voided(self, transaction_id: int, should_void: bool,
+                               reason: str, authorized_by_head_id: int) -> dict:
+        """Undo or reapply an internal return while protecting reused cash."""
+        reason = reason.strip()
+        if not reason:
+            raise ValueError("Enter the reason for this void or restoration.")
+        row = self.one(
+            """SELECT t.*,a.project_id,a.reference allocation_reference,
+                      a.allocation_type,a.status allocation_status,
+                      a.receiver_registry_id,a.receiver_head_id
+               FROM cash_allocation_transactions t
+               JOIN cash_allocations a ON a.id=t.allocation_id
+               WHERE t.id=? AND t.txn_type='Returned to Shared Pool' AND a.voided=0""",
+            (transaction_id,),
+        )
+        if not row:
+            raise ValueError("Select a return-to-shared-pool transaction.")
+        if bool(row["voided"]) == bool(should_void):
+            raise ValueError("That pool return is already in the requested state.")
+        head = self.one(
+            "SELECT id,name FROM project_heads WHERE id=? AND project_id=? AND active=1",
+            (authorized_by_head_id, row["project_id"]),
+        )
+        if not head:
+            raise ValueError("An active project head for the allocation project must record this correction.")
+        source_rows = self.all(
+            "SELECT * FROM cash_pool_return_sources WHERE transaction_id=?",
+            (transaction_id,),
+        )
+        if should_void:
+            if (row["allocation_type"] == "Petty Cash"
+                    and row["allocation_status"] not in {"Active", "Partially Used", "Open"}):
+                receiver_identity = row["receiver_registry_id"] or row["receiver_head_id"]
+                active_pc_count = self.one(
+                    """SELECT COUNT(*) n FROM cash_allocations a
+                       LEFT JOIN project_heads h ON h.id=a.custodian_head_id
+                       WHERE a.id<>? AND a.voided=0 AND a.allocation_type='Petty Cash'
+                         AND a.status IN ('Active','Partially Used','Open')
+                         AND COALESCE(a.receiver_registry_id,h.registry_head_id,h.id)=?""",
+                    (row["allocation_id"], receiver_identity),
+                )["n"]
+                if active_pc_count >= 2:
+                    raise ValueError(
+                        "This return cannot be voided because the project head already has two "
+                        "other active Petty Cash accounts."
+                    )
+            if self.unallocated_cash() < row["amount_cents"]:
+                raise ValueError(
+                    "This return cannot be voided because its cash is no longer available in the "
+                    "shared unallocated pool. Return or correct the later allocation first."
+                )
+            for source in source_rows:
+                if self.withdrawal_available(source["withdrawal_id"]) < source["amount_cents"]:
+                    raise ValueError(
+                        "This return cannot be voided because its withdrawal-source cash has been "
+                        "reallocated. Return or correct the later allocation first."
+                    )
+        else:
+            available = self.allocation_balance(row["allocation_id"])
+            if row["amount_cents"] > available:
+                raise ValueError(
+                    "This pool return cannot be restored because the allocation balance has since "
+                    f"fallen to {money(available)}."
+                )
+        stamp = local_timestamp()
+        with self.conn:
+            self.conn.execute(
+                """UPDATE cash_allocation_transactions
+                   SET voided=?,voided_at=?,void_reason=?,voided_by_head_id=?,
+                       notes=TRIM(notes || ?)
+                   WHERE id=?""",
+                (1 if should_void else 0, stamp if should_void else "", reason,
+                 authorized_by_head_id,
+                 f" | {'VOIDED' if should_void else 'RESTORED'}: {reason}", transaction_id),
+            )
+            balance = self.allocation_balance(row["allocation_id"])
+            spent = self.allocation_spent(row["allocation_id"])
+            status = (
+                "Returned to Shared Pool" if balance <= 0 else
+                "Partially Used" if spent or self.allocation_returned(row["allocation_id"]) else
+                "Active"
+            )
+            self.conn.execute(
+                "UPDATE cash_allocations SET status=?,closed_at=? WHERE id=?",
+                (status, row["txn_date"] if balance <= 0 else "", row["allocation_id"]),
+            )
+            action = (
+                "CASH_POOL_RETURN_VOIDED" if should_void else "CASH_POOL_RETURN_RESTORED"
+            )
+            self.conn.execute(
+                "INSERT INTO audit_log(project_id,action,details,created_at) VALUES(?,?,?,?)",
+                (row["project_id"], action,
+                 f"{row['system_reference'] or row['allocation_reference']} {money(row['amount_cents'])}; "
+                 f"reason: {reason}; recorded by {head['name']}", stamp),
+            )
+        return {
+            "reference": row["system_reference"] or row["allocation_reference"],
+            "amount_cents": row["amount_cents"], "voided": bool(should_void),
+            "allocation_status": status,
+        }
+
     def close_cash_allocation(self, allocation_id: int, txn_date: str,
                               actor_head_id: int, approver_head_id: int, notes: str = "") -> int:
         row = self.one("SELECT * FROM cash_allocations WHERE id=? AND voided=0", (allocation_id,))
@@ -3802,15 +4003,27 @@ class Database:
 
     def _allocation_unspent_sources(self, allocation_id: int):
         spent = self.allocation_spent(allocation_id)
+        released = {
+            row["withdrawal_id"]: row["total"]
+            for row in self.all(
+                """SELECT s.withdrawal_id,SUM(s.amount_cents) total
+                   FROM cash_pool_return_sources s
+                   JOIN cash_allocation_transactions t ON t.id=s.transaction_id
+                   WHERE t.allocation_id=? AND t.txn_type='Returned to Shared Pool'
+                     AND t.voided=0 GROUP BY s.withdrawal_id""",
+                (allocation_id,),
+            )
+        }
         result = []
         for row in self.all(
             """SELECT s.withdrawal_id,s.amount_cents,r.txn_date
                FROM cash_allocation_sources s JOIN remittances r ON r.id=s.withdrawal_id
                WHERE s.allocation_id=? ORDER BY r.txn_date,r.id""", (allocation_id,)
         ):
-            consumed = min(spent, row["amount_cents"])
+            reserved = max(0, row["amount_cents"] - released.get(row["withdrawal_id"], 0))
+            consumed = min(spent, reserved)
             spent -= consumed
-            remaining = row["amount_cents"] - consumed
+            remaining = reserved - consumed
             if remaining > 0:
                 result.append((row["withdrawal_id"], remaining))
         return result
@@ -3932,7 +4145,7 @@ class Database:
                 """SELECT COALESCE(SUM(amount_cents),0) total
                    FROM cash_allocation_transactions
                    WHERE allocation_id=? AND id<>? AND voided=0
-                     AND txn_type IN ('Surrendered','Returned')""",
+                     AND txn_type IN ('Surrendered','Returned','Returned to Shared Pool')""",
                 (row["allocation_id"], transaction_id),
             )["total"]
             available = max(
@@ -4312,7 +4525,9 @@ class Database:
         if changes_cash_source:
             active_return = self.one(
                 """SELECT id FROM cash_allocation_transactions
-                   WHERE allocation_id=? AND txn_type IN ('Surrendered','Returned') AND voided=0
+                   WHERE allocation_id=?
+                     AND txn_type IN ('Surrendered','Returned','Returned to Shared Pool')
+                     AND voided=0
                    LIMIT 1""", (old_allocation_id,)
             )
             if active_return:
@@ -4383,9 +4598,15 @@ class Database:
             balance = max(0, row["amount_cents"] - row["spent_cents"] - row["returned_cents"])
             if balance <= 0: continue
             holder = row["holder"] or row["supplier"] or "Unassigned"
-            context = row["project"] or "Legacy project"
-            label = (f"{row['reference']} | {row['allocation_type']} | {holder} | "
-                     f"{money(balance)} remaining | {context}")
+            if row["allocation_type"] == "Direct Procurement":
+                # The project chosen on the expense is the costing project.  A
+                # DP's creation project is audit context only and must not make
+                # a shared funding source look project-restricted.
+                payee = row["supplier"] or holder
+                label = f"{row['reference']} | {payee} | {money(balance)} remaining"
+            else:
+                label = (f"{row['reference']} | Petty Cash | {holder} | "
+                         f"{money(balance)} remaining")
             options[label] = row["id"]
         return options
 
@@ -9794,7 +10015,7 @@ class PaymentSourcesDialog(tk.Toplevel):
         self.allocation_note.pack(anchor="w", pady=(2, 5))
         allocation_columns = (
             ("reference", "Allocation ref.", 155), ("type", "Type", 135),
-            ("holder", "Holder / Payee", 165), ("project", "Issuance project", 150),
+            ("holder", "Holder / Payee", 165), ("project", "Origin (audit)", 180),
             ("issued", "Issued", 105), ("remaining", "Remaining", 110),
             ("status", "Status", 125),
         )
@@ -9875,7 +10096,8 @@ class PaymentSourcesDialog(tk.Toplevel):
                 status = f"{status} / No balance"
             self.allocation_tree.insert("", "end", iid=str(allocation["id"]), values=(
                 allocation["reference"], allocation["allocation_type"], holder,
-                allocation["project"], money(allocation["amount_cents"]), money(balance), status,
+                f"Created under {allocation['project'] or 'Legacy project'}",
+                money(allocation["amount_cents"]), money(balance), status,
             ), tags=("unavailable",) if balance <= 0 else ())
         self.allocation_tree.tag_configure("unavailable", foreground="#7A8496")
         if not allocations:
@@ -10283,12 +10505,24 @@ class ExpensesTab(BaseTab):
                    command=self.issue_cash_allocation).pack(side="right")
         ttk.Button(toolbar, text="Deposit All Surrendered", style="Primary.TButton",
                    command=self.deposit_surrendered_cash).pack(side="right", padx=(0, 6))
-        ttk.Button(toolbar, text="Surrender / Close", command=self.surrender_cash_allocation).pack(
-            side="right", padx=(0, 6))
         ttk.Button(toolbar, text="Void / Restore Cash Return",
                    command=self.void_restore_cash_return).pack(side="right", padx=(0, 6))
-        ttk.Button(toolbar, text="Edit Selected Allocation",
-                   command=self.edit_cash_allocation).pack(side="right", padx=(0, 6))
+        allocation_actions = tk.Menubutton(
+            toolbar, text="Allocation Actions ▾", bg=WHITE, fg=INK, relief="solid", bd=1,
+            font=("Segoe UI", 9, "bold"), padx=10, pady=5,
+        )
+        allocation_menu = tk.Menu(allocation_actions, tearoff=False)
+        allocation_menu.add_command(label="Edit selected allocation", command=self.edit_cash_allocation)
+        allocation_menu.add_command(
+            label="Return unused cash to shared pool", command=self.return_allocation_to_pool
+        )
+        allocation_menu.add_command(label="Surrender / close", command=self.surrender_cash_allocation)
+        allocation_menu.add_separator()
+        allocation_menu.add_command(
+            label="Void / restore selected pool return", command=self.void_restore_pool_return
+        )
+        allocation_actions.configure(menu=allocation_menu)
+        allocation_actions.pack(side="right", padx=(0, 6))
 
         summary = ttk.Frame(self.cash_page); summary.pack(fill="x", pady=(0, 8))
         self.cash_summary_values = {}
@@ -10296,7 +10530,7 @@ class ExpensesTab(BaseTab):
             ("unallocated", "Unallocated shared cash", GREEN),
             ("petty", "Active petty cash", ORANGE),
             ("direct", "Direct procurement reserved", "#2563EB"),
-            ("surrendered", "Surrendered / returned", INK),
+            ("surrendered", "Surrendered awaiting deposit", INK),
         ):
             card, value = metric_card(summary, title, color)
             card.pack(side="left", fill="x", expand=True, padx=(0, 6))
@@ -10322,6 +10556,7 @@ class ExpensesTab(BaseTab):
         self.allocation_tree.bind("<<TreeviewSelect>>", lambda _e: self._refresh_allocation_transactions())
         self.allocation_txn_tree = make_tree(transactions, [
             ("date", "Date & Time", 145), ("reference", "Allocation", 155),
+            ("activity_reference", "Activity Ref.", 145),
             ("type", "Activity", 120), ("amount", "Amount", 105),
             ("expense", "Expense", 175), ("actor", "Recorded / authorized by", 155),
             ("status", "Status", 90), ("notes", "Notes", 230),
@@ -10397,6 +10632,118 @@ class ExpensesTab(BaseTab):
                 f"Cash allocation {row['reference']} is now active.\n\n"
                 f"FIFO sources: {self.db.allocation_source_text(allocation_id)}\n\n"
                 "Use this reference when recording cash expenses.",
+                parent=self,
+            )
+        except (ValueError, sqlite3.Error) as exc:
+            messagebox.showerror(APP_TITLE, str(exc), parent=self)
+
+    def return_allocation_to_pool(self):
+        selection = self.allocation_tree.selection()
+        allocation_id = int(selection[0]) if selection else None
+        if not allocation_id:
+            messagebox.showinfo(
+                APP_TITLE, "Select a Petty Cash or Direct Procurement allocation first.", parent=self
+            )
+            return
+        row = self.db.one("SELECT * FROM cash_allocations WHERE id=?", (allocation_id,))
+        if not row or row["voided"] or row["status"] not in {"Active", "Partially Used", "Open"}:
+            messagebox.showinfo(APP_TITLE, "Select an active allocation with unused cash.", parent=self)
+            return
+        returnable = self.db.allocation_balance(allocation_id)
+        if returnable <= 0:
+            messagebox.showinfo(APP_TITLE, "This allocation has no unused cash to return.", parent=self)
+            return
+        data = dialog(
+            self, "Return Unused Allocation to Shared Pool",
+            [("_allocation", "Allocation", None, "display"),
+             ("_type", "Allocation type", None, "display"),
+             ("_maximum", "Maximum returnable", None, "display"),
+             ("amount", "Amount to return"), ("return_date", "Return date"),
+             ("reason", "Reason for return")],
+            {"_allocation": row["reference"], "_type": row["allocation_type"],
+             "_maximum": money(returnable), "amount": money(returnable),
+             "return_date": date.today().isoformat()},
+            required_keys=("amount", "return_date", "reason"),
+        )
+        if not data:
+            return
+        try:
+            amount = cents(data["amount"])
+            if amount <= 0 or amount > returnable:
+                raise ValueError(f"Enter a return amount from 0.01 through {money(returnable)}.")
+            return_date = valid_date(data["return_date"], True)
+            details = (
+                f"{row['reference']} | {row['allocation_type']} | return {money(amount)} "
+                f"to shared unallocated cash | reason: {data['reason']}"
+            )
+            head = self.app.authorize_for_project(
+                row["project_id"], "Return allocation to shared cash pool", details
+            )
+            if not head:
+                return
+            result = self.db.return_cash_allocation_to_pool(
+                allocation_id, amount, return_date, data["reason"], head["id"]
+            )
+            self.app.refresh_all()
+            messagebox.showinfo(
+                APP_TITLE,
+                f"{result['reference']} returned {money(amount)} to shared unallocated cash.\n\n"
+                f"{money(result['remaining_cents'])} remains spendable in {row['reference']}.\n"
+                "No expense, withdrawal, bank balance, or surrender was changed.",
+                parent=self,
+            )
+        except (ValueError, sqlite3.Error) as exc:
+            messagebox.showerror(APP_TITLE, str(exc), parent=self)
+
+    def void_restore_pool_return(self):
+        selection = self.allocation_txn_tree.selection()
+        transaction_id = int(selection[0]) if selection else None
+        if not transaction_id:
+            messagebox.showinfo(
+                APP_TITLE, "Select a pool-return row in Allocation activity first.", parent=self
+            )
+            return
+        row = self.db.one(
+            """SELECT t.*,a.project_id,a.reference allocation_reference
+               FROM cash_allocation_transactions t
+               JOIN cash_allocations a ON a.id=t.allocation_id WHERE t.id=?""",
+            (transaction_id,),
+        )
+        if not row or row["txn_type"] != "Returned to Shared Pool":
+            messagebox.showinfo(
+                APP_TITLE, "The selected activity is not a return to the shared pool.", parent=self
+            )
+            return
+        should_void = not bool(row["voided"])
+        verb = "Undo" if should_void else "Restore"
+        consequence = (
+            "reserve the cash back into the original allocation" if should_void else
+            "return the cash to the shared unallocated pool again"
+        )
+        data = dialog(
+            self, f"{verb} Return to Shared Pool",
+            [("reason", f"Reason to {verb.lower()} this pool return")],
+            required_keys=("reason",),
+        )
+        if not data:
+            return
+        reference = row["system_reference"] or row["allocation_reference"]
+        head = self.app.authorize_for_project(
+            row["project_id"], f"{verb} cash pool return",
+            f"{reference} | {money(row['amount_cents'])} | {consequence}",
+        )
+        if not head:
+            return
+        try:
+            result = self.db.set_pool_return_voided(
+                transaction_id, should_void, data["reason"], head["id"]
+            )
+            self.app.refresh_all()
+            messagebox.showinfo(
+                APP_TITLE,
+                f"{result['reference']} was {'undone' if should_void else 'restored'}.\n\n"
+                f"The cash was {'reserved back into the allocation' if should_void else 'returned to the shared pool'}. "
+                "The audit record remains visible.",
                 parent=self,
             )
         except (ValueError, sqlite3.Error) as exc:
@@ -10699,6 +11046,7 @@ class ExpensesTab(BaseTab):
             self.allocation_txn_tree.insert(
                 "", "end", iid=row["id"],
                 values=(row["transaction_time"] or row["txn_date"], row["reference"],
+                        row["system_reference"] or "—",
                         "Cash Advance Release" if row["txn_type"]=="Expense Payment" and
                         row["expense"].upper().startswith("CASH ADVANCE") else row["txn_type"],
                         money(row["amount_cents"]), row["expense"], row["actor"],
