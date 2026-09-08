@@ -29,7 +29,7 @@ This cumulative, record-preserving Windows update adds a controlled way to corre
 
 6. **Clear Direct Procurement funding labels**
    - DP choices display `DP reference | supplier/payee | remaining balance`.
-   - The creation project is retained only as audit context in the expanded allocation list (“Created under …”).
+   - The creation project is retained only as audit context in the expanded allocation list ("Created under ...").
    - The project selected on the expense remains the project used for project costing.
 
 ## Intentionally unchanged
@@ -43,4 +43,3 @@ This cumulative, record-preserving Windows update adds a controlled way to corre
 - 49 automated regression tests pass.
 - The installer payload rejects SQLite database files.
 - The updater creates timestamped application and database backups before replacing application files.
-
