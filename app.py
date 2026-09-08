@@ -1780,7 +1780,7 @@ class Database:
             id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
             name TEXT NOT NULL, role TEXT NOT NULL DEFAULT '', company TEXT NOT NULL DEFAULT '',
             phone TEXT NOT NULL DEFAULT '', email TEXT NOT NULL DEFAULT '', address TEXT NOT NULL DEFAULT '',
-            notes TEXT NOT NULL DEFAULT ''
+            notes TEXT NOT NULL DEFAULT '', active INTEGER NOT NULL DEFAULT 1
         );
         CREATE TABLE IF NOT EXISTS employees (
             id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -2321,6 +2321,8 @@ class Database:
         self._ensure_column("cash_repayment_surrenders", "voided_by_head_id", "INTEGER")
         self._ensure_column("expense_verification_batches", "verification_time", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("expense_verification_batches", "created_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("contacts", "active", "INTEGER NOT NULL DEFAULT 1")
+        self._install_supplier_contact_sync()
         # Cash-advance funding and recovery preferences are additive migrations.
         # Existing advances remain valid and default to the legacy/manual workflow.
         self._ensure_column("cash_advances", "cash_allocation_id", "INTEGER")
@@ -2883,6 +2885,65 @@ class Database:
         columns = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
         if column not in columns:
             self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def _install_supplier_contact_sync(self):
+        """Keep vendor/payee names discoverable without changing financial records."""
+        supplier_match = """project_id=NEW.project_id AND LOWER(TRIM(role))='supplier'
+            AND (LOWER(TRIM(name))=LOWER(TRIM(NEW.supplier))
+                 OR LOWER(TRIM(company))=LOWER(TRIM(NEW.supplier)))"""
+        expense_guard = """TRIM(NEW.supplier)<>''
+            AND UPPER(TRIM(COALESCE(NEW.area,'')))<>'PAYROLL'
+            AND UPPER(TRIM(COALESCE(NEW.trade,'')))<>'RECOVERABLE EMPLOYEE ADVANCE'"""
+        for event in ("INSERT", "UPDATE OF supplier,project_id"):
+            suffix = "insert" if event == "INSERT" else "update"
+            self.conn.execute(f"""CREATE TRIGGER IF NOT EXISTS trg_expense_supplier_contact_{suffix}
+                AFTER {event} ON expenses WHEN {expense_guard}
+                BEGIN
+                    UPDATE contacts SET active=1 WHERE {supplier_match};
+                    INSERT INTO contacts(project_id,name,role,notes,active)
+                    SELECT NEW.project_id,TRIM(NEW.supplier),'Supplier',
+                           'Automatically added from the expense ledger.',1
+                    WHERE NOT EXISTS(SELECT 1 FROM contacts WHERE {supplier_match});
+                END""")
+        for event in ("INSERT", "UPDATE OF supplier,project_id,allocation_type"):
+            suffix = "insert" if event == "INSERT" else "update"
+            self.conn.execute(f"""CREATE TRIGGER IF NOT EXISTS trg_dp_supplier_contact_{suffix}
+                AFTER {event} ON cash_allocations
+                WHEN NEW.allocation_type='Direct Procurement' AND TRIM(NEW.supplier)<>''
+                BEGIN
+                    UPDATE contacts SET active=1 WHERE {supplier_match};
+                    INSERT INTO contacts(project_id,name,role,notes,active)
+                    SELECT NEW.project_id,TRIM(NEW.supplier),'Supplier',
+                           'Automatically added from Direct Procurement.',1
+                    WHERE NOT EXISTS(SELECT 1 FROM contacts WHERE {supplier_match});
+                END""")
+
+        # Populate the list from existing vendor-bearing records. Payroll and
+        # employee cash advances use the supplier column for a non-vendor payee,
+        # so they are intentionally excluded.
+        self.conn.execute("""INSERT INTO contacts(project_id,name,role,notes,active)
+            SELECT DISTINCT e.project_id,TRIM(e.supplier),'Supplier',
+                   'Backfilled from the expense ledger.',1
+            FROM expenses e
+            WHERE TRIM(COALESCE(e.supplier,''))<>''
+              AND UPPER(TRIM(COALESCE(e.area,'')))<>'PAYROLL'
+              AND UPPER(TRIM(COALESCE(e.trade,'')))<>'RECOVERABLE EMPLOYEE ADVANCE'
+              AND NOT EXISTS(
+                    SELECT 1 FROM contacts c WHERE c.project_id=e.project_id
+                      AND LOWER(TRIM(c.role))='supplier'
+                      AND (LOWER(TRIM(c.name))=LOWER(TRIM(e.supplier))
+                           OR LOWER(TRIM(c.company))=LOWER(TRIM(e.supplier))))""")
+        self.conn.execute("""INSERT INTO contacts(project_id,name,role,notes,active)
+            SELECT DISTINCT a.project_id,TRIM(a.supplier),'Supplier',
+                   'Backfilled from Direct Procurement.',1
+            FROM cash_allocations a
+            WHERE a.allocation_type='Direct Procurement'
+              AND TRIM(COALESCE(a.supplier,''))<>''
+              AND NOT EXISTS(
+                    SELECT 1 FROM contacts c WHERE c.project_id=a.project_id
+                      AND LOWER(TRIM(c.role))='supplier'
+                      AND (LOWER(TRIM(c.name))=LOWER(TRIM(a.supplier))
+                           OR LOWER(TRIM(c.company))=LOWER(TRIM(a.supplier))))""")
 
     def one(self, sql, params=()):
         return self.conn.execute(sql, params).fetchone()
@@ -3620,6 +3681,7 @@ class Database:
                 """SELECT COUNT(*) n FROM cash_allocations a
                    LEFT JOIN project_heads h ON h.id=a.custodian_head_id
                    WHERE COALESCE(a.receiver_registry_id,h.registry_head_id,h.id)=? AND a.voided=0
+                      AND a.allocation_type='Petty Cash'
                       AND a.status IN ('Active','Partially Used','Open')""",
                 ((receiver_registry_id or receiver_head_id),),
             )["n"]
@@ -10019,7 +10081,8 @@ class CashAllocationDialog(tk.Toplevel):
             self.vars["receiver"].set(values[1] if len(values) > 1 else values[0])
         suppliers = [row["supplier"] for row in self.db.all(
             """SELECT DISTINCT CASE WHEN TRIM(company)<>'' THEN company ELSE name END supplier
-               FROM contacts WHERE LOWER(role)='supplier' ORDER BY supplier COLLATE NOCASE"""
+               FROM contacts WHERE LOWER(role)='supplier' AND active=1
+               ORDER BY supplier COLLATE NOCASE"""
         ) if row["supplier"]]
         self.widgets["supplier"].set_source(suppliers)
         self.balance_note.config(
@@ -11775,30 +11838,42 @@ class ExpensesTab(BaseTab):
 
 class ContactsTab(BaseTab):
     FIELDS = [
-        ("name", "Name"), ("role", "Role / relationship"), ("company", "Company"),
+        ("name", "Name"), ("role", "Role / relationship", ["Supplier", "Client", "Contractor", "Other"]),
+        ("company", "Company"),
         ("phone", "Phone"), ("email", "Email"), ("address", "Address"), ("notes", "Notes"),
     ]
 
     def __init__(self, app):
         super().__init__(app)
-        ttk.Label(self, text="Project contacts", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(self, text="Project contacts and suppliers", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            self,
+            text="Suppliers used in expenses and Direct Procurement are added here automatically.",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(2, 0))
         bar = ttk.Frame(self); bar.pack(fill="x", pady=(10, 0))
         ttk.Button(bar, text="＋ Add Contact", command=self.add).pack(side="left")
         ttk.Button(bar, text="Edit", command=self.edit).pack(side="left", padx=5)
-        ttk.Button(bar, text="Delete", command=self.delete).pack(side="left")
+        ttk.Button(bar, text="Delete / Restore", command=self.delete).pack(side="left")
+        self.show_deleted = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            bar, text="Show deleted", variable=self.show_deleted, command=self.refresh
+        ).pack(side="left", padx=(12, 0))
         self.tree = make_tree(self, [
             ("name", "Name", 180), ("role", "Role", 150), ("company", "Company", 160),
             ("phone", "Phone", 125), ("email", "Email", 190), ("address", "Address", 220),
+            ("status", "Status", 80),
         ])
+        self.tree.tag_configure("deleted", foreground="#9CA3AF", background="#F3F4F6")
 
     def add(self):
         if not self.require_project():
             return
-        data = dialog(self, "Contact", self.FIELDS, required_keys=("name",))
+        data = dialog(self, "Contact", self.FIELDS, {"role": "Supplier"}, required_keys=("name",))
         if data and data["name"]:
             self.db.execute(
-                """INSERT INTO contacts(project_id,name,role,company,phone,email,address,notes)
-                   VALUES(?,?,?,?,?,?,?,?)""", (self.project_id,) + tuple(data[k] for k, *_ in self.FIELDS)
+                """INSERT INTO contacts(project_id,name,role,company,phone,email,address,notes,active)
+                   VALUES(?,?,?,?,?,?,?,?,1)""", (self.project_id,) + tuple(data[k] for k, *_ in self.FIELDS)
             )
             self.app.refresh_all()
 
@@ -11821,17 +11896,33 @@ class ContactsTab(BaseTab):
         if not self.require_project():
             return
         record_id = self.selected_id(self.tree)
-        if record_id and messagebox.askyesno(APP_TITLE, "Delete this contact?"):
-            self.db.execute("DELETE FROM contacts WHERE id=?", (record_id,))
+        if not record_id:
+            return
+        row = self.db.one("SELECT * FROM contacts WHERE id=?", (record_id,))
+        restoring = not bool(row["active"])
+        action = "restore" if restoring else "delete"
+        explanation = (
+            f"Restore {row['name']} to the active Contacts list?" if restoring else
+            f"Delete {row['name']} from the active Contacts list?\n\n"
+            "Existing expenses and allocation records will remain unchanged."
+        )
+        if messagebox.askyesno(APP_TITLE, explanation, parent=self):
+            self.db.execute("UPDATE contacts SET active=? WHERE id=?", (1 if restoring else 0, record_id))
+            self.db.audit(self.project_id, f"CONTACT_{action.upper()}D", row["name"])
             self.app.refresh_all()
 
     def refresh(self):
         self.tree.delete(*self.tree.get_children())
         if self.project_id:
-            for row in self.db.all("SELECT * FROM contacts WHERE project_id=? ORDER BY name", (self.project_id,)):
+            sql = "SELECT * FROM contacts WHERE project_id=?"
+            if not self.show_deleted.get():
+                sql += " AND active=1"
+            sql += " ORDER BY CASE WHEN LOWER(role)='supplier' THEN 0 ELSE 1 END,name COLLATE NOCASE"
+            for row in self.db.all(sql, (self.project_id,)):
                 self.tree.insert("", "end", iid=row["id"], values=(
-                    row["name"], row["role"], row["company"], row["phone"], row["email"], row["address"]
-                ))
+                    row["name"], row["role"], row["company"], row["phone"], row["email"],
+                    row["address"], "Active" if row["active"] else "Deleted"
+                ), tags=(() if row["active"] else ("deleted",)))
 
 
 class KioskWindow(tk.Toplevel):

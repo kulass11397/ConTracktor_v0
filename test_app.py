@@ -19,6 +19,92 @@ class ContractorTrackerTests(unittest.TestCase):
         self.assertEqual(cash_allocation_approval_mode("Direct Procurement"), "Single Issuer")
         self.assertEqual(cash_allocation_approval_mode("Petty Cash"), "Two Heads")
 
+    def test_two_petty_cash_limit_excludes_direct_procurement_allocations(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "petty-cash-limit.db")
+            project_id = db.create_project({
+                "name": "Allocation Project", "client": "Client", "contract_value": "100000",
+                "start_date": "2026-09-01", "target_date": "", "address": "Site", "notes": "",
+                "heads": [
+                    {"name": "Issuing Head", "position": "Manager", "pin": "0000"},
+                    {"name": "Receiving Head", "position": "Custodian", "pin": "0000"},
+                ],
+            })
+            heads = db.all("SELECT * FROM project_heads WHERE project_id=? ORDER BY id", (project_id,))
+            issuer, receiver = heads
+            db.execute(
+                """INSERT INTO remittances(project_id,type,amount_cents,txn_date,shared_cash,
+                   system_reference) VALUES(?,'Withdrawal',10000000,'2026-09-01',1,
+                   'WD-20260901-TEST')""", (project_id,),
+            )
+            for number in range(2):
+                db.create_cash_allocation(
+                    project_id=project_id, allocation_type="Direct Procurement",
+                    amount_cents=100000, allocation_date="2026-09-01",
+                    issuer_head_id=issuer["id"], receiver_head_id=receiver["id"],
+                    supplier=f"DP Supplier {number + 1}", purpose="Materials",
+                )
+            first_pc = db.create_cash_allocation(
+                project_id=project_id, allocation_type="Petty Cash", amount_cents=100000,
+                allocation_date="2026-09-01", issuer_head_id=issuer["id"],
+                receiver_head_id=receiver["id"], purpose="Site cash one",
+            )
+            second_pc = db.create_cash_allocation(
+                project_id=project_id, allocation_type="Petty Cash", amount_cents=100000,
+                allocation_date="2026-09-01", issuer_head_id=issuer["id"],
+                receiver_head_id=receiver["id"], purpose="Site cash two",
+            )
+            self.assertTrue(first_pc)
+            self.assertTrue(second_pc)
+            with self.assertRaisesRegex(ValueError, "two active petty-cash allocations"):
+                db.create_cash_allocation(
+                    project_id=project_id, allocation_type="Petty Cash", amount_cents=100000,
+                    allocation_date="2026-09-01", issuer_head_id=issuer["id"],
+                    receiver_head_id=receiver["id"], purpose="Site cash three",
+                )
+            db.close()
+
+    def test_suppliers_sync_to_contacts_and_reactivate_when_reused(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "supplier-contacts.db")
+            project_id = db.create_project({
+                "name": "Supplier Project", "client": "Client", "contract_value": "100000",
+                "start_date": "2026-09-01", "target_date": "", "address": "Site", "notes": "",
+                "heads": [{"name": "Project Head", "position": "Manager", "pin": "0000"}],
+            })
+            db.execute(
+                """INSERT INTO expenses(project_id,name,supplier,area,trade,expense_date,total_cents)
+                   VALUES(?,'Cement delivery','ABC Trading','MATERIALS','Concrete','2026-09-02',50000)""",
+                (project_id,),
+            )
+            contact = db.one(
+                """SELECT * FROM contacts WHERE project_id=? AND name='ABC Trading'
+                   AND role='Supplier'""", (project_id,),
+            )
+            self.assertIsNotNone(contact)
+            self.assertEqual(contact["active"], 1)
+            db.execute("UPDATE contacts SET active=0 WHERE id=?", (contact["id"],))
+            db.execute(
+                """INSERT INTO expenses(project_id,name,supplier,area,trade,expense_date,total_cents)
+                   VALUES(?,'Paint delivery','ABC Trading','MATERIALS','Painting','2026-09-03',30000)""",
+                (project_id,),
+            )
+            contacts = db.all(
+                """SELECT * FROM contacts WHERE project_id=? AND name='ABC Trading'
+                   AND role='Supplier'""", (project_id,),
+            )
+            self.assertEqual(len(contacts), 1)
+            self.assertEqual(contacts[0]["active"], 1)
+            db.execute(
+                """INSERT INTO expenses(project_id,name,supplier,area,trade,expense_date,total_cents)
+                   VALUES(?,'Weekly Payroll','Payroll','PAYROLL','Labor','2026-09-04',100000)""",
+                (project_id,),
+            )
+            self.assertIsNone(db.one(
+                "SELECT id FROM contacts WHERE project_id=? AND name='Payroll'", (project_id,),
+            ))
+            db.close()
+
     def test_inventory_consumables_track_opening_restock_and_employee_usage(self):
         with tempfile.TemporaryDirectory() as folder:
             db = Database(Path(folder) / "inventory-consumables.db")
