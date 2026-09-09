@@ -1,0 +1,50 @@
+ConTracktor v1.6.11 - Client Update Guide
+=========================================
+
+Installer:
+ConTracktor_v1_Update_1.6.11_WDReferenceRepair.exe
+
+Before updating
+---------------
+1. Finish and close ConTracktor on the client computer.
+2. Keep the latest manual SQLite backup in a separate safe folder.
+3. Do not rename, move, or delete the existing ConTracktor Data folder.
+
+Install
+-------
+1. Download the v1.6.11 EXE from the GitHub release.
+2. Verify the SHA-256 checksum using SHA256SUMS.txt.
+3. Open the installer and approve the update.
+4. The updater preserves the live database and creates timestamped backups.
+5. Start ConTracktor from the existing shortcut.
+
+First launch
+------------
+1. The app checks the reviewed WD/allocation sequence before changing anything.
+2. If every check passes, it repairs the references atomically and shows a success notice.
+3. If a reviewed or succeeding record cannot be reconciled safely, it shows a skipped notice and changes no WD references.
+4. The repair runs once only; later launches do not repeat it.
+
+Verification after updating
+----------------------------
+1. Open Expenses > Petty Cash & Direct Procurement.
+2. Confirm the curated allocations show these WD sources:
+   - PC-20260825-0001 -> WD-20260824-0001
+   - PC-20260824-0001 and PC-20260824-0002 -> WD-20260824-0002
+   - DP-20260827-0001 -> WD-20260826-0001
+   - DP-20260828-0001 -> WD-20260828-0001
+   - DP-20260901-0001 -> WD-20260831-0001
+   - DP-20260901-0002 -> WD-20260901-0001
+   - PC-20260904-0001 -> WD-20260901-0002
+   - DP-20260904-0001 -> WD-20260904-0001
+   - DP-20260905-0001 and PC-20260905-0001 -> WD-20260905-0001
+3. Confirm allocations entered later continue from the remaining corrected withdrawal balances.
+4. Confirm the redundant Selected Allocation menu is gone and Allocation Actions remains available.
+
+Important
+---------
+- Earlier withdrawals are not deleted; they remain visible for audit.
+- The repair changes source references only. It does not change any financial amount.
+- If the app reports that the repair was safely skipped, keep the backup and send the latest .db file for review.
+
+

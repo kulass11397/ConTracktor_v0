@@ -107,6 +107,18 @@ class CleanContractorApp(core.ContractorApp):
         return matches[0] if matches else None
 
     @classmethod
+    def _first_menubutton(cls, root, text_prefix):
+        for widget in cls._walk(root):
+            if not isinstance(widget, tk.Menubutton):
+                continue
+            try:
+                if str(widget.cget("text")).startswith(text_prefix):
+                    return widget
+            except tk.TclError:
+                pass
+        return None
+
+    @classmethod
     def _container_with_labels(cls, root, required_labels):
         required = set(required_labels)
         for candidate in root.winfo_children():
@@ -336,21 +348,19 @@ class CleanContractorApp(core.ContractorApp):
         cash_allocate = self._first_button(page.cash_page, "+ Allocate Withdrawal")
         if cash_allocate:
             toolbar = cash_allocate.master
+            allocation_actions = self._first_menubutton(toolbar, "Allocation Actions")
             edit_button = self._first_button(toolbar, "Edit Selected Allocation")
             surrender_button = self._first_button(toolbar, "Surrender / Close")
             deposit_button = self._first_button(toolbar, "Deposit All Surrendered")
             return_button = self._first_button(toolbar, "Void / Restore Cash Return")
             for button in (edit_button, surrender_button, deposit_button, return_button):
                 self._forget(button)
-            cash_actions = self._action_menu(toolbar, "Selected Allocation", [
-                ("Edit selected allocation", page.edit_cash_allocation),
-                ("Surrender / close allocation", page.surrender_cash_allocation),
-            ], side="right", padx=(0, 6))
             self._action_menu(toolbar, "Cash Returns", [
                 ("Deposit all surrendered cash", page.deposit_surrendered_cash),
                 ("Void / restore selected surrender or redeposit", page.void_restore_cash_return),
             ], side="right", padx=(0, 6))
-            self._selection_controls(page.allocation_tree, cash_actions)
+            if allocation_actions:
+                self._selection_controls(page.allocation_tree, allocation_actions)
 
         if filter_bar:
             original_refresh = page.refresh

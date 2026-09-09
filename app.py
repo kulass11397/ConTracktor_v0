@@ -1668,8 +1668,10 @@ def verify_pin(pin: str, salt_hex: str, digest_hex: str) -> bool:
 class Database:
     def __init__(self, path: Path | str | None = DB_PATH):
         self.path = resolve_db_path(path)
+        self.wd_reference_repair_status = ("skipped", "")
         self.migration_backup = self._backup_before_shared_cash_migration()
         self.v120_migration_backup = self._backup_before_v120_migration()
+        self.wd_reference_migration_backup = self._backup_before_wd_reference_repair()
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
@@ -1720,6 +1722,48 @@ class Database:
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             backup = path.with_name(f"{path.stem}_before_v1_2_0_{stamp}{path.suffix}")
             shutil.copy2(path, backup)
+            return backup
+        except (OSError, sqlite3.Error):
+            return None
+
+    def _backup_before_wd_reference_repair(self):
+        """Back up the verified client ledger before its one-time WD relink."""
+        path = Path(self.path)
+        if not path.exists() or path.stat().st_size == 0:
+            return None
+        marker = "verified_wd_allocation_relink_20260909"
+        try:
+            probe = sqlite3.connect(path)
+            has_allocations = probe.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cash_allocations'"
+            ).fetchone()
+            if not has_allocations:
+                probe.close()
+                return None
+            has_metadata = probe.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_metadata'"
+            ).fetchone()
+            if has_metadata and probe.execute(
+                "SELECT 1 FROM app_metadata WHERE key=?", (marker,)
+            ).fetchone():
+                probe.close()
+                return None
+            target = probe.execute(
+                "SELECT 1 FROM cash_allocations WHERE reference='PC-20260825-0001'"
+            ).fetchone()
+            if not target:
+                probe.close()
+                return None
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            backup = path.with_name(
+                f"{path.stem}_before_wd_reference_repair_{stamp}{path.suffix}"
+            )
+            backup_conn = sqlite3.connect(backup)
+            try:
+                probe.backup(backup_conn)
+            finally:
+                backup_conn.close()
+                probe.close()
             return backup
         except (OSError, sqlite3.Error):
             return None
@@ -2462,6 +2506,7 @@ class Database:
         self._backfill_shared_cash_references()
         self._migrate_cash_repayment_surrenders()
         self._migrate_v120_payroll_deductions()
+        self._migrate_verified_wd_allocation_references()
         # Preserve the employee and daily details of every existing committed
         # payroll before any future reopen operation detaches its live attendance.
         for payroll in self.conn.execute(
@@ -2477,6 +2522,339 @@ class Database:
             (local_timestamp(),),
         )
         self.conn.commit()
+
+    def _migrate_verified_wd_allocation_references(self):
+        """Relink one verified client sequence without altering any cash amount.
+
+        This is intentionally not a general FIFO rebuild. It runs only when the
+        complete set of client references, dates, amounts, and known legacy source
+        splits all match. Any mismatch blocks the repair and leaves the ledger
+        untouched so a newer client backup can be reviewed instead of guessed at.
+        """
+        marker = "verified_wd_allocation_relink_20260909"
+        marked = self.conn.execute(
+            "SELECT value FROM app_metadata WHERE key=?", (marker,)
+        ).fetchone()
+        if marked:
+            self.wd_reference_repair_status = ("already_applied", marked["value"])
+            return
+
+        allocation_specs = {
+            "PC-20260825-0001": (10000000, "2026-08-25"),
+            "PC-20260824-0001": (5000000, "2026-08-24"),
+            "PC-20260824-0002": (5000000, "2026-08-24"),
+            "DP-20260827-0001": (2250000, "2026-08-27"),
+            "DP-20260828-0001": (8407500, "2026-08-28"),
+            "DP-20260901-0001": (5000000, "2026-09-01"),
+            "DP-20260901-0002": (5009000, "2026-09-01"),
+            "PC-20260904-0001": (10000000, "2026-09-04"),
+            "DP-20260904-0001": (6305000, "2026-09-04"),
+            "DP-20260905-0001": (2188800, "2026-09-05"),
+            "PC-20260905-0001": (2811200, "2026-09-05"),
+        }
+        withdrawal_specs = {
+            "WD-20260824-0001": (10000000, "2026-08-24"),
+            "WD-20260824-0002": (10000000, "2026-08-24"),
+            "WD-20260826-0001": (2250000, "2026-08-26"),
+            "WD-20260828-0001": (8407500, "2026-08-28"),
+            "WD-20260831-0001": (5000000, "2026-08-31"),
+            "WD-20260901-0001": (5009000, "2026-09-01"),
+            "WD-20260901-0002": (15000000, "2026-09-01"),
+            "WD-20260904-0001": (6305000, "2026-09-04"),
+            "WD-20260905-0001": (5000000, "2026-09-05"),
+        }
+        old_sources = {
+            "PC-20260825-0001": {"WD-20260522-0001": 9434100, "WD-20260530-0001": 565900},
+            "PC-20260824-0001": {"WD-20260530-0001": 1434100, "WD-20260604-0001": 3565900},
+            "PC-20260824-0002": {"WD-20260604-0001": 5000000},
+            "DP-20260827-0001": {"WD-20260604-0001": 1434100, "WD-20260610-0001": 815900},
+            "DP-20260828-0001": {
+                "WD-20260610-0001": 2189500, "WD-20260611-0001": 5000000,
+                "WD-20260615-0001": 1001600, "WD-20260615-0002": 216400,
+            },
+            "DP-20260901-0001": {"WD-20260615-0002": 785200, "WD-20260615-0003": 4214800},
+            "DP-20260901-0002": {"WD-20260615-0003": 785200, "WD-20260617-0001": 4223800},
+            "PC-20260904-0001": {
+                "WD-20260617-0001": 776200, "WD-20260623-0001": 5000000,
+                "WD-20260624-0001": 4223800,
+            },
+            "DP-20260904-0001": {"WD-20260624-0001": 6305000},
+            "DP-20260905-0001": {"WD-20260624-0001": 2188800},
+            "PC-20260905-0001": {"WD-20260624-0001": 2282400, "WD-20260629-0001": 528800},
+        }
+        new_sources = {
+            "PC-20260825-0001": {"WD-20260824-0001": 10000000},
+            "PC-20260824-0001": {"WD-20260824-0002": 5000000},
+            "PC-20260824-0002": {"WD-20260824-0002": 5000000},
+            "DP-20260827-0001": {"WD-20260826-0001": 2250000},
+            "DP-20260828-0001": {"WD-20260828-0001": 8407500},
+            "DP-20260901-0001": {"WD-20260831-0001": 5000000},
+            "DP-20260901-0002": {"WD-20260901-0001": 5009000},
+            "PC-20260904-0001": {"WD-20260901-0002": 10000000},
+            "DP-20260904-0001": {"WD-20260904-0001": 6305000},
+            "DP-20260905-0001": {"WD-20260905-0001": 2188800},
+            "PC-20260905-0001": {"WD-20260905-0001": 2811200},
+        }
+
+        present = self.conn.execute(
+            "SELECT COUNT(*) count FROM cash_allocations WHERE reference IN (%s)"
+            % ",".join("?" for _ in allocation_specs),
+            tuple(allocation_specs),
+        ).fetchone()["count"]
+        if not present:
+            return
+
+        def block(reason):
+            self.wd_reference_repair_status = ("blocked", reason)
+
+        if present != len(allocation_specs):
+            block("The verified allocation sequence is incomplete; no references were changed.")
+            return
+        if not self.wd_reference_migration_backup:
+            block("A safety backup could not be created; no references were changed.")
+            return
+
+        try:
+            allocations = {}
+            for reference, (expected_amount, expected_date) in allocation_specs.items():
+                row = self.conn.execute(
+                    "SELECT * FROM cash_allocations WHERE reference=?", (reference,)
+                ).fetchone()
+                if (row["amount_cents"], row["allocation_date"]) != (expected_amount, expected_date):
+                    raise ValueError(f"{reference} amount or date no longer matches the reviewed backup")
+                allocations[reference] = row
+
+            withdrawals = {}
+            for reference, (expected_amount, expected_date) in withdrawal_specs.items():
+                row = self.conn.execute(
+                    """SELECT * FROM remittances WHERE system_reference=?
+                       AND type='Withdrawal' AND voided=0""", (reference,)
+                ).fetchone()
+                if not row or (row["amount_cents"], row["txn_date"]) != (expected_amount, expected_date):
+                    raise ValueError(f"{reference} amount, date, or active status no longer matches")
+                withdrawals[reference] = row
+
+            for reference, expected in old_sources.items():
+                rows = self.conn.execute(
+                    """SELECT r.system_reference,s.amount_cents
+                       FROM cash_allocation_sources s
+                       JOIN remittances r ON r.id=s.withdrawal_id
+                       WHERE s.allocation_id=?""", (allocations[reference]["id"],)
+                ).fetchall()
+                actual = {row["system_reference"]: row["amount_cents"] for row in rows}
+                if actual != expected:
+                    raise ValueError(f"{reference} source links were changed after the reviewed backup")
+
+            # Include every allocation entered after the curated anchor. Those
+            # records may not exist in the reviewed backup, so they are rebuilt
+            # deterministically from the remaining post-cutoff withdrawals.
+            anchor_id = max(row["id"] for row in allocations.values())
+            succeeding = self.conn.execute(
+                """SELECT * FROM cash_allocations
+                   WHERE id>? AND voided=0
+                   ORDER BY allocation_date,COALESCE(NULLIF(allocation_time,''),created_at),id""",
+                (anchor_id,),
+            ).fetchall()
+            for allocation in succeeding:
+                reference = allocation["reference"]
+                allocations[reference] = allocation
+                rows = self.conn.execute(
+                    """SELECT r.system_reference,s.amount_cents
+                       FROM cash_allocation_sources s
+                       JOIN remittances r ON r.id=s.withdrawal_id
+                       WHERE s.allocation_id=?""", (allocation["id"],)
+                ).fetchall()
+                old_sources[reference] = {
+                    row["system_reference"]: row["amount_cents"] for row in rows
+                }
+
+            eligible_withdrawals = self.conn.execute(
+                """SELECT * FROM remittances
+                   WHERE type='Withdrawal' AND voided=0 AND txn_date>='2026-08-24'
+                   ORDER BY txn_date,COALESCE(NULLIF(transaction_time,''),created_at),id"""
+            ).fetchall()
+            for row in eligible_withdrawals:
+                withdrawals[row["system_reference"]] = row
+
+            fixed_usage = {}
+            for sources in new_sources.values():
+                for wd_ref, amount in sources.items():
+                    fixed_usage[wd_ref] = fixed_usage.get(wd_ref, 0) + amount
+
+            repair_ids = tuple(row["id"] for row in allocations.values())
+            placeholders = ",".join("?" for _ in repair_ids)
+            protected_usage = {
+                row["withdrawal_id"]: row["amount_cents"]
+                for row in self.conn.execute(
+                    f"""SELECT s.withdrawal_id,SUM(s.amount_cents) amount_cents
+                        FROM cash_allocation_sources s
+                        JOIN cash_allocations a ON a.id=s.allocation_id
+                        WHERE a.voided=0 AND s.allocation_id NOT IN ({placeholders})
+                        GROUP BY s.withdrawal_id""", repair_ids,
+                ).fetchall()
+            }
+            available_lots = []
+            for row in eligible_withdrawals:
+                available = (
+                    row["amount_cents"]
+                    - fixed_usage.get(row["system_reference"], 0)
+                    - protected_usage.get(row["id"], 0)
+                )
+                if available < 0:
+                    raise ValueError(f"{row['system_reference']} would be over-allocated")
+                if available:
+                    available_lots.append([
+                        row["system_reference"], row["id"], row["txn_date"], available
+                    ])
+
+            for allocation in succeeding:
+                remaining = allocation["amount_cents"]
+                sources = {}
+                for lot in available_lots:
+                    if lot[2] > allocation["allocation_date"] or lot[3] <= 0:
+                        continue
+                    take = min(remaining, lot[3])
+                    sources[lot[0]] = take
+                    lot[3] -= take
+                    remaining -= take
+                    if not remaining:
+                        break
+                if remaining:
+                    raise ValueError(
+                        f"{allocation['reference']} cannot be fully matched to an available "
+                        "withdrawal on or before its allocation date"
+                    )
+                new_sources[allocation["reference"]] = sources
+
+            source_events = {reference: [] for reference in allocations}
+            for reference, allocation in allocations.items():
+                redeposits = self.conn.execute(
+                    """SELECT s.redeposit_id event_id,SUM(s.amount_cents) amount_cents,
+                              d.transaction_time event_time
+                       FROM cash_redeposit_sources s
+                       JOIN cash_redeposits d ON d.id=s.redeposit_id
+                       WHERE s.allocation_id=?
+                       GROUP BY s.redeposit_id,d.transaction_time""", (allocation["id"],)
+                ).fetchall()
+                for row in redeposits:
+                    source_events[reference].append(
+                        (row["event_time"] or "", "redeposit", row["event_id"], row["amount_cents"])
+                    )
+                pool_returns = self.conn.execute(
+                    """SELECT s.transaction_id event_id,SUM(s.amount_cents) amount_cents,
+                              t.transaction_time event_time
+                       FROM cash_pool_return_sources s
+                       JOIN cash_allocation_transactions t ON t.id=s.transaction_id
+                       WHERE t.allocation_id=?
+                       GROUP BY s.transaction_id,t.transaction_time""", (allocation["id"],)
+                ).fetchall()
+                for row in pool_returns:
+                    source_events[reference].append(
+                        (row["event_time"] or "", "pool_return", row["event_id"], row["amount_cents"])
+                    )
+                if sum(event[3] for event in source_events[reference]) > allocation["amount_cents"]:
+                    raise ValueError(f"{reference} has overlapping return/deposit source records")
+
+            stamp = local_timestamp()
+            self.conn.execute("SAVEPOINT verified_wd_relink")
+            try:
+                for reference, allocation in allocations.items():
+                    allocation_id = allocation["id"]
+                    lots = [
+                        [withdrawals[wd_ref]["id"], amount]
+                        for wd_ref, amount in new_sources[reference].items()
+                    ]
+                    self.conn.execute(
+                        "DELETE FROM cash_allocation_sources WHERE allocation_id=?", (allocation_id,)
+                    )
+                    for withdrawal_id, amount in lots:
+                        self.conn.execute(
+                            """INSERT INTO cash_allocation_sources(
+                               allocation_id,withdrawal_id,amount_cents) VALUES(?,?,?)""",
+                            (allocation_id, withdrawal_id, amount),
+                        )
+                    self.conn.execute(
+                        "UPDATE cash_allocations SET withdrawal_id=? WHERE id=?",
+                        (lots[0][0], allocation_id),
+                    )
+
+                    event_lots = [lot[:] for lot in lots]
+                    for _event_time, kind, event_id, event_amount in sorted(source_events[reference]):
+                        if kind == "redeposit":
+                            self.conn.execute(
+                                "DELETE FROM cash_redeposit_sources WHERE redeposit_id=? AND allocation_id=?",
+                                (event_id, allocation_id),
+                            )
+                        else:
+                            self.conn.execute(
+                                "DELETE FROM cash_pool_return_sources WHERE transaction_id=?", (event_id,)
+                            )
+                        remaining = event_amount
+                        for lot in event_lots:
+                            take = min(remaining, lot[1])
+                            if take <= 0:
+                                continue
+                            if kind == "redeposit":
+                                self.conn.execute(
+                                    """INSERT INTO cash_redeposit_sources(
+                                       redeposit_id,allocation_id,withdrawal_id,amount_cents)
+                                       VALUES(?,?,?,?)""", (event_id, allocation_id, lot[0], take),
+                                )
+                            else:
+                                self.conn.execute(
+                                    """INSERT INTO cash_pool_return_sources(
+                                       transaction_id,withdrawal_id,amount_cents) VALUES(?,?,?)""",
+                                    (event_id, lot[0], take),
+                                )
+                            lot[1] -= take
+                            remaining -= take
+                            if not remaining:
+                                break
+                        if remaining:
+                            raise ValueError(f"{reference} return/deposit trail exceeds its new sources")
+
+                    old_text = ", ".join(
+                        f"{ref} {money(amount)}" for ref, amount in old_sources[reference].items()
+                    )
+                    new_text = ", ".join(
+                        f"{ref} {money(amount)}" for ref, amount in new_sources[reference].items()
+                    )
+                    self.conn.execute(
+                        """INSERT INTO audit_log(project_id,action,details,created_at)
+                           VALUES(?,'CASH_ALLOCATION_WD_REFERENCE_REPAIRED',?,?)""",
+                        (allocation["project_id"],
+                         f"{reference}: {old_text} -> {new_text}; amounts unchanged", stamp),
+                    )
+
+                payload = json.dumps({
+                    "applied_at": stamp,
+                    "allocations": new_sources,
+                    "post_boundary_unallocated_cents": sum(lot[3] for lot in available_lots),
+                    "cutoff_date": "2026-08-24",
+                    "backup": str(self.wd_reference_migration_backup),
+                }, separators=(",", ":"))
+                self.conn.execute(
+                    "INSERT INTO app_metadata(key,value,updated_at) VALUES(?,?,?)",
+                    (marker, payload, stamp),
+                )
+                self.conn.execute(
+                    """INSERT INTO app_metadata(key,value,updated_at)
+                       VALUES('cash_allocation_wd_cutoff','2026-08-24',?)
+                       ON CONFLICT(key) DO UPDATE SET
+                           value=excluded.value,updated_at=excluded.updated_at""", (stamp,)
+                )
+                self.conn.execute("RELEASE SAVEPOINT verified_wd_relink")
+            except Exception:
+                self.conn.execute("ROLLBACK TO SAVEPOINT verified_wd_relink")
+                self.conn.execute("RELEASE SAVEPOINT verified_wd_relink")
+                raise
+            self.wd_reference_repair_status = (
+                "applied",
+                f"{len(allocations)} PC/DP allocations were linked successively from the verified "
+                "24 August 2026 boundary; all amounts stayed unchanged.",
+            )
+        except (sqlite3.Error, ValueError) as exc:
+            block(f"WD-reference repair was not applied: {exc}. No references were changed.")
 
     def _backfill_shared_cash_references(self):
         """Add stable audit references without changing any financial amounts."""
@@ -3531,14 +3909,25 @@ class Database:
         )["total"]
         return max(0, withdrawal["amount_cents"] - allocated + released)
 
-    def fifo_withdrawal_sources(self, amount_cents: int):
-        """Reserve an amount across the oldest withdrawals with remaining capacity."""
+    def fifo_withdrawal_sources(self, amount_cents: int, allocation_date: str | None = None):
+        """Reserve cash from valid unallocated withdrawals in traceable date order."""
         if amount_cents <= 0:
             raise ValueError("Allocation amount must be positive.")
         remaining, sources = amount_cents, []
+        cutoff_row = self.one(
+            "SELECT value FROM app_metadata WHERE key='cash_allocation_wd_cutoff'"
+        )
+        where = ["type='Withdrawal'", "voided=0"]
+        params = []
+        if cutoff_row and cutoff_row["value"]:
+            where.append("txn_date>=?")
+            params.append(cutoff_row["value"])
+        if allocation_date:
+            where.append("txn_date<=?")
+            params.append(allocation_date)
         rows = self.all(
-            """SELECT id,system_reference,txn_date FROM remittances
-               WHERE type='Withdrawal' AND voided=0 ORDER BY txn_date,id"""
+            f"""SELECT id,system_reference,txn_date FROM remittances
+                WHERE {' AND '.join(where)} ORDER BY txn_date,id""", tuple(params)
         )
         for row in rows:
             available = self.withdrawal_available(row["id"])
@@ -3693,7 +4082,7 @@ class Database:
             raise ValueError("Allocation amount must be positive.")
         if amount_cents > self.unallocated_cash():
             raise ValueError("This amount exceeds total unallocated cash on-hand.")
-        sources = self.fifo_withdrawal_sources(amount_cents)
+        sources = self.fifo_withdrawal_sources(amount_cents, allocation_date)
         withdrawal_id = sources[0][0]
         if allocation_type == "Petty Cash":
             count = self.one(
@@ -16136,6 +16525,17 @@ class ContractorApp(tk.Tk):
             tab.place(x=0, y=0, relwidth=1, relheight=1)
         self.show_page("Dashboard")
         self.load_projects()
+        repair_state, repair_message = self.db.wd_reference_repair_status
+        if repair_state == "applied" and os.environ.get("CONTRACTOR_SMOKE_TEST") != "1":
+            self.after_idle(lambda: messagebox.showinfo(
+                "Withdrawal references repaired",
+                repair_message + "\n\nA timestamped database backup was saved beside the live database.",
+                parent=self,
+            ))
+        elif repair_state == "blocked" and os.environ.get("CONTRACTOR_SMOKE_TEST") != "1":
+            self.after_idle(lambda: messagebox.showwarning(
+                "Withdrawal-reference repair safely skipped", repair_message, parent=self
+            ))
 
     def show_page(self, name):
         page = getattr(self, "pages", {}).get(name)
