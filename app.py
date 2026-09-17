@@ -27,6 +27,7 @@ from xml.sax.saxutils import escape as xml_escape
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
+from contextlib import nullcontext
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -1211,6 +1212,7 @@ EXPENSE_IMPORT_HEADERS = (
     ("expense_date", "Expense Date*"),
     ("notes", "Notes"),
     ("source_reference", "Source Reference"),
+    ('funding_project','Funding Project (blank = expense project)'),
 )
 
 EXPENSE_IMPORT_REQUIRED_FIELDS = (
@@ -1276,7 +1278,7 @@ def write_expense_import_xlsx(path, draft_reference, reference_lists):
             style = 5 if index in {4, 5, 9} else 4
             cells.append(_xlsx_inline_cell(f"{letter}{row_number}", "", style))
         cells.append(
-            f'<c r="Q{row_number}" s="5"><f>IF(OR(E{row_number}="",F{row_number}=""),"",E{row_number}*F{row_number})</f></c>'
+            f'<c r="R{row_number}" s="5"><f>IF(OR(E{row_number}="",F{row_number}=""),"",E{row_number}*F{row_number})</f></c>'
         )
         rows.append(f'<row r="{row_number}">' + ''.join(cells) + '</row>')
 
@@ -1305,7 +1307,7 @@ def write_expense_import_xlsx(path, draft_reference, reference_lists):
 
     validation_map = [
         ("A7:A506", 0), ("G7:G506", 1), ("H7:H506", 2),
-        ("I7:I506", 3), ("K7:K506", 4), ("L7:L506", 5), ("M7:M506", 6),
+        ("I7:I506", 3), ("K7:K506", 4), ("L7:L506", 5), ("M7:M506", 6), ('Q7:Q506',0),
     ]
     range_names = (
         "ProjectOptions", "PhaseOptions", "CategoryOptions",
@@ -1316,7 +1318,7 @@ def write_expense_import_xlsx(path, draft_reference, reference_lists):
         key, _title = list_order[list_index]
         formula = range_names[list_index]
         validations.append(
-            f'<dataValidation type="list" allowBlank="0" showErrorMessage="1" '
+            f'<dataValidation type="list" allowBlank="{1 if target=="Q7:Q506" else 0}" showErrorMessage="1" '
             f'errorStyle="stop" errorTitle="Invalid selection" '
             f'error="Choose a value from this workbook dropdown." sqref="{target}">'
             f'<formula1>{formula}</formula1></dataValidation>'
@@ -1330,10 +1332,10 @@ def write_expense_import_xlsx(path, draft_reference, reference_lists):
     sheet_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
 <sheetViews><sheetView workbookViewId="0"><pane ySplit="6" topLeftCell="A7" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>
-<cols>{''.join(f'<col min="{i+1}" max="{i+1}" width="{width}" customWidth="1"/>' for i, width in enumerate([24,30,18,24,12,14,20,20,18,15,18,30,36,15,30,20,18]))}</cols>
+<cols>{''.join(f'<col min="{i+1}" max="{i+1}" width="{width}" customWidth="1"/>' for i, width in enumerate([24,30,18,24,12,14,20,20,18,15,18,30,36,15,30,20,30,18]))}</cols>
 <sheetData>{''.join(rows)}</sheetData>
-<autoFilter ref="A6:Q506"/>
-<mergeCells count="2"><mergeCell ref="A1:Q1"/><mergeCell ref="A4:Q4"/></mergeCells>
+<autoFilter ref="A6:R506"/>
+<mergeCells count="2"><mergeCell ref="A1:R1"/><mergeCell ref="A4:R4"/></mergeCells>
 <dataValidations count="{len(validations)}">{''.join(validations)}</dataValidations>
 <pageMargins left="0.25" right="0.25" top="0.5" bottom="0.5" header="0.2" footer="0.2"/>
 </worksheet>'''
@@ -1609,7 +1611,7 @@ try {
 
 
 def compute_shift_pay(clock_in: datetime, clock_out: datetime, daily_rate_cents: int,
-                      day_type: str = "Ordinary Day") -> dict:
+                      day_type: str = "Ordinary Day", *, regular_limit=Decimal('8')) -> dict:
     """Calculate paid time, lunch exclusion, regular time, and Philippine OT premiums."""
     if clock_out <= clock_in:
         raise ValueError("Time out must be later than time in.")
@@ -1624,8 +1626,8 @@ def compute_shift_pay(clock_in: datetime, clock_out: datetime, daily_rate_cents:
             lunch_seconds += Decimal(str((overlap_end - overlap_start).total_seconds()))
         work_day += timedelta(days=1)
     paid_hours = max(Decimal("0"), (elapsed_seconds - lunch_seconds) / Decimal("3600"))
-    regular_hours = min(Decimal("8"), paid_hours)
-    overtime_hours = max(Decimal("0"), paid_hours - Decimal("8"))
+    regular_hours = min(max(Decimal('0'),Decimal(regular_limit)), paid_hours)
+    overtime_hours = max(Decimal("0"), paid_hours - regular_hours)
     daily_rate = Decimal(daily_rate_cents)
     hourly_rate = daily_rate / Decimal("8")
     normalized = (day_type or "Ordinary Day").strip().lower()
@@ -1665,6 +1667,9 @@ def verify_pin(pin: str, salt_hex: str, digest_hex: str) -> bool:
     return secrets.compare_digest(candidate, digest_hex)
 
 
+WD_RELINK_REVIEW_20260917 = json.loads('''{"allocations":{"PC-20260825-0001":{"amount":10000000,"date":"2026-08-25","old":{"WD-20260522-0001":9434100,"WD-20260530-0001":565900},"new":{"WD-20260824-0001":10000000}},"PC-20260824-0001":{"amount":5000000,"date":"2026-08-24","old":{"WD-20260530-0001":1434100,"WD-20260604-0001":3565900},"new":{"WD-20260824-0002":5000000}},"PC-20260824-0002":{"amount":5000000,"date":"2026-08-24","old":{"WD-20260604-0001":5000000},"new":{"WD-20260824-0002":5000000}},"DP-20260827-0001":{"amount":2250000,"date":"2026-08-27","old":{"WD-20260604-0001":1434100,"WD-20260610-0001":815900},"new":{"WD-20260826-0001":2250000}},"DP-20260828-0001":{"amount":8407500,"date":"2026-08-28","old":{"WD-20260610-0001":2189500,"WD-20260611-0001":5000000,"WD-20260615-0001":1001600,"WD-20260615-0002":216400},"new":{"WD-20260828-0001":8407500}},"DP-20260901-0001":{"amount":5000000,"date":"2026-09-01","old":{"WD-20260615-0002":785200,"WD-20260615-0003":4214800},"new":{"WD-20260831-0001":5000000}},"DP-20260901-0002":{"amount":5009000,"date":"2026-09-01","old":{"WD-20260615-0003":785200,"WD-20260617-0001":4223800},"new":{"WD-20260901-0001":5009000}},"PC-20260904-0001":{"amount":10000000,"date":"2026-09-04","old":{"WD-20260617-0001":776200,"WD-20260623-0001":5000000,"WD-20260624-0001":4223800},"new":{"WD-20260901-0002":10000000}},"DP-20260904-0001":{"amount":6305000,"date":"2026-09-04","old":{"WD-20260624-0001":6305000},"new":{"WD-20260904-0001":6305000}},"DP-20260905-0001":{"amount":2188800,"date":"2026-09-05","old":{"WD-20260624-0001":2188800},"new":{"WD-20260905-0001":2188800}},"PC-20260905-0001":{"amount":2811200,"date":"2026-09-05","old":{"WD-20260624-0001":2282400,"WD-20260629-0001":528800},"new":{"WD-20260905-0001":2811200}},"DP-20260907-0001":{"amount":3700000,"date":"2026-09-07","old":{"WD-20260629-0001":3700000},"new":{"WD-20260907-0001":3700000}},"DP-20260907-0002":{"amount":3700000,"date":"2026-09-07","old":{"WD-20260629-0001":771200,"WD-20260702-0001":2928800},"new":{"WD-20260907-0001":3700000}},"DP-20260908-0001":{"amount":3700000,"date":"2026-09-08","old":{"WD-20260629-0001":3700000},"new":{"WD-20260908-0001":3700000}},"PC-20260908-0001":{"amount":5000000,"date":"2026-09-08","old":{"WD-20260629-0001":771200,"WD-20260702-0001":4228800},"new":{"WD-20260901-0002":5000000}},"PC-20260908-0002":{"amount":20000000,"date":"2026-09-08","old":{"WD-20260702-0001":771200,"WD-20260704-0001":5000000,"WD-20260706-0001":3005400,"WD-20260706-0002":5000000,"WD-20260710-0001":6223400},"new":{"WD-20260908-0002":20000000}},"PC-20260908-0003":{"amount":10000000,"date":"2026-09-08","old":{"WD-20260710-0001":3776600,"WD-20260713-0001":6223400},"new":{"WD-20260908-0003":10000000}},"DP-20260912-0001":{"amount":9032500,"date":"2026-09-12","old":{"WD-20260713-0001":3776600,"WD-20260717-0001":5255900},"new":{"WD-20260912-0001":9032500}},"DP-20260914-0001":{"amount":6325000,"date":"2026-09-14","old":{"WD-20260624-0001":6305000,"WD-20260717-0001":20000},"new":{"WD-20260904-0001":6325000}},"PC-20260916-0001":{"amount":5000000,"date":"2026-09-16","old":{"WD-20260717-0001":4724100,"WD-20260722-0001":275900},"new":{"WD-20260916-0001":5000000}},"PC-20260916-0002":{"amount":5000000,"date":"2026-09-16","old":{"WD-20260722-0001":5000000},"new":{"WD-20260916-0001":5000000}}},"withdrawals":{"WD-20260824-0001":{"amount":10000000,"date":"2026-08-24","voided":0},"WD-20260824-0002":{"amount":10000000,"date":"2026-08-24","voided":0},"WD-20260826-0001":{"amount":2250000,"date":"2026-08-26","voided":0},"WD-20260828-0001":{"amount":8407500,"date":"2026-08-28","voided":0},"WD-20260831-0001":{"amount":5000000,"date":"2026-08-31","voided":0},"WD-20260901-0001":{"amount":5009000,"date":"2026-09-01","voided":0},"WD-20260901-0002":{"amount":15000000,"date":"2026-09-01","voided":0},"WD-20260904-0001":{"amount":6325000,"date":"2026-09-04","voided":0},"WD-20260905-0001":{"amount":5000000,"date":"2026-09-05","voided":0},"WD-20260907-0001":{"amount":3700000,"date":"2026-09-07","voided":1},"WD-20260908-0001":{"amount":3700000,"date":"2026-09-08","voided":0},"WD-20260908-0002":{"amount":20000000,"date":"2026-09-08","voided":0},"WD-20260908-0003":{"amount":10000000,"date":"2026-09-08","voided":0},"WD-20260912-0001":{"amount":9032500,"date":"2026-09-12","voided":0},"WD-20260916-0001":{"amount":10000000,"date":"2026-09-16","voided":0}},"unresolved":[],"cancelled_duplicates":["DP-20260907-0001","DP-20260907-0002"]}''')
+
+
 class Database:
     def __init__(self, path: Path | str | None = DB_PATH):
         self.path = resolve_db_path(path)
@@ -1672,11 +1677,50 @@ class Database:
         self.migration_backup = self._backup_before_shared_cash_migration()
         self.v120_migration_backup = self._backup_before_v120_migration()
         self.wd_reference_migration_backup = self._backup_before_wd_reference_repair()
+        self.project_funding_backup = self._backup_before_project_funding()
+        self.updated_wd_repair_backup = self._backup_before_updated_wd_repair()
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
         self._create_schema()
+
+    def _backup_before_project_funding(self):
+        """Back up an existing database once before additive funding tables."""
+        path = Path(self.path)
+        if not path.exists() or not path.stat().st_size:
+            return None
+        source=sqlite3.connect(path)
+        try:
+            if source.execute("SELECT 1 FROM sqlite_master WHERE name='project_funding_loans'").fetchone():
+                return None
+            target = path.with_name(path.stem + '_before_project_funding_' +
+                                    datetime.now().strftime('%Y%m%d_%H%M%S_%f') + '.db')
+            backup=sqlite3.connect(target)
+            try:
+                source.backup(backup)
+            finally:
+                backup.close()
+        finally:
+            source.close()
+        return target
+
+    def _backup_before_updated_wd_repair(self):
+        path=Path(self.path)
+        if not path.exists() or not path.stat().st_size:return None
+        probe=None;target=None
+        try:
+            probe=sqlite3.connect(path)
+            if not probe.execute("SELECT 1 FROM sqlite_master WHERE name='app_metadata'").fetchone():return None
+            if probe.execute("SELECT 1 FROM app_metadata WHERE key='reviewed_wd_relink_20260917'").fetchone():return None
+            if not probe.execute("SELECT 1 FROM cash_allocations WHERE reference='PC-20260825-0001'").fetchone():return None
+            backup=path.with_name(path.stem+'_before_wd_relink_20260917_'+datetime.now().strftime('%Y%m%d_%H%M%S_%f')+'.db')
+            target=sqlite3.connect(backup);probe.backup(target)
+            return backup
+        except (OSError,sqlite3.Error):return None
+        finally:
+            if target:target.close()
+            if probe:probe.close()
 
     def _backup_before_shared_cash_migration(self):
         """Create one recoverable copy before the shared-cash/reference upgrade."""
@@ -2257,6 +2301,44 @@ class Database:
         self._ensure_column("payments", "transaction_time", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("payments", "created_at", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("payments", "accounting_excluded", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("payments", "funding_project_id", "INTEGER REFERENCES projects(id)")
+        self._ensure_column("expenses", "funding_project_id", "INTEGER REFERENCES projects(id)")
+        self.conn.executescript("""
+        CREATE TABLE IF NOT EXISTS payroll_week_plans (
+            id INTEGER PRIMARY KEY, employee_id INTEGER NOT NULL REFERENCES employees(id),
+            period_start TEXT NOT NULL, period_end TEXT NOT NULL,
+            attendance_signature TEXT NOT NULL, gross_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(employee_id,period_start)
+        );
+        CREATE TABLE IF NOT EXISTS payroll_week_ca_shares (
+            id INTEGER PRIMARY KEY, plan_id INTEGER NOT NULL REFERENCES payroll_week_plans(id) ON DELETE CASCADE,
+            project_id INTEGER NOT NULL REFERENCES projects(id),
+            advance_id INTEGER NOT NULL REFERENCES cash_advances(id),
+            schedule_id INTEGER NOT NULL REFERENCES cash_advance_transactions(id),
+            amount_cents INTEGER NOT NULL CHECK(amount_cents>0),
+            payroll_batch_id INTEGER REFERENCES payroll_batches(id),
+            UNIQUE(plan_id,project_id,schedule_id)
+        );
+        CREATE TABLE IF NOT EXISTS project_funding_loans (
+            id INTEGER PRIMARY KEY, reference TEXT NOT NULL UNIQUE,
+            lender_project_id INTEGER NOT NULL REFERENCES projects(id),
+            borrower_project_id INTEGER NOT NULL REFERENCES projects(id),
+            expense_id INTEGER REFERENCES expenses(id), payment_id INTEGER UNIQUE REFERENCES payments(id),
+            ca_share_id INTEGER UNIQUE REFERENCES payroll_week_ca_shares(id) ON DELETE SET NULL,
+            payroll_batch_id INTEGER REFERENCES payroll_batches(id),
+            amount_cents INTEGER NOT NULL CHECK(amount_cents>0), loan_date TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'Expense funding', notes TEXT NOT NULL DEFAULT '',
+            CHECK(lender_project_id<>borrower_project_id)
+        );
+        CREATE TABLE IF NOT EXISTS project_funding_repayments (
+            id INTEGER PRIMARY KEY, loan_id INTEGER NOT NULL REFERENCES project_funding_loans(id),
+            amount_cents INTEGER NOT NULL CHECK(amount_cents>0), repayment_date TEXT NOT NULL,
+            reference TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '',
+            authorized_by_head_id INTEGER REFERENCES project_heads(id),
+            voided INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
         self._ensure_column("expenses", "default_cash_allocation_id", "INTEGER")
         self._ensure_column("expenses", "expense_batch_id", "INTEGER")
         self._ensure_column("expenses", "created_at", "TEXT NOT NULL DEFAULT ''")
@@ -2506,7 +2588,11 @@ class Database:
         self._backfill_shared_cash_references()
         self._migrate_cash_repayment_surrenders()
         self._migrate_v120_payroll_deductions()
-        self._migrate_verified_wd_allocation_references()
+        self._ensure_column('cash_allocations','source_selection_mode',"TEXT NOT NULL DEFAULT ''")
+        if self.one("SELECT 1 FROM cash_allocations WHERE reference='PC-20260916-0002'"):
+            self._migrate_updated_wd_allocation_references()
+        else:
+            self._migrate_verified_wd_allocation_references()
         # Preserve the employee and daily details of every existing committed
         # payroll before any future reopen operation detaches its live attendance.
         for payroll in self.conn.execute(
@@ -2855,6 +2941,119 @@ class Database:
             )
         except (sqlite3.Error, ValueError) as exc:
             block(f"WD-reference repair was not applied: {exc}. No references were changed.")
+
+    def _migrate_updated_wd_allocation_references(self):
+        """Apply the reviewed September backup, including returned-DP reuse.
+
+        Only source links change. The user-confirmed September 7 duplicates
+        are linked for audit only to their cancelled withdrawal, with zero net
+        usage because both were fully returned before the withdrawal was voided.
+        """
+        marker='reviewed_wd_relink_20260917'
+        if self.one('SELECT 1 FROM app_metadata WHERE key=?',(marker,)):
+            self.wd_reference_repair_status=('already_applied','September 17 reference review already applied.');return
+        if not self.one("SELECT 1 FROM cash_allocations WHERE reference='PC-20260916-0002'"):return
+        review=WD_RELINK_REVIEW_20260917
+        try:
+            if not self.updated_wd_repair_backup:raise ValueError('A safety backup could not be created')
+            allocations={};withdrawals={};new_sources={};old_sources={}
+            for ref,spec in review['allocations'].items():
+                row=self.one('SELECT * FROM cash_allocations WHERE reference=?',(ref,))
+                if not row or row['voided'] or (row['amount_cents'],row['allocation_date'])!=(spec['amount'],spec['date']):
+                    raise ValueError(f'{ref} no longer matches the reviewed amount/date/active record')
+                old={s['system_reference']:s['amount_cents'] for s in self.all("""SELECT r.system_reference,s.amount_cents
+                    FROM cash_allocation_sources s JOIN remittances r ON r.id=s.withdrawal_id WHERE s.allocation_id=?""",(row['id'],))}
+                if old not in (spec['old'],spec['new']):raise ValueError(f'{ref} source links were manually changed after the reviewed backup')
+                allocations[ref]=row;old_sources[ref]=old;new_sources[ref]=spec['new'].copy()
+                if ref in review.get('cancelled_duplicates',[]):
+                    returned=self.one("SELECT COALESCE(SUM(amount_cents),0) n FROM cash_allocation_transactions WHERE allocation_id=? AND txn_type='Returned to Shared Pool' AND voided=0",(row['id'],))['n']
+                    if returned!=row['amount_cents'] or self.allocation_spent(row['id'])!=0:
+                        raise ValueError(f'{ref} is not a fully returned, unspent cancelled attempt')
+            for ref,spec in review['withdrawals'].items():
+                row=self.one("SELECT * FROM remittances WHERE system_reference=? AND type='Withdrawal'",(ref,))
+                if not row or (row['amount_cents'],row['txn_date'],row['voided'])!=(spec['amount'],spec['date'],spec.get('voided',0)):
+                    raise ValueError(f'{ref} no longer matches the reviewed withdrawal')
+                withdrawals[ref]=row
+            candidates=self.all("""SELECT * FROM remittances WHERE type='Withdrawal' AND voided=0
+                AND txn_date>='2026-08-24' ORDER BY txn_date,id""")
+            withdrawals.update({r['system_reference']:r for r in candidates})
+            ids=tuple(a['id'] for a in allocations.values());marks=','.join('?' for _ in ids)
+            protected={r['withdrawal_id']:r['n'] for r in self.all(f"""SELECT s.withdrawal_id,SUM(s.amount_cents) n
+                FROM cash_allocation_sources s JOIN cash_allocations a ON a.id=s.allocation_id
+                WHERE a.voided=0 AND a.id NOT IN ({marks}) GROUP BY s.withdrawal_id""",ids)}
+            for r in self.all(f"""SELECT s.withdrawal_id,SUM(s.amount_cents) n FROM cash_pool_return_sources s
+                JOIN cash_allocation_transactions t ON t.id=s.transaction_id JOIN cash_allocations a ON a.id=t.allocation_id
+                WHERE t.voided=0 AND a.voided=0 AND t.txn_type='Returned to Shared Pool'
+                AND a.id NOT IN ({marks}) GROUP BY s.withdrawal_id""",ids):
+                protected[r['withdrawal_id']]=protected.get(r['withdrawal_id'],0)-r['n']
+            event_map={}
+            def source_events(row):
+                events=[]
+                for event in self.all("""SELECT s.redeposit_id id,SUM(s.amount_cents) amount,d.voided,d.transaction_time stamp
+                    FROM cash_redeposit_sources s JOIN cash_redeposits d ON d.id=s.redeposit_id
+                    WHERE s.allocation_id=? GROUP BY s.redeposit_id""",(row['id'],)):
+                    events.append(dict(event,kind='redeposit'))
+                for event in self.all("""SELECT t.id,SUM(s.amount_cents) amount,t.voided,t.transaction_time stamp
+                    FROM cash_pool_return_sources s JOIN cash_allocation_transactions t ON t.id=s.transaction_id
+                    WHERE t.allocation_id=? GROUP BY t.id""",(row['id'],)):
+                    events.append(dict(event,kind='pool_return'))
+                if sum(e['amount'] for e in events if not e['voided'])>row['amount_cents']:
+                    raise ValueError(f"{row['reference']} has overlapping active return/deposit trails")
+                return sorted(events,key=lambda e:(e['stamp'],e['id']))
+            # A returned allocation releases its source lots; surrender/redeposit does not.
+            usage={}
+            for ref,row in allocations.items():
+                events=source_events(row);event_map[ref]=events
+                lots=[[wd,amount] for wd,amount in new_sources[ref].items()]
+                for wd,amount in lots:usage[wd]=usage.get(wd,0)+amount
+                for event in events:
+                    event_lots=[lot[:] for lot in lots] if event['voided'] else lots
+                    left=event['amount'];splits=[]
+                    for lot in event_lots:
+                        take=min(left,lot[1])
+                        if take:splits.append((lot[0],take));lot[1]-=take;left-=take
+                        if not left:break
+                    if left:raise ValueError(f'{ref} return/deposit cannot be traced to its replacement sources')
+                    event['splits']=splits
+                    if not event['voided'] and event['kind']=='pool_return':
+                        for wd,amount in splits:usage[wd]-=amount
+            for wd,row in withdrawals.items():
+                if row['voided'] and usage.get(wd,0)+protected.get(row['id'],0)!=0:
+                    raise ValueError(f'{wd} is cancelled and must have zero net allocation usage')
+                if usage.get(wd,0)+protected.get(row['id'],0)>row['amount_cents']:
+                    raise ValueError(f'{wd} would be over-allocated after accounting for pool returns')
+            # Do not guess or overwrite newer client entries. They retain their
+            # recorded trail; all future issuance uses explicit manual sources.
+            stamp=local_timestamp()
+            self.conn.execute('SAVEPOINT reviewed_wd_relink')
+            try:
+                for ref,row in allocations.items():
+                    self.conn.execute('DELETE FROM cash_allocation_sources WHERE allocation_id=?',(row['id'],))
+                    self.conn.executemany('INSERT INTO cash_allocation_sources(allocation_id,withdrawal_id,amount_cents) VALUES(?,?,?)',
+                        [(row['id'],withdrawals[wd]['id'],amount) for wd,amount in new_sources[ref].items()])
+                    first=withdrawals[next(iter(new_sources[ref]))]['id']
+                    self.conn.execute("UPDATE cash_allocations SET withdrawal_id=?,source_selection_mode='Reviewed 2026-09-17' WHERE id=?",(first,row['id']))
+                    for event in event_map[ref]:
+                        if event['kind']=='pool_return':
+                            self.conn.execute('DELETE FROM cash_pool_return_sources WHERE transaction_id=?',(event['id'],))
+                            self.conn.executemany('INSERT INTO cash_pool_return_sources(transaction_id,withdrawal_id,amount_cents) VALUES(?,?,?)',
+                                [(event['id'],withdrawals[wd]['id'],amount) for wd,amount in event['splits']])
+                        else:
+                            self.conn.execute('DELETE FROM cash_redeposit_sources WHERE redeposit_id=? AND allocation_id=?',(event['id'],row['id']))
+                            self.conn.executemany('INSERT INTO cash_redeposit_sources(redeposit_id,allocation_id,withdrawal_id,amount_cents) VALUES(?,?,?,?)',
+                                [(event['id'],row['id'],withdrawals[wd]['id'],amount) for wd,amount in event['splits']])
+                    self.conn.execute("INSERT INTO audit_log(project_id,action,details) VALUES(?,'REVIEWED_WD_LINK_REPAIRED',?)",
+                        (row['project_id'],f'{ref}: {json.dumps(old_sources[ref],sort_keys=True)} -> {json.dumps(new_sources[ref],sort_keys=True)}; financial amounts unchanged'))
+                payload=json.dumps(dict(applied_at=stamp,allocations=new_sources,unresolved=review['unresolved'],backup=str(self.updated_wd_repair_backup)))
+                self.conn.execute('INSERT INTO app_metadata(key,value,updated_at) VALUES(?,?,?)',(marker,payload,stamp))
+                self.conn.execute("INSERT OR IGNORE INTO app_metadata(key,value,updated_at) VALUES('verified_wd_allocation_relink_20260909',?,?)",(json.dumps({'superseded_by':marker}),stamp))
+                self.conn.execute("INSERT INTO app_metadata(key,value,updated_at) VALUES('cash_allocation_wd_cutoff','2026-08-24',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",(stamp,))
+                self.conn.execute('RELEASE SAVEPOINT reviewed_wd_relink')
+            except Exception:
+                self.conn.execute('ROLLBACK TO SAVEPOINT reviewed_wd_relink');self.conn.execute('RELEASE SAVEPOINT reviewed_wd_relink');raise
+            self.wd_reference_repair_status=('applied','21 reviewed PC/DP references repaired; all financial amounts retained. The two cancelled 7 September DP attempts are linked to the voided withdrawal for audit only, with zero net cash usage. New allocations require manual withdrawal sources.')
+        except (sqlite3.Error,ValueError) as exc:
+            self.wd_reference_repair_status=('blocked',f'September reference repair was safely skipped: {exc}. No September-review links changed.')
 
     def _backfill_shared_cash_references(self):
         """Add stable audit references without changing any financial amounts."""
@@ -3802,6 +4001,170 @@ class Database:
                  AND t.txn_type IN ('Cash Repayment','Bank Repayment','Repayment')""", (project_id,)
         )["total"]
 
+    def project_cost_budget(self, project_id: int):
+        """Contract spending limit; deliberately independent of deposits/cash."""
+        project = self.one("SELECT contract_value_cents FROM projects WHERE id=?", (project_id,))
+        if not project:
+            raise ValueError("Select an existing project.")
+        committed = self.project_commitment_budget(project_id)[1]
+        for loan in self.interproject_loans(project_id):
+            if loan['kind']=='CA recovery':
+                committed += -loan['amount_cents'] if loan['lender_project_id']==project_id else loan['amount_cents']
+        return project['contract_value_cents'], committed, project['contract_value_cents'] - committed
+
+    def interproject_loans(self, project_id=None, include_inactive=False):
+        rows = self.all("""SELECT l.*,lp.name lender,bp.name borrower,e.name expense_name,
+            COALESCE((SELECT SUM(r.amount_cents) FROM project_funding_repayments r
+                      WHERE r.loan_id=l.id AND r.voided=0),0) repaid_cents,
+            CASE WHEN l.kind='CA recovery' THEN
+                CASE WHEN pb.status='Committed' AND e.voided=0 THEN 1 ELSE 0 END
+            ELSE CASE WHEN p.accounting_excluded=0 AND e.voided=0 THEN 1 ELSE 0 END END active
+            FROM project_funding_loans l JOIN projects lp ON lp.id=l.lender_project_id
+            JOIN projects bp ON bp.id=l.borrower_project_id
+            LEFT JOIN expenses e ON e.id=l.expense_id LEFT JOIN payments p ON p.id=l.payment_id
+            LEFT JOIN payroll_batches pb ON pb.id=l.payroll_batch_id
+            WHERE (? IS NULL OR l.lender_project_id=? OR l.borrower_project_id=?)
+            ORDER BY l.loan_date DESC,l.id DESC""", (project_id,project_id,project_id))
+        result = []
+        for source in rows:
+            row = dict(source)
+            # A corrected payment may retain the reference with a revised amount.
+            row['outstanding_cents'] = max(0,row['amount_cents']-row['repaid_cents']) if row['active'] else 0
+            if include_inactive or row['active']:
+                result.append(row)
+        return result
+
+    def interproject_balance(self, project_id):
+        rows = self.interproject_loans(project_id)
+        return (sum(r['outstanding_cents'] for r in rows if r['lender_project_id']==project_id),
+                sum(r['outstanding_cents'] for r in rows if r['borrower_project_id']==project_id))
+
+    def _funding_cash_adjustment(self, project_id):
+        """Move expense funding to the lender; CA cash was already paid there."""
+        adjustment = 0
+        for row in self.interproject_loans(project_id):
+            if row['kind']=='Expense funding':
+                adjustment += row['amount_cents'] if row['lender_project_id']==project_id else -row['amount_cents']
+            adjustment += -row['repaid_cents'] if row['lender_project_id']==project_id else row['repaid_cents']
+        return adjustment
+
+    def project_funding_budget(self,project_id):
+        deposited,committed,_remaining=self.project_commitment_budget(project_id)
+        reserved=committed+self._funding_cash_adjustment(project_id)
+        return deposited,reserved,deposited-reserved
+
+    def _sync_project_funding_loan(self, payment_id):
+        payment = self.one("""SELECT p.*,e.project_id expense_project,e.voided expense_voided
+            FROM payments p JOIN expenses e ON e.id=p.expense_id WHERE p.id=?""",(payment_id,))
+        old = self.one("SELECT * FROM project_funding_loans WHERE payment_id=?",(payment_id,))
+        lender = payment['funding_project_id'] or payment['expense_project']
+        if old and self.one("SELECT 1 FROM project_funding_repayments WHERE loan_id=? AND voided=0",(old['id'],)):
+            if lender!=old['lender_project_id'] or payment['amount_cents']!=old['amount_cents'] or payment['expense_project']!=old['borrower_project_id']:
+                raise ValueError("Undo the inter-project repayment before changing its funding project or amount.")
+        if lender == payment['expense_project']:
+            if old:
+                # Preserve the audit row but make it inactive through the payment link.
+                self.conn.execute("UPDATE project_funding_loans SET payment_id=NULL,notes=notes||' | Funding corrected to own project' WHERE id=?",(old['id'],))
+            return
+        if old:
+            self.conn.execute("UPDATE project_funding_loans SET lender_project_id=?,borrower_project_id=?,amount_cents=?,loan_date=? WHERE id=?",
+                (lender,payment['expense_project'],payment['amount_cents'],payment['payment_date'],old['id']))
+        else:
+            reference=self._next_system_reference('IPL','project_funding_loans','reference',payment['payment_date'])
+            self.conn.execute("""INSERT INTO project_funding_loans(reference,lender_project_id,
+                borrower_project_id,expense_id,payment_id,amount_cents,loan_date,notes)
+                VALUES(?,?,?,?,?,?,?,?)""",(reference,lender,payment['expense_project'],payment['expense_id'],
+                payment_id,payment['amount_cents'],payment['payment_date'],payment['notes']))
+            self.conn.execute("INSERT INTO audit_log(project_id,action,details) VALUES(?,?,?)",
+                (lender,'INTERPROJECT_FUNDING',f"{reference}: {money(payment['amount_cents'])} paid for expense #{payment['expense_id']} in project #{payment['expense_project']}"))
+
+    def record_project_payment(self, expense_id, amount_cents, payment_date, method,
+                               authorized_by_head_id, funding_project_id=None,
+                               cash_allocation_id=None, bank_account_id=None,
+                               reference='', notes='', _within_transaction=False):
+        expense=self.one('SELECT * FROM expenses WHERE id=?',(expense_id,))
+        if not expense or expense['voided']:
+            raise ValueError('Select an active expense.')
+        funding_project_id=funding_project_id or expense['funding_project_id'] or expense['project_id']
+        if not self.project_is_active(funding_project_id):
+            raise ValueError('Select an active funding project.')
+        valid_date(payment_date,True)
+        paid=self.one('SELECT COALESCE(SUM(amount_cents),0) n FROM payments WHERE expense_id=? AND accounting_excluded=0',(expense_id,))['n']
+        if amount_cents<=0 or paid+amount_cents>expense['total_cents']:
+            raise ValueError('Payment must be positive and no greater than the outstanding expense.')
+        self.validate_payment_source(funding_project_id,amount_cents,method,bank_account_id,cash_allocation_id,
+                                    require_cash_allocation='bank' not in method.lower())
+        with (nullcontext() if _within_transaction else self.conn):
+            system_ref=self._next_system_reference('BT','payments','system_reference',payment_date) if 'bank' in method.lower() else ''
+            payment_id=self.conn.execute("""INSERT INTO payments(expense_id,amount_cents,payment_date,
+                method,reference,notes,authorized_by_head_id,funding_project_id,cash_allocation_id,
+                bank_account_id,system_reference,transaction_time) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (expense_id,amount_cents,payment_date,method,reference,notes,authorized_by_head_id,
+                 funding_project_id,cash_allocation_id,bank_account_id,system_ref,local_timestamp())).lastrowid
+            if cash_allocation_id:
+                self.register_allocation_payment(cash_allocation_id,payment_id,expense_id,amount_cents,payment_date,authorized_by_head_id)
+            self._sync_project_funding_loan(payment_id)
+            self._sync_expense_payment_status(expense_id)
+            self.conn.execute('INSERT INTO audit_log(project_id,action,details) VALUES(?,?,?)',
+                (expense['project_id'],'PAYMENT_RECORDED',f"Expense #{expense_id}: {money(amount_cents)} funded by project #{funding_project_id}"))
+        return payment_id
+
+    def pay_weekly_project_expenses(self, expense_ids, allocation_id, payment_date, head_id,
+                                    funding_project_id=None):
+        """One allocation pays exact outstanding portions; no forced balancing."""
+        ids=list(dict.fromkeys(int(value) for value in expense_ids))
+        if not ids:
+            raise ValueError('Select at least one payroll expense.')
+        rows=self.all(f"""SELECT e.*,pb.period_start,pb.period_end,pb.status payroll_status,
+            e.total_cents-COALESCE((SELECT SUM(amount_cents) FROM payments
+                WHERE expense_id=e.id AND accounting_excluded=0),0) outstanding
+            FROM expenses e JOIN payroll_batches pb ON pb.expense_id=e.id
+            WHERE e.id IN ({','.join('?' for _ in ids)})""",tuple(ids))
+        if len(rows)!=len(ids) or any(r['voided'] or r['payroll_status']!='Committed' or r['outstanding']<=0 for r in rows):
+            raise ValueError('Select active committed payroll expenses with an outstanding balance.')
+        if len({(r['period_start'],r['period_end']) for r in rows})!=1:
+            raise ValueError('Select payroll expenses belonging to the same week.')
+        total=sum(r['outstanding'] for r in rows)
+        self.validate_cash_allocation_payment(rows[0]['project_id'],allocation_id,total)
+        if self.cash_summary()[2]<total:
+            raise ValueError('Insufficient shared cash to pay the selected payrolls.')
+        required={}
+        for row in rows:
+            pid=funding_project_id or row['funding_project_id'] or row['project_id']
+            required[pid]=required.get(pid,0)+row['outstanding']
+        for pid,amount in required.items():
+            if amount>self.project_budget(pid)[2]:
+                raise ValueError(f'Project #{pid} has insufficient funds; choose a lending project or record partial payments separately.')
+        with self.conn:
+            payments=[self.record_project_payment(r['id'],r['outstanding'],payment_date,'Cash',head_id,
+                funding_project_id=funding_project_id or r['funding_project_id'] or r['project_id'],
+                cash_allocation_id=allocation_id,notes='Shared allocation weekly payroll distribution',
+                _within_transaction=True) for r in rows]
+        return dict(total_cents=total,payment_ids=payments,remaining_cents=self.allocation_balance(allocation_id))
+
+    def repay_project_funding(self, loan_id, amount_cents, repayment_date, head_id, reference='', notes=''):
+        loan=next((r for r in self.interproject_loans() if r['id']==loan_id),None)
+        if not loan or amount_cents<=0 or amount_cents>loan['outstanding_cents']:
+            raise ValueError('Enter a positive repayment no greater than the active borrowing balance.')
+        if self.project_budget(loan['borrower_project_id'])[2]<amount_cents:
+            raise ValueError('The borrowing project has insufficient available funds for this repayment.')
+        valid_date(repayment_date,True)
+        if repayment_date<loan['loan_date']:
+            raise ValueError('Repayment cannot precede the borrowing date.')
+        with self.conn:
+            repayment_id=self.conn.execute("""INSERT INTO project_funding_repayments(loan_id,amount_cents,
+                repayment_date,authorized_by_head_id,reference,notes) VALUES(?,?,?,?,?,?)""",
+                (loan_id,amount_cents,repayment_date,head_id,reference,notes)).lastrowid
+            for pid in (loan['lender_project_id'],loan['borrower_project_id']):
+                self.conn.execute('INSERT INTO audit_log(project_id,action,details) VALUES(?,?,?)',
+                    (pid,'INTERPROJECT_REPAYMENT',f"{loan['reference']}: {money(amount_cents)} settled; {reference}; {notes}"))
+        return repayment_id
+
+    def assert_funding_reversal_allowed(self, expense_id):
+        if self.one("""SELECT 1 FROM project_funding_loans l JOIN project_funding_repayments r
+            ON r.loan_id=l.id WHERE l.expense_id=? AND r.voided=0""",(expense_id,)):
+            raise ValueError('Undo the inter-project repayments first before voiding or reopening this expense.')
+
     def project_budget(self, project_id: int) -> tuple[int, int, int]:
         """Return deposited, payments recorded, and payment-basis balance."""
         deposited = self.one(
@@ -3813,7 +4176,7 @@ class Database:
                FROM payments pay JOIN expenses e ON e.id=pay.expense_id
                WHERE e.project_id=? AND e.voided=0 AND pay.accounting_excluded=0""", (project_id,)
         )["total"]
-        paid = max(0, paid - self.project_recoveries(project_id))
+        paid = paid - self.project_recoveries(project_id) + self._funding_cash_adjustment(project_id)
         return deposited, paid, deposited - paid
 
     def project_commitment_budget(self, project_id: int) -> tuple[int, int, int]:
@@ -3944,6 +4307,31 @@ class Database:
             )
         return sources
 
+    def manual_withdrawal_options(self, allocation_date):
+        allocation_date=valid_date(allocation_date,True)
+        cutoff=self.one("SELECT value FROM app_metadata WHERE key='cash_allocation_wd_cutoff'")
+        rows=self.all("""SELECT * FROM remittances WHERE type='Withdrawal' AND voided=0
+            AND txn_date<=? AND txn_date>=? ORDER BY txn_date DESC,id DESC""",
+            (allocation_date,cutoff['value'] if cutoff else '0001-01-01'))
+        return [dict(r,available_cents=self.withdrawal_available(r['id'])) for r in rows if self.withdrawal_available(r['id'])>0]
+
+    def validate_manual_withdrawal_sources(self, amount_cents, allocation_date, selected):
+        options={r['id']:r for r in self.manual_withdrawal_options(allocation_date)}
+        if not selected:raise ValueError('Select withdrawal references and enter the amount taken from each.')
+        seen=set();result=[]
+        for wid,amount in selected:
+            if wid in seen:raise ValueError('Select each withdrawal only once.')
+            seen.add(wid)
+            if not isinstance(amount,int) or amount<=0:raise ValueError('Every selected withdrawal amount must be positive.')
+            row=options.get(wid)
+            if not row:raise ValueError('A selected withdrawal is voided, unavailable, after the allocation date, or before the reviewed boundary.')
+            if amount>row['available_cents']:
+                raise ValueError(f"{row['system_reference']} has only {money(row['available_cents'])} available.")
+            result.append((wid,amount,row['system_reference']))
+        if sum(r[1] for r in result)!=amount_cents:
+            raise ValueError('The selected withdrawal contributions must exactly equal the PC/DP allocation amount.')
+        return result
+
     def allocation_source_text(self, allocation_id: int) -> str:
         rows = self.all(
             """SELECT s.amount_cents,COALESCE(NULLIF(r.system_reference,''),'WD-' || PRINTF('%04d',r.id)) reference
@@ -4050,6 +4438,7 @@ class Database:
                                receiver_head_id: int, purpose: str = "",
                                supplier: str = "", notes: str = "",
                                withdrawal_id: int | None = None,
+                               withdrawal_sources: list | None = None,
                                issuer_registry_id: int | None = None,
                                receiver_registry_id: int | None = None) -> int:
         if allocation_type not in {"Petty Cash", "Direct Procurement"}:
@@ -4082,7 +4471,10 @@ class Database:
             raise ValueError("Allocation amount must be positive.")
         if amount_cents > self.unallocated_cash():
             raise ValueError("This amount exceeds total unallocated cash on-hand.")
-        sources = self.fifo_withdrawal_sources(amount_cents, allocation_date)
+        allocation_date=valid_date(allocation_date,True)
+        if withdrawal_sources is None and withdrawal_id is not None:
+            withdrawal_sources=[(withdrawal_id,amount_cents)]
+        sources = self.validate_manual_withdrawal_sources(amount_cents, allocation_date,withdrawal_sources)
         withdrawal_id = sources[0][0]
         if allocation_type == "Petty Cash":
             count = self.one(
@@ -4113,6 +4505,7 @@ class Database:
                  1, local_timestamp(), issuer_registry_id, receiver_registry_id),
             )
             allocation_id = cursor.lastrowid
+            self.conn.execute("UPDATE cash_allocations SET source_selection_mode='Manual' WHERE id=?",(allocation_id,))
             self.conn.executemany(
                 """INSERT INTO cash_allocation_sources(allocation_id,withdrawal_id,amount_cents)
                    VALUES(?,?,?)""",
@@ -4839,7 +5232,8 @@ class Database:
                                  cash_allocation_id: int | None,
                                  bank_account_id: int | None, reference: str,
                                  notes: str, correction_reason: str,
-                                 authorized_by_head_id: int) -> dict:
+                                 authorized_by_head_id: int,
+                                 funding_project_id: int | None = None) -> dict:
         """Atomically move an expense payment to the correct funding source."""
         payment_date = valid_date(payment_date, True)
         correction_reason = correction_reason.strip()
@@ -4907,6 +5301,14 @@ class Database:
                 )
 
         old_allocation_id = row["cash_allocation_id"]
+        funding_project_id=funding_project_id or row['funding_project_id'] or row['project_id']
+        if not self.project_is_active(funding_project_id):
+            raise ValueError('Select an active funding project.')
+        project_available=self.project_budget(funding_project_id)[2]
+        if funding_project_id==(row['funding_project_id'] or row['project_id']):
+            project_available+=row['amount_cents']
+        if (funding_project_id!=(row['funding_project_id'] or row['project_id']) or amount_cents>row['amount_cents']) and amount_cents>project_available:
+            raise ValueError('The selected funding project has insufficient available funds.')
         changes_cash_source = (
             old_allocation_id and
             (old_allocation_id != cash_allocation_id or amount_cents != row["amount_cents"] or is_bank)
@@ -4949,11 +5351,12 @@ class Database:
             self.conn.execute(
                 """UPDATE payments SET amount_cents=?,payment_date=?,method=?,reference=?,notes=?,
                    bank_account_id=?,cash_allocation_id=?,authorized_by_head_id=?,
-                   system_reference=?,transaction_time=? WHERE id=?""",
+                   system_reference=?,transaction_time=?,funding_project_id=? WHERE id=?""",
                 (amount_cents, payment_date, method, reference.strip(), notes.strip(),
                  bank_account_id, cash_allocation_id, authorized_by_head_id,
-                 system_reference, local_timestamp(), payment_id),
+                 system_reference, local_timestamp(), funding_project_id,payment_id),
             )
+            self._sync_project_funding_loan(payment_id)
             if cash_allocation_id:
                 self.register_allocation_payment(
                     cash_allocation_id, payment_id, row["expense_id"], amount_cents,
@@ -5578,6 +5981,19 @@ class Database:
         )
         if not row or not row["clock_out"]:
             raise ValueError("Only completed attendance can be corrected.")
+        old_week,_=payroll_week_bounds(row['clock_in'][:10])
+        new_week,_=payroll_week_bounds(new_clock_in.date())
+        if row['payroll_batch_id'] and new_week!=old_week:
+            raise ValueError('Reopen the committed payroll before moving attendance to a different work week.')
+        if new_week!=old_week and self.one('SELECT 1 FROM payroll_week_plans WHERE employee_id=? AND period_start=?',(row['employee_id'],new_week)):
+            raise ValueError('The destination week is locked. Reopen all affected payrolls before moving attendance into it.')
+        frozen=self.one('SELECT * FROM payroll_week_plans WHERE employee_id=? AND period_start=?',(row['employee_id'],old_week))
+        if frozen and len(json.loads(frozen['gross_json']))>1:
+            raise ValueError('Reopen all affected project payrolls for this employee\'s week before editing multi-project attendance or pay rates.')
+        if self.one("""SELECT 1 FROM attendance WHERE employee_id=? AND id<>? AND clock_in<?
+            AND (clock_out='' OR clock_out>?)""",(row['employee_id'],attendance_id,
+            new_clock_out.isoformat(timespec='seconds'),new_clock_in.isoformat(timespec='seconds'))):
+            raise ValueError('The revised times overlap another project attendance segment.')
         reason = correction_reason.strip()
         if not reason:
             raise ValueError("Enter the reason for this attendance correction.")
@@ -5594,7 +6010,15 @@ class Database:
         rate = historical_rate if daily_rate_cents is None else int(daily_rate_cents)
         if rate <= 0:
             raise ValueError("The attendance daily rate must be greater than zero.")
-        result = compute_shift_pay(new_clock_in, new_clock_out, rate)
+        preceding=self.all("""SELECT * FROM attendance WHERE employee_id=? AND id<>?
+            AND SUBSTR(clock_in,1,10)=? AND clock_in<? AND clock_out<>'' ORDER BY clock_in,id""",
+            (row['employee_id'],attendance_id,new_clock_in.date().isoformat(),new_clock_in.isoformat(timespec='seconds')))
+        regular_left=Decimal('8')
+        for segment in preceding:
+            segment_pay=compute_shift_pay(datetime.fromisoformat(segment['clock_in']),datetime.fromisoformat(segment['clock_out']),
+                segment['pay_rate_cents'],segment['day_type'],regular_limit=regular_left)
+            regular_left-=Decimal(segment_pay['regular_hours'])
+        result = compute_shift_pay(new_clock_in, new_clock_out, rate,row['day_type'],regular_limit=regular_left)
         computed_gross = result["gross_cents"]
         if final_gross_cents is not None and int(final_gross_cents) < 0:
             raise ValueError("The final daily pay cannot be negative.")
@@ -5643,6 +6067,9 @@ class Database:
                  reason if (daily_rate_cents is not None or final_gross_cents is not None) else "",
                  attendance_id),
             )
+            if not row['payroll_batch_id'] and not row['committed_expense_id']:
+                for day in {row['clock_in'][:10],new_clock_in.date().isoformat()}:
+                    self._recalculate_employee_day_segments(row['employee_id'],day)
             if row["closure_batch_id"]:
                 self.conn.execute(
                     """UPDATE attendance_closure_batches SET gross_cents=COALESCE((
@@ -5675,6 +6102,10 @@ class Database:
                 # Keep the committed-batch snapshot aligned with authorized
                 # in-place corrections until the payroll is explicitly reopened.
                 self._capture_payroll_batch_snapshot(batch["id"])
+            if frozen:
+                gross,signature=self._employee_week_inputs(row['employee_id'],old_week)
+                self.conn.execute('UPDATE payroll_week_plans SET attendance_signature=?,gross_json=? WHERE id=?',
+                    (signature,json.dumps(gross),frozen['id']))
             self.conn.execute("INSERT INTO audit_log(project_id,action,details) VALUES(?,?,?)",
                 (project_id, "ATTENDANCE_CORRECTED",
                  f"Attendance #{attendance_id}, {row['name']} [{row['employee_no']}], "
@@ -5743,6 +6174,69 @@ class Database:
         return {"id": batch_id, "reference": reference, "work_date": work_date,
                 "count": len(rows), "gross_cents": gross}
 
+    def record_batch_project_attendance(self, segments, head_id):
+        """Stage multiple projects/segments per worker with global overlap guards."""
+        checked=[]
+        for employee_id,pid,started,ended in segments:
+            if ended<=started or ended.date()!=started.date():
+                raise ValueError('Each attendance segment must finish later on the same date.')
+            deployed={e['id']:e for e in self.employees_deployed_to(pid,on_date=started.date().isoformat())}
+            if employee_id not in deployed or not self.project_is_active(pid):
+                raise ValueError('The employee must be deployed to the selected active project on the work date.')
+            week_start,_=payroll_week_bounds(started.date())
+            if self.one('SELECT 1 FROM payroll_week_plans WHERE employee_id=? AND period_start=?',(employee_id,week_start)):
+                raise ValueError('This employee\'s weekly payroll is locked. Reopen all affected project payrolls before adding attendance.')
+            if self.one("SELECT 1 FROM attendance WHERE employee_id=? AND clock_out=''",(employee_id,)):
+                raise ValueError('Clock the employee out before recording manual attendance.')
+            existing=self.all("SELECT clock_in,clock_out FROM attendance WHERE employee_id=? AND clock_in<? AND clock_out>?",
+                (employee_id,ended.isoformat(timespec='seconds'),started.isoformat(timespec='seconds')))
+            overlap=existing or any(eid==employee_id and max(started,s)<min(ended,e) for eid,_pid,s,e,_rate in checked)
+            if overlap:
+                raise ValueError(f"Overlapping attendance for {deployed[employee_id]['name']}; one worker cannot be paid in two projects at the same time.")
+            checked.append((employee_id,pid,started,ended,deployed[employee_id]['deployment_daily_rate_cents'] or employee_daily_rate(deployed[employee_id])))
+        if not checked:
+            raise ValueError('Select at least one employee.')
+        with self.conn:
+            ids=[]
+            for eid,pid,started,ended,rate in checked:
+                result=compute_shift_pay(started,ended,rate)
+                attendance_id=self.conn.execute("""INSERT INTO attendance(employee_id,project_id,clock_in,
+                    clock_out,hours,lunch_hours,regular_hours,overtime_hours,regular_pay_cents,
+                    overtime_pay_cents,gross_cents,pay_rate_cents,day_type,source,authorized_by_head_id)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'Ordinary Day','Manual Batch',?)""",
+                    (eid,pid,started.isoformat(timespec='seconds'),ended.isoformat(timespec='seconds'),
+                     result['hours'],result['lunch_hours'],result['regular_hours'],result['overtime_hours'],
+                     result['regular_pay_cents'],result['overtime_pay_cents'],result['gross_cents'],rate,head_id)).lastrowid
+                ids.append(attendance_id)
+            for eid,day in {(r[0],r[2].date().isoformat()) for r in checked}:
+                self._recalculate_employee_day_segments(eid,day)
+            for pid in {r[1] for r in checked}:
+                self.conn.execute('INSERT INTO audit_log(project_id,action,details) VALUES(?,?,?)',
+                    (pid,'BATCH_ATTENDANCE_ADDED',f'{sum(r[1]==pid for r in checked)} project attendance segments; authorized head #{head_id}'))
+        return ids
+
+    def _recalculate_employee_day_segments(self, employee_id, work_date):
+        rows=self.all("SELECT * FROM attendance WHERE employee_id=? AND SUBSTR(clock_in,1,10)=? ORDER BY clock_in,id",(employee_id,work_date))
+        remaining=Decimal('8')
+        for row in rows:
+            if not row['clock_out']:
+                continue
+            base=compute_shift_pay(datetime.fromisoformat(row['clock_in']),datetime.fromisoformat(row['clock_out']),row['pay_rate_cents'],row['day_type'],regular_limit=remaining)
+            regular=Decimal(base['regular_hours']); overtime=Decimal(base['overtime_hours'])
+            remaining-=regular
+            regular_pay=base['regular_pay_cents']; overtime_pay=base['overtime_pay_cents']
+            gross=regular_pay+overtime_pay+(row['manual_pay_adjustment_cents'] or 0)
+            if row['payroll_batch_id'] or row['committed_expense_id']:
+                if regular_pay!=row['regular_pay_cents'] or overtime_pay!=row['overtime_pay_cents']:
+                    raise ValueError('Reopen the existing payroll before changing this employee\'s daily regular/overtime split.')
+                continue
+            self.conn.execute("""UPDATE attendance SET regular_hours=?,overtime_hours=?,regular_pay_cents=?,
+                overtime_pay_cents=?,gross_cents=? WHERE id=?""",
+                (str(regular),str(overtime),regular_pay,overtime_pay,gross,row['id']))
+        for closure_id in {r['closure_batch_id'] for r in rows if r['closure_batch_id']}:
+            self.conn.execute("""UPDATE attendance_closure_batches SET gross_cents=
+                (SELECT COALESCE(SUM(gross_cents),0) FROM attendance WHERE closure_batch_id=?) WHERE id=?""",(closure_id,closure_id))
+
     def weekly_payroll_summary(self, project_id: int, week_value: str | date):
         """Return every active employee and closed, uncommitted pay for a week."""
         week_start, week_end = payroll_week_bounds(week_value)
@@ -5772,11 +6266,7 @@ class Database:
         )
         result = []
         for employee in employees:
-            deduction = sum(
-                item["amount_cents"]
-                for item in self.salary_deduction_plan(
-                    employee["id"], employee["gross_cents"], week_end)
-            )
+            deduction = self.weekly_project_deduction(employee['id'],project_id,week_start)
             adjustment = self.one(
                 """SELECT COALESCE(SUM(amount_cents),0) total FROM payroll_adjustments
                    WHERE employee_id=? AND project_id=? AND status='Pending'""",
@@ -5789,6 +6279,136 @@ class Database:
                        net_cents=employee["gross_cents"] - deduction + adjustment)
             result.append(row)
         return result
+
+    @staticmethod
+    def _proportional_cents(total, weights):
+        """Largest-remainder rounding; portions always equal the cent total."""
+        weights={pid:max(0,int(value)) for pid,value in weights.items()}
+        denominator=sum(weights.values())
+        if not denominator or total<=0:
+            return {pid:0 for pid in weights}
+        portions={pid:total*value//denominator for pid,value in weights.items()}
+        ranked=sorted(weights,key=lambda pid:(-(total*weights[pid]%denominator),pid))
+        for pid in ranked[:total-sum(portions.values())]:
+            portions[pid]+=1
+        return portions
+
+    def _employee_week_inputs(self, employee_id, week_start):
+        week_start,week_end=payroll_week_bounds(week_start)
+        rows=self.all("""SELECT a.*,COALESCE(a.project_id,e.project_id) work_project
+            FROM attendance a JOIN employees e ON e.id=a.employee_id
+            WHERE a.employee_id=? AND SUBSTR(a.clock_in,1,10) BETWEEN ? AND ?
+              AND a.clock_out<>'' AND a.closure_batch_id IS NOT NULL ORDER BY a.id""",
+            (employee_id,week_start,week_end))
+        gross={}
+        signature=[]
+        for row in rows:
+            gross[row['work_project']]=gross.get(row['work_project'],0)+row['gross_cents']
+            signature.append([row['id'],row['work_project'],row['clock_in'],row['clock_out'],row['gross_cents']])
+        return gross,json.dumps(signature,separators=(',',':'))
+
+    def _preview_week_shares(self, employee_id, week_start):
+        week_start,week_end=payroll_week_bounds(week_start)
+        gross,signature=self._employee_week_inputs(employee_id,week_start)
+        frozen=self.one('SELECT * FROM payroll_week_plans WHERE employee_id=? AND period_start=?',(employee_id,week_start))
+        if frozen:
+            if signature!=frozen['attendance_signature']:
+                raise ValueError('Attendance changed after the shared weekly deduction was locked. Reopen all affected project payrolls before recalculating.')
+            return gross,signature,[dict(r) for r in self.all('SELECT * FROM payroll_week_ca_shares WHERE plan_id=?',(frozen['id'],))]
+        # Preserve old committed weeks; never reinterpret historical deductions.
+        already=self.one("""SELECT 1 FROM cash_advance_transactions t JOIN cash_advances ca ON ca.id=t.advance_id
+            JOIN payroll_batches pb ON pb.id=t.payroll_batch_id
+            WHERE ca.employee_id=? AND t.posted=1 AND t.voided=0 AND t.txn_type='Salary Deduction'
+            AND pb.status='Committed' AND pb.period_start=?""",(employee_id,week_start))
+        if already:
+            if len(gross)>1:
+                raise ValueError('This multi-project week has an older committed advance deduction. Reopen its affected payrolls before using proportional deductions.')
+            return gross,signature,[]
+        available={pid:max(0,value) for pid,value in gross.items()}
+        for pid in available:
+            adjustment=self.one("""SELECT COALESCE(SUM(amount_cents),0) n FROM payroll_adjustments
+                WHERE employee_id=? AND project_id=? AND (status='Pending' OR applied_payroll_batch_id IN
+                (SELECT id FROM payroll_batches WHERE period_start=? AND status='Committed'))""",(employee_id,pid,week_start))['n']
+            available[pid]=max(0,available[pid]+min(0,adjustment))
+        plan=self.salary_deduction_plan(employee_id,sum(available.values()),week_end)
+        shares=[]
+        for item in plan:
+            portions=self._proportional_cents(item['amount_cents'],gross)
+            excess=0
+            for pid in portions:
+                if portions[pid]>available[pid]:
+                    excess+=portions[pid]-available[pid]; portions[pid]=available[pid]
+            while excess:
+                room={pid:available[pid]-portions[pid] for pid in portions if available[pid]>portions[pid]}
+                additional=self._proportional_cents(excess,room)
+                applied=0
+                for pid,value in additional.items():
+                    take=min(value,room[pid]); portions[pid]+=take; applied+=take
+                if not applied:
+                    raise ValueError('Cannot safely distribute this weekly cash-advance deduction.')
+                excess-=applied
+            for pid,amount in portions.items():
+                if amount:
+                    shares.append(dict(project_id=pid,advance_id=item['transaction']['advance_id'],
+                        schedule_id=item['transaction']['id'],amount_cents=amount,payroll_batch_id=None))
+                    available[pid]-=amount
+        return gross,signature,shares
+
+    def weekly_project_deduction(self, employee_id, project_id, week_start):
+        _gross,_signature,shares=self._preview_week_shares(employee_id,week_start)
+        return sum(r['amount_cents'] for r in shares if r['project_id']==project_id and not r['payroll_batch_id'])
+
+    def _lock_employee_week(self, employee_id, week_start):
+        week_start,week_end=payroll_week_bounds(week_start)
+        if self.one("""SELECT 1 FROM attendance WHERE employee_id=? AND SUBSTR(clock_in,1,10)
+            BETWEEN ? AND ? AND (clock_out='' OR closure_batch_id IS NULL)""",(employee_id,week_start,week_end)):
+            raise ValueError('Close this employee\'s attendance in every project for the week before committing the shared payroll breakdown.')
+        gross,signature,shares=self._preview_week_shares(employee_id,week_start)
+        frozen=self.one('SELECT id FROM payroll_week_plans WHERE employee_id=? AND period_start=?',(employee_id,week_start))
+        if frozen:
+            return frozen['id']
+        plan_id=self.conn.execute("""INSERT INTO payroll_week_plans(employee_id,period_start,period_end,
+            attendance_signature,gross_json) VALUES(?,?,?,?,?)""",
+            (employee_id,week_start,week_end,signature,json.dumps(gross))).lastrowid
+        for share in shares:
+            self.conn.execute("""INSERT INTO payroll_week_ca_shares(plan_id,project_id,advance_id,schedule_id,
+                amount_cents) VALUES(?,?,?,?,?)""",(plan_id,share['project_id'],share['advance_id'],share['schedule_id'],share['amount_cents']))
+        return plan_id
+
+    def _post_week_project_shares(self, employee_ids, project_id, week_start, batch_id, expense_id, posted_date, head_id):
+        for employee_id in employee_ids:
+            plan_id=self._lock_employee_week(employee_id,week_start)
+            shares=self.all('SELECT * FROM payroll_week_ca_shares WHERE plan_id=? AND project_id=? AND payroll_batch_id IS NULL',(plan_id,project_id))
+            for share in shares:
+                schedule=self.one("""SELECT t.*,ca.project_id original_project,ca.advance_date FROM cash_advance_transactions t
+                    JOIN cash_advances ca ON ca.id=t.advance_id WHERE t.id=? AND t.posted=0 AND t.voided=0 AND ca.voided=0""",(share['schedule_id'],))
+                if not schedule or share['amount_cents']>schedule['amount_cents']:
+                    raise ValueError('The advance changed after the weekly split was locked. Reopen all affected payrolls and review its repayments.')
+                self.post_salary_deduction_plan([{'transaction':schedule,'amount_cents':share['amount_cents']}],batch_id,posted_date,head_id)
+                self.conn.execute('UPDATE payroll_week_ca_shares SET payroll_batch_id=? WHERE id=?',(batch_id,share['id']))
+                if schedule['original_project']!=project_id:
+                    reference=self._next_system_reference('IPL','project_funding_loans','reference',posted_date)
+                    self.conn.execute("""INSERT INTO project_funding_loans(reference,lender_project_id,
+                        borrower_project_id,expense_id,ca_share_id,payroll_batch_id,amount_cents,loan_date,kind,notes)
+                        VALUES(?,?,?,?,?,?,?,?,'CA recovery',?)""",
+                        (reference,schedule['original_project'],project_id,expense_id,share['id'],batch_id,
+                         share['amount_cents'],posted_date,f"Advance #{share['advance_id']} recovered through employee #{employee_id}'s payroll"))
+
+    def _release_reopened_week_plans(self, batch_id):
+        plans=self.all("""SELECT DISTINCT wp.* FROM payroll_week_plans wp JOIN payroll_week_ca_shares s
+            ON s.plan_id=wp.id WHERE s.payroll_batch_id=?""",(batch_id,))
+        batch=self.one('SELECT * FROM payroll_batches WHERE id=?',(batch_id,))
+        # Include plans with zero advance deductions as well.
+        plans={r['id']:r for r in plans}
+        for row in self.all("""SELECT wp.* FROM payroll_week_plans wp JOIN payroll_batch_employee_snapshots s
+            ON s.employee_id=wp.employee_id WHERE s.payroll_batch_id=? AND wp.period_start=?""",(batch_id,batch['period_start'])):
+            plans[row['id']]=row
+        self.conn.execute('UPDATE payroll_week_ca_shares SET payroll_batch_id=NULL WHERE payroll_batch_id=?',(batch_id,))
+        for plan in plans.values():
+            remaining=self.one("""SELECT 1 FROM attendance a JOIN payroll_batches pb ON pb.id=a.payroll_batch_id
+                WHERE a.employee_id=? AND pb.period_start=? AND pb.status='Committed'""",(plan['employee_id'],plan['period_start']))
+            if not remaining:
+                self.conn.execute('DELETE FROM payroll_week_plans WHERE id=?',(plan['id'],))
 
     def _capture_payroll_batch_snapshot(self, batch_id: int):
         """Store immutable payroll detail before live attendance can be reopened."""
@@ -5915,6 +6535,8 @@ class Database:
         )
         if not batch:
             raise ValueError("The selected payroll batch no longer exists.")
+        if batch['expense_id']:
+            self.assert_funding_reversal_allowed(batch['expense_id'])
         if batch["project_status"] == "Completed":
             raise ValueError("Reactivate the completed project before reopening its payroll.")
         if batch["status"] != "Committed":
@@ -5991,6 +6613,7 @@ class Database:
                    reopened_by_head_id=? WHERE id=?""",
                 (stamp, reason, authorized_by_head_id, batch_id),
             )
+            self._release_reopened_week_plans(batch_id)
             for allocation_id in allocation_ids:
                 self._sync_allocation_usage_status(allocation_id)
             self.conn.execute(
@@ -6006,7 +6629,7 @@ class Database:
                 "payment_count": len(payments), "payment_total_cents": payment_total}
 
     def commit_weekly_payroll(self, project_id: int, week_value: str | date,
-                              authorized_by_head_id: int) -> dict:
+                              authorized_by_head_id: int, *, _within_transaction=False) -> dict:
         """Create one weekly payroll expense from daily-closed attendance only."""
         week_start, week_end = payroll_week_bounds(week_value)
         attendance = self.all(
@@ -6048,22 +6671,31 @@ class Database:
             gross_by_employee[row["employee_id"]] = (
                 gross_by_employee.get(row["employee_id"], 0) + row["gross_cents"]
             )
-        deduction_plan = []
-        for employee_id, employee_gross in gross_by_employee.items():
-            deduction_plan.extend(
-                self.salary_deduction_plan(employee_id, employee_gross, week_end)
-            )
         gross = sum(row["gross_cents"] for row in attendance)
-        deduction_total = sum(item["amount_cents"] for item in deduction_plan)
+        deduction_total = sum(self.weekly_project_deduction(employee_id,project_id,week_start)
+                              for employee_id in gross_by_employee)
         adjustment_rows = self.all(
             f"""SELECT * FROM payroll_adjustments WHERE project_id=? AND status='Pending'
                AND employee_id IN ({','.join('?' for _ in gross_by_employee)}) ORDER BY id""",
             (project_id, *gross_by_employee),
         )
         adjustment_total = sum(row["amount_cents"] for row in adjustment_rows)
+        for employee_id, employee_gross in gross_by_employee.items():
+            employee_adjustment=sum(r['amount_cents'] for r in adjustment_rows if r['employee_id']==employee_id)
+            if employee_gross+employee_adjustment-self.weekly_project_deduction(employee_id,project_id,week_start)<0:
+                raise ValueError('An employee would have negative net pay in this project. Reopen all affected payrolls and review the weekly deduction and corrections.')
         net = gross - deduction_total + adjustment_total
-        _deposited, _committed, remaining = self.project_commitment_budget(project_id)
-        if net > remaining:
+        _contract, _committed, remaining = self.project_cost_budget(project_id)
+        if net < 0:
+            raise ValueError('Weekly payroll cannot have a negative net payable.')
+        incoming_ca_cost=0
+        for employee_id in gross_by_employee:
+            _gross,_signature,shares=self._preview_week_shares(employee_id,week_start)
+            for share in shares:
+                if share['project_id']==project_id and not share['payroll_batch_id']:
+                    original=self.one('SELECT project_id FROM cash_advances WHERE id=?',(share['advance_id'],))['project_id']
+                    if original!=project_id:incoming_ca_cost+=share['amount_cents']
+        if not _within_transaction and net+incoming_ca_cost > remaining:
             raise ValueError(
                 f"Weekly payroll exceeds the project's remaining commitment budget of {money(remaining)}."
             )
@@ -6071,7 +6703,9 @@ class Database:
         reference = self._next_system_reference(
             "PAYW", "payroll_batches", "batch_ref", week_start
         )
-        with self.conn:
+        with (nullcontext() if _within_transaction else self.conn):
+            for employee_id in gross_by_employee:
+                self._lock_employee_week(employee_id,week_start)
             expense_id = self.conn.execute(
                 """INSERT INTO expenses(project_id,name,item,supplier,qty,unit,
                    unit_price_cents,total_cents,area,trade,expense_date,due_date,
@@ -6100,10 +6734,8 @@ class Database:
                    WHERE id=?""",
                 [(expense_id, batch_id, row["id"]) for row in attendance],
             )
-            if deduction_plan:
-                self.post_salary_deduction_plan(
-                    deduction_plan, batch_id, commit_date, authorized_by_head_id
-                )
+            self._post_week_project_shares(gross_by_employee,project_id,week_start,
+                batch_id,expense_id,commit_date,authorized_by_head_id)
             if adjustment_rows:
                 self.conn.executemany(
                     """UPDATE payroll_adjustments SET status='Applied',applied_payroll_batch_id=?
@@ -6139,6 +6771,19 @@ class Database:
                 "expense_id": expense_id,
                 "supersedes_batch_id": supersedes_batch_id,
                 "supersedes_reference": superseded["batch_ref"] if superseded else ""}
+
+    def commit_project_weekly_payrolls(self, project_heads, week_value):
+        results=[]
+        before={r['id']:self.project_cost_budget(r['id'])[1] for r in self.all('SELECT id FROM projects')}
+        with self.conn:
+            for pid,head_id in sorted(project_heads.items()):
+                results.append(self.commit_weekly_payroll(pid,week_value,head_id,_within_transaction=True))
+            for pid,old_cost in before.items():
+                contract,used,_remaining=self.project_cost_budget(pid)
+                if used>contract and used>old_cost:
+                    name=self.one('SELECT name FROM projects WHERE id=?',(pid,))['name']
+                    raise ValueError(f'{name}: payroll and attributed advance costs exceed the project contract spending limit. No project payroll was committed.')
+        return results
 
     def create_project(self, values: dict) -> int:
         with self.conn:
@@ -8756,7 +9401,7 @@ class ProjectsTab(BaseTab):
             if row["id"] not in project_ids:
                 continue
             _deposited, payments, _payment_balance = self.db.project_budget(row["id"])
-            _committed_deposit, _committed, budget = self.db.project_commitment_budget(row["id"])
+            _committed_deposit, _committed, budget = self.db.project_funding_budget(row["id"])
             outstanding = self.db.one(
                 """SELECT COALESCE(SUM(MAX(e.total_cents-COALESCE(x.paid,0),0)),0) total
                    FROM expenses e LEFT JOIN (
@@ -8794,13 +9439,14 @@ class ProjectsTab(BaseTab):
             self.paid_value.config(text=money(paid))
             self.outstanding_value.config(text=money(outstanding))
             self.progress_value.config(text=f"{progress}%")
-            committed = paid + outstanding
-            budget_remaining = deposited - committed
+            committed = sum(self.db.project_commitment_budget(pid)[1] for pid in project_ids)
+            budget_remaining = sum(self.db.project_funding_budget(pid)[2] for pid in project_ids)
+            receivable=sum(self.db.interproject_balance(pid)[0] for pid in project_ids)
+            payable=sum(self.db.interproject_balance(pid)[1] for pid in project_ids)
             self.expense_reconciliation.config(
-                text=(f"Expense reconciliation: payments recorded {money(paid)} + outstanding "
-                      f"{money(outstanding)} = active expenses {money(committed)}. "
-                      f"Deposited {money(deposited)} − active expenses {money(committed)} = "
-                      f"project budget remaining {money(budget_remaining)}.")
+                text=(f"Active expenses {money(committed)} | Own funds used {money(paid)} | Unpaid supplier bills {money(outstanding)} | "
+                      f"Funds after commitments {money(budget_remaining)} | Inter-project recoverable {money(receivable)}; owed {money(payable)}. "
+                      'Borrowing and repayments do not create duplicate expenses.')
             )
             self.financial_chart.set_data(contract, deposited, paid, outstanding, progress)
             for event in self.db.all(
@@ -9646,7 +10292,7 @@ class BulkExpenseDialog(tk.Toplevel):
         }
         keys = ("project", "name", "item", "dimensions", "supplier", "qty", "unit", "unit_price",
                 "phase", "area", "trade", "expense_date", "due_date", "invoice_no", "notes", "status",
-                "initial_payment", "payment_method", "bank", "cash_allocation")
+                "initial_payment", "payment_method", "bank", "cash_allocation", "funding_project")
         self.vars = {key: tk.StringVar() for key in keys}
         self.vars["qty"].set("1"); self.vars["expense_date"].set(date.today().isoformat())
         self.vars["status"].set("Unpaid"); self.vars["payment_method"].set("Cash")
@@ -9667,7 +10313,7 @@ class BulkExpenseDialog(tk.Toplevel):
         self.budget_label = ttk.Label(funding, style="Muted.TLabel")
         self.budget_label.pack(anchor="e")
         form = ttk.Frame(body); form.pack(fill="x", pady=(12, 8))
-        specs = [("project", "Project *"), ("item", "Item name / description *"),
+        specs = [("project", "Expense project *"), ("funding_project", "Funding project *"), ("item", "Item name / description *"),
                  ("dimensions", "Size / dimensions *"), ("supplier", "Supplier (optional)"), ("qty", "Quantity *"),
                  ("unit_price", "Unit price *"), ("phase", "Phase *"),
                  ("area", "Area / category *"), ("status", "Payment state *"),
@@ -9680,9 +10326,12 @@ class BulkExpenseDialog(tk.Toplevel):
             row, col = divmod(index, 4)
             cell = ttk.Frame(form); cell.grid(row=row, column=col, sticky="ew", padx=5, pady=4)
             ttk.Label(cell, text=label).pack(anchor="w")
-            if key == "project":
+            if key in {'project','funding_project'}:
                 widget = ttk.Combobox(cell, textvariable=self.vars[key], values=list(self.projects), state="readonly")
-                widget.bind("<<ComboboxSelected>>", lambda _e: self.project_changed())
+                if key=='project':
+                    widget.bind("<<ComboboxSelected>>", lambda _e: self.project_changed())
+                else:
+                    widget.bind("<<ComboboxSelected>>", lambda _e: self.refresh_funding_summary())
             elif key in {"phase", "area", "status", "payment_method", "bank", "cash_allocation"}:
                 if key == "status": values = ["Paid", "Partially Paid", "Unpaid"]
                 elif key == "payment_method": values = ["Cash", "Bank Transfer"]
@@ -9833,6 +10482,7 @@ class BulkExpenseDialog(tk.Toplevel):
 
     def project_changed(self):
         project_id = self.current_project_id()
+        self.vars['funding_project'].set(self.vars['project'].get())
         phases = [row["name"] for row in self.db.all(
             "SELECT name FROM phases WHERE project_id=? ORDER BY sort_order,id", (project_id,)
         )] if project_id else []
@@ -9864,6 +10514,12 @@ class BulkExpenseDialog(tk.Toplevel):
         self.widgets["cash_allocation"].configure(state=cash_state)
 
     def refresh_funding_summary(self):
+        funding_pid=self.projects.get(self.vars['funding_project'].get())
+        if funding_pid:
+            _deposited,_paid,available=self.db.project_budget(funding_pid)
+            staged=sum(i['payment_amount_cents'] for i in self.items if i.get('funding_project_id',i['project_id'])==funding_pid)
+            _limit,_committed,cost_remaining=self.db.project_cost_budget(self.current_project_id())
+            self.budget_label.config(text=f'Funding available {money(available-staged)} | Expense project cost budget remaining {money(cost_remaining)}')
         cash_on_hand = self.db.cash_summary()[2]
         staged_cash = sum(
             item["payment_amount_cents"] for item in self.items
@@ -9934,9 +10590,11 @@ class BulkExpenseDialog(tk.Toplevel):
         project_id = self.projects.get(project_label)
         if not project_id:
             raise ValueError("Project does not match an existing project.")
-        _deposited, _paid, remaining = self.db.project_budget(project_id)
-        if remaining <= 0:
-            raise ValueError("This project has no remaining deposited budget.")
+        funding_label=self._project_label(values.get('funding_project') or project_label)
+        funding_project_id=self.projects.get(funding_label)
+        if not funding_project_id:
+            raise ValueError('Select an active funding project.')
+        _deposited, _paid, remaining = self.db.project_budget(funding_project_id)
         quantity = qty_decimal(values.get("qty", ""))
         unit_price = cents(values.get("unit_price", ""))
         if quantity <= 0 or unit_price < 0:
@@ -9997,13 +10655,13 @@ class BulkExpenseDialog(tk.Toplevel):
                 raise ValueError("Select an active Petty Cash or Direct Procurement reference for paid cash.")
             values["cash_allocation"] = allocation_label
             cash_allocation_id = allocation_options[allocation_label]
-        _commit_deposit, _committed, commitment_remaining = self.db.project_commitment_budget(project_id)
+        _contract, _committed, commitment_remaining = self.db.project_cost_budget(project_id)
         staged_commitments = sum(x["total_cents"] for x in staged_items if x["project_id"] == project_id)
         if staged_commitments + total > commitment_remaining:
-            raise ValueError("This row would exceed the project's uncommitted deposited budget.")
-        staged_payments = sum(x["payment_amount_cents"] for x in staged_items if x["project_id"] == project_id)
+            raise ValueError("This row would exceed the expense project's remaining contract spending limit.")
+        staged_payments = sum(x["payment_amount_cents"] for x in staged_items if x.get('funding_project_id',x['project_id']) == funding_project_id)
         if staged_payments + payment_amount > remaining:
-            raise ValueError("Staged payments exceed this project's remaining deposited budget.")
+            raise ValueError("Staged payments exceed the funding project's available funds.")
         if payment_amount > 0 and bank_account_id:
             staged_bank = sum(x["payment_amount_cents"] for x in staged_items
                               if x.get("bank_account_id") == bank_account_id)
@@ -10022,6 +10680,7 @@ class BulkExpenseDialog(tk.Toplevel):
         item.update(
             name=values["item"], item=values["item"], project=project_label,
             project_id=project_id, project_name=project_label.split(" [#")[0],
+            funding_project_id=funding_project_id, funding_project=funding_label,
             dimensions=values["dimensions"], supplier=supplier, qty=str(quantity), unit="item",
             unit_price_cents=unit_price, total_cents=total, phase=phase, area=area,
             trade="", status=status, initial_payment=values.get("initial_payment", ""),
@@ -10155,6 +10814,8 @@ class BulkExpenseDialog(tk.Toplevel):
             "payment_method": item.get("payment_method", "Cash"),
             "expense_date": item.get("expense_date", date.today().isoformat()),
             "notes": item.get("notes", ""),
+            "funding_project": next((label for label,pid in self.projects.items()
+                                     if pid==item.get('funding_project_id',item.get('project_id'))),'') ,
         }
         bank_label = next(
             (label for label, bank_id in self.banks.items()
@@ -10218,7 +10879,8 @@ class BulkExpenseDialog(tk.Toplevel):
             self.tree.insert("", "end", iid=str(index), values=(item["project_name"], item["name"], item["item"],
                 item["supplier"], item["area"], item["qty"], money(item["total_cents"]), item["status"],
                 ((item["payment_method"] + (f" | {item['cash_allocation']}" if item.get("cash_allocation_id") else ""))
-                 if item["payment_amount_cents"] > 0 else f"Planned {item['payment_method']}")))
+                 if item["payment_amount_cents"] > 0 else f"Planned {item['payment_method']}") +
+                 ' | Funding: ' + item.get('funding_project',item['project_name'])))
         paid = sum(item["payment_amount_cents"] for item in self.items)
         outstanding = sum(
             max(0, item["total_cents"] - item["payment_amount_cents"]) for item in self.items
@@ -10287,10 +10949,10 @@ class BulkExpenseDialog(tk.Toplevel):
                         f"Paid transfers from {bank['bank_name']} require {money(required)}, "
                         f"but the bank balance is only {money(available)}."
                     )
-            for project_id in {item["project_id"] for item in self.items}:
+            for project_id in {item.get('funding_project_id',item['project_id']) for item in self.items}:
                 required = sum(
                     item["payment_amount_cents"] for item in self.items
-                    if item["project_id"] == project_id
+                    if item.get('funding_project_id',item['project_id']) == project_id
                 )
                 available = self.db.project_budget(project_id)[2]
                 if required > available:
@@ -10613,7 +11275,7 @@ class CashAllocationDialog(tk.Toplevel):
     def __init__(self, parent, db, initial_project_id=None, initial_withdrawal_id=None):
         super().__init__(parent)
         self.title("Allocate Withdrawn Cash")
-        self.geometry("820x560"); self.minsize(720, 520)
+        self.geometry(f"{max(850,min(1000,self.winfo_screenwidth()-80))}x{max(650,min(790,self.winfo_screenheight()-80))}"); self.minsize(850,650)
         self.db, self.result = db, None
         self.initial_withdrawal_id = initial_withdrawal_id
         projects = db.all("SELECT id,name FROM projects ORDER BY name")
@@ -10630,7 +11292,7 @@ class CashAllocationDialog(tk.Toplevel):
         ttk.Label(body, text="Allocate withdrawn cash", style="DialogTitle.TLabel").grid(
             row=0, column=0, columnspan=4, sticky="w")
         ttk.Label(
-            body, text="Cash is shared across projects. Withdrawal sources are assigned automatically, oldest first.",
+            body, text="Cash is shared across projects. Select withdrawal references and specify each contribution; their sum must equal this allocation.",
             style="Muted.TLabel", wraplength=740,
         ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(3, 14))
         specs = [
@@ -10657,20 +11319,59 @@ class CashAllocationDialog(tk.Toplevel):
             widget.grid(row=row, column=col + 1, sticky="ew", pady=6)
             body.columnconfigure(col + 1, weight=1)
             self.widgets[key] = widget
-        self.balance_note = ttk.Label(body, style="Muted.TLabel", wraplength=740)
-        self.balance_note.grid(row=7, column=0, columnspan=4, sticky="w", pady=(10, 4))
-        buttons = ttk.Frame(body); buttons.grid(row=8, column=0, columnspan=4, sticky="e", pady=(14, 0))
+        source_box=ttk.LabelFrame(body,text='Withdrawal sources — select and enter amounts',padding=8)
+        source_box.grid(row=6,column=0,columnspan=4,sticky='nsew',pady=8);body.rowconfigure(6,weight=1)
+        source_canvas=tk.Canvas(source_box,bg=WHITE,highlightthickness=0,height=190)
+        source_scroll=ttk.Scrollbar(source_box,command=source_canvas.yview);source_canvas.configure(yscrollcommand=source_scroll.set)
+        source_scroll.pack(side='right',fill='y');source_canvas.pack(side='left',fill='both',expand=True)
+        self.source_frame=ttk.Frame(source_canvas);source_window=source_canvas.create_window((0,0),window=self.source_frame,anchor='nw')
+        self.source_frame.bind('<Configure>',lambda _e:source_canvas.configure(scrollregion=source_canvas.bbox('all')))
+        source_canvas.bind('<Configure>',lambda e:source_canvas.itemconfigure(source_window,width=e.width))
+        self.source_rows=[]
+        self.source_note=ttk.Label(body,style='Section.TLabel');self.source_note.grid(row=7,column=0,columnspan=4,sticky='w')
+        self.balance_note = ttk.Label(body, style="Muted.TLabel", wraplength=900)
+        self.balance_note.grid(row=8, column=0, columnspan=4, sticky="w", pady=(10, 4))
+        buttons = ttk.Frame(body); buttons.grid(row=9, column=0, columnspan=4, sticky="e", pady=(14, 0))
         ttk.Button(buttons, text="Cancel", style="Secondary.TButton", command=self.destroy).pack(side="right", padx=(8, 0))
         self.continue_button = ttk.Button(
             buttons, text="Review Allocation", style="Primary.TButton", command=self.save
         )
         self.continue_button.pack(side="right")
         self.refresh_context(); self.update_type()
+        self.vars['allocation_date'].trace_add('write',lambda *_:self.refresh_sources())
+        self.vars['amount'].trace_add('write',lambda *_:self.refresh_source_total())
+        self.refresh_sources()
         self.transient(parent); self.grab_set(); self.bind("<Escape>", lambda _e: self.destroy())
         self.after_idle(lambda: center_toplevel(self))
 
     def project_id(self):
         return self.context_project_id
+
+    def refresh_sources(self):
+        previous={r[0]['id']:(r[1].get(),r[2].get()) for r in self.source_rows}
+        for widget in self.source_frame.winfo_children():widget.destroy()
+        self.source_rows=[]
+        try:rows=self.db.manual_withdrawal_options(self.vars['allocation_date'].get())
+        except ValueError:
+            ttk.Label(self.source_frame,text='Enter a valid allocation date to load available withdrawals.').pack(anchor='w');return
+        for wd in rows:
+            line=ttk.Frame(self.source_frame,padding=(3,4));line.pack(fill='x')
+            old=previous.get(wd['id'],(wd['id']==self.initial_withdrawal_id,''))
+            selected=tk.BooleanVar(value=old[0]);amount=tk.StringVar(value=old[1])
+            ttk.Checkbutton(line,text=f"{wd['system_reference']} | {wd['txn_date']} | {money(wd['available_cents'])} available",variable=selected,command=self.refresh_source_total).pack(side='left',fill='x',expand=True)
+            ttk.Label(line,text='Use:').pack(side='left',padx=6)
+            entry=ttk.Entry(line,textvariable=amount,width=16);entry.pack(side='left')
+            amount.trace_add('write',lambda *_:self.refresh_source_total())
+            self.source_rows.append((wd,selected,amount,entry))
+        if not rows:ttk.Label(self.source_frame,text='No eligible withdrawal cash remains on or before this date.').pack(anchor='w')
+        self.refresh_source_total()
+
+    def refresh_source_total(self):
+        try:
+            total=sum(cents(amount.get()) for _wd,selected,amount,_entry in self.source_rows if selected.get())
+            target=cents(self.vars['amount'].get())
+            self.source_note.configure(text=f'Selected sources: {money(total)} | Allocation: {money(target)} | Difference: {money(target-total)}')
+        except ValueError:self.source_note.configure(text='Enter valid amounts for the allocation and selected withdrawal sources.')
 
     def refresh_context(self):
         rows = self.db.all(
@@ -10711,6 +11412,7 @@ class CashAllocationDialog(tk.Toplevel):
         )
 
     def save(self):
+        if flash_missing_fields(self,self.vars,self.widgets,['allocation_type','amount','allocation_date','issuer','receiver','purpose']):return
         try:
             project_id = self.project_id()
             issuer_id = self.heads.get(self.vars["issuer"].get())
@@ -10723,6 +11425,16 @@ class CashAllocationDialog(tk.Toplevel):
             allocation_date = valid_date(self.vars["allocation_date"].get(), True)
             if self.vars["allocation_type"].get() == "Direct Procurement" and not self.vars["supplier"].get().strip():
                 raise ValueError("Supplier or payee is required for Direct Procurement.")
+            selected=[]
+            for wd,checked,source_amount,entry in self.source_rows:
+                if checked.get():
+                    try:
+                        contribution=cents(source_amount.get())
+                        if contribution<=0:raise ValueError('Enter a positive contribution for each checked withdrawal.')
+                    except ValueError:
+                        flash_required_widgets(self,[entry]);raise
+                    selected.append((wd['id'],contribution))
+            self.db.validate_manual_withdrawal_sources(amount,allocation_date,selected)
             self.result = {
                 "project_id": project_id,
                 "allocation_type": self.vars["allocation_type"].get(), "amount_cents": amount,
@@ -10731,6 +11443,7 @@ class CashAllocationDialog(tk.Toplevel):
                 "issuer_registry_id": self.head_registries.get(self.vars["issuer"].get()),
                 "receiver_registry_id": self.head_registries.get(self.vars["receiver"].get()),
                 "purpose": self.vars["purpose"].get().strip(), "notes": self.vars["notes"].get().strip(),
+                'withdrawal_sources':selected,
             }
             self.destroy()
         except ValueError as exc:
@@ -10760,7 +11473,7 @@ class ExpensesTab(BaseTab):
             cards, "Cash on-hand", "Unallocated cash | Surrendered", ORANGE
         )
         self.deposit_card, self.deposit_value = metric_card(cards, "Project amount deposited", "#2563EB")
-        self.budget_card, self.budget_value = metric_card(cards, "Project budget remaining", GREEN)
+        self.budget_card, self.budget_value = metric_card(cards, "Project cost budget remaining", GREEN)
         (self.contract_card, self.contract_value, self.collectible_label,
          self.collectible_value) = metric_card_with_detail(
             cards, "Total contract amount", "Contract amount collectible", INK
@@ -10783,6 +11496,9 @@ class ExpensesTab(BaseTab):
         self.cash_page = ttk.Frame(self.expense_notebook, padding=(2, 6))
         self.expense_notebook.add(self.ledger_page, text="Expense Ledger")
         self.expense_notebook.add(self.cash_page, text="Petty Cash & Direct Procurement")
+        self.funding_page=ttk.Frame(self.expense_notebook,padding=(8,6))
+        self.expense_notebook.add(self.funding_page,text='Inter-project Funding')
+        self._build_project_funding_page()
         filters = ttk.Frame(self.ledger_page); filters.pack(fill="x")
         self.filter_var = tk.StringVar()
         filter_definitions = (
@@ -10853,6 +11569,7 @@ class ExpensesTab(BaseTab):
         controls = ttk.Frame(self.ledger_page); controls.pack(fill="x", pady=(4, 0))
         ttk.Button(controls, text="Edit (all heads)", command=self.edit).pack(side="left")
         ttk.Button(controls, text="Payments / Funding", command=self.pay).pack(side="left", padx=5)
+        ttk.Button(controls,text='Pay Selected Payrolls',command=self.pay_selected_weekly_payrolls).pack(side='left',padx=5)
         ttk.Button(controls, text="Verify Selected", command=self.verify_selected).pack(side="left")
         ttk.Button(controls, text="Batch Verify Unverified",
                    command=self.verify_all_unverified).pack(side="left", padx=(5, 0))
@@ -10868,7 +11585,7 @@ class ExpensesTab(BaseTab):
             ("allocation", "Cash Allocation Ref.", 150), ("withdrawal", "Withdrawal Ref.", 115),
             ("item", "Item", 145), ("supplier", "Supplier", 125), ("area", "Area", 115),
             ("phase", "Phase", 105),
-            ("authorized", "Authorized by", 125)])
+            ("authorized", "Authorized by", 125),('funding_project','Funding project',170),('project_debt','Project repayment owed',145)])
         self.tree.configure(selectmode="extended")
         self.tree.tag_configure("paid", background="#ECFDF5", foreground="#065F46")
         self.tree.tag_configure("unpaid", background="#FEF2F2", foreground="#991B1B")
@@ -10997,7 +11714,7 @@ class ExpensesTab(BaseTab):
         data = win.result
         approval_details = (
             f"Shared {data['allocation_type']} of {money(data['amount_cents'])}; "
-            "withdrawal sources use FIFO"
+            'withdrawals: '+', '.join(f"{self.db.one('SELECT system_reference FROM remittances WHERE id=?',(wid,))['system_reference']} {money(value)}" for wid,value in data['withdrawal_sources'])
         )
         if cash_allocation_approval_mode(data["allocation_type"]) == "Single Issuer":
             approval = self.app.authorize_registered_head(
@@ -11019,7 +11736,7 @@ class ExpensesTab(BaseTab):
             messagebox.showinfo(
                 APP_TITLE,
                 f"Cash allocation {row['reference']} is now active.\n\n"
-                f"FIFO sources: {self.db.allocation_source_text(allocation_id)}\n\n"
+                f"Selected sources: {self.db.allocation_source_text(allocation_id)}\n\n"
                 "Use this reference when recording cash expenses.",
                 parent=self,
             )
@@ -11514,12 +12231,64 @@ class ExpensesTab(BaseTab):
         return max(1000, 535 + row_count * 36)
 
     def show_payment_history(self, expense_id):
+        if expense_id<0:
+            self.show_project_loan(-expense_id);return
         win = PaymentHistoryDialog(self, self.db, expense_id)
         self.wait_window(win)
 
     def show_expense_details(self, expense_id):
+        if expense_id<0:
+            self.show_project_loan(-expense_id);return
         win = ExpenseDetailsDialog(self, self.db, expense_id, self.edit)
         self.wait_window(win)
+
+    def show_project_loan(self,loan_id):
+        self.expense_notebook.select(self.funding_page)
+        self.loan_project.set(ALL_PROJECTS_LABEL);self.refresh_project_funding()
+        if self.loan_tree.exists(str(loan_id)):
+            self.loan_tree.selection_set(str(loan_id));self.loan_tree.see(str(loan_id))
+            self.refresh_project_repayments()
+
+    def selected_id(self,tree):
+        selected=tree.selection()
+        if tree is self.tree and selected and int(selected[0])<0:
+            self.show_project_loan(-int(selected[0]))
+            messagebox.showinfo(APP_TITLE,'This is a linked recoverable funding record, not a second supplier expense. Manage its repayment here; edit the original expense in the borrower project.',parent=self)
+            return None
+        return super().selected_id(tree)
+
+    def _display_lender_recoverables(self,project_ids):
+        # Virtual ledger rows cannot enter SQL expense/payment totals or be voided independently.
+        if len(self.funding_selector.selected())!=len(self.funding_selector.options):return
+        for loan in self.db.interproject_loans():
+            if loan['lender_project_id'] not in project_ids:continue
+            if 'Paid' not in self.status_selector.selected():continue
+            if self.date_from_filter.get() and loan['loan_date']<self.date_from_filter.get():continue
+            if self.date_to_filter.get() and loan['loan_date']>self.date_to_filter.get():continue
+            expense=self.db.one('SELECT * FROM expenses WHERE id=?',(loan['expense_id'],))
+            if not expense:continue
+            if len(self.area_selector.selected())!=len(self.area_selector.options) and expense['area'] not in self.area_selector.selected():continue
+            if len(self.supplier_selector.selected())!=len(self.supplier_selector.options) and expense['supplier'] not in self.supplier_selector.selected():continue
+            if (expense['verification_status'] or 'Unverified') not in self.verification_selector.selected():continue
+            text=f"{loan['reference']} {loan['lender']} {loan['borrower']} {expense['name']} {expense['item']} {money(loan['amount_cents'])}".lower().replace(',','')
+            if any(t not in text for t in self.filter_var.get().lower().replace(',','').split()):continue
+            allocation='';withdrawal='';method='Salary Deduction'
+            if loan['payment_id']:
+                p=self.db.one('SELECT * FROM payments WHERE id=?',(loan['payment_id'],))
+                method=p['method']
+                if p['cash_allocation_id']:
+                    allocation=self.db.one('SELECT reference FROM cash_allocations WHERE id=?',(p['cash_allocation_id'],))['reference']
+                    withdrawal=self.db.allocation_source_text(p['cash_allocation_id'])
+            method_filter='Bank Transfer' if 'bank' in method.lower() else 'Cash' if method.lower()=='cash' else 'Other'
+            if method_filter not in self.mop_selector.selected():continue
+            self.tree.insert('','end',iid=str(-loan['id']),values=(loan['lender'],loan['reference'],
+                'Recoverable — Outstanding' if loan['outstanding_cents'] else 'Recoverable — Settled',
+                expense['verification_status'] or 'Unverified','Linked to original expense',
+                f"Funds provided to {loan['borrower']}",method,'',money(loan['amount_cents']),
+                money(loan['repaid_cents']),'Excluded from costs',money(loan['amount_cents']),
+                'No supplier bill',loan['loan_date'],allocation,withdrawal,expense['item'],expense['supplier'],expense['area'],'',
+                'Linked funding record',loan['lender'],money(loan['outstanding_cents'])),tags=('recoverable',))
+        self.tree.tag_configure('recoverable',foreground='#2563EB')
 
     def open_date_filter(self, boundary):
         variable = self.date_from_filter if boundary == "from" else self.date_to_filter
@@ -11546,6 +12315,129 @@ class ExpensesTab(BaseTab):
         return {row["name"]: row["id"] for row in self.db.all(
             "SELECT id,name FROM phases WHERE project_id=? ORDER BY sort_order,id", (project_id,))}
 
+    def _build_project_funding_page(self):
+        bar=ttk.Frame(self.funding_page);bar.pack(fill='x')
+        self.loan_project=tk.StringVar(value=ALL_PROJECTS_LABEL)
+        ttk.Label(bar,text='Project').pack(side='left')
+        self.loan_project_widget=ttk.Combobox(bar,textvariable=self.loan_project,state='readonly',width=28)
+        self.loan_project_widget.pack(side='left',padx=8)
+        self.loan_project_widget.bind('<<ComboboxSelected>>',lambda _e:self.refresh_project_funding())
+        ttk.Button(bar,text='Record repayment',command=self.record_project_repayment).pack(side='right')
+        ttk.Button(bar,text='Undo selected repayment',command=self.undo_project_repayment).pack(side='right',padx=6)
+        self.loan_summary=ttk.Label(self.funding_page,style='Section.TLabel')
+        self.loan_summary.pack(anchor='w',pady=8)
+        ttk.Label(self.funding_page,text='Lender: recoverable money out. Borrower: supplier paid, project repayment outstanding. These are linked records, not duplicate expenses.',style='Muted.TLabel',wraplength=1000).pack(anchor='w')
+        self.loan_tree=make_tree(self.funding_page,[('ref','Borrowing reference',145),('lender','Funding project',150),
+            ('borrower','Expense project',150),('expense','Linked expense',210),('kind','Type',125),
+            ('amount','Provided',100),('repaid','Repaid',95),('balance','Outstanding',100),('status','Status',100),('date','Date',100)])
+        self.loan_tree.bind('<<TreeviewSelect>>',lambda _e:self.refresh_project_repayments())
+        self.loan_tree.bind('<Double-1>',self.open_borrowed_expense)
+        ttk.Label(self.funding_page,text='Repayment history for the selected borrowing',style='Section.TLabel').pack(anchor='w',pady=5)
+        self.loan_repayments=make_tree(self.funding_page,[('date','Date',105),('amount','Amount',100),('ref','Reference',180),('notes','Notes',260),('status','Status',100)])
+
+    def pay_selected_weekly_payrolls(self):
+        ids=[int(i) for i in self.tree.selection()]
+        if any(eid<0 for eid in ids):
+            messagebox.showinfo(APP_TITLE,'Select the original payroll expenses, not recoverable funding mirror rows.',parent=self);return
+        if not ids:
+            messagebox.showinfo(APP_TITLE,'Select the weekly payroll expenses to distribute from one allocation.',parent=self);return
+        allocations=self.db.active_allocation_options()
+        funding={'Each expense project’s own funds':None}
+        funding.update({f"{p['name']} [#{p['id']}]":p['id'] for p in self.db.all("SELECT id,name FROM projects WHERE status<>'Completed' ORDER BY name")})
+        data=dialog(self,'Distribute weekly payroll payment',[
+            ('allocation','Shared PC / DP allocation',list(allocations)),('funding','Funding project',list(funding)),
+            ('date','Payment date')],{'funding':next(iter(funding)),'date':date.today().isoformat()},required_keys=('allocation','funding','date'))
+        if not data:return
+        try:
+            allocation_id=allocations[data['allocation']]
+            total=sum(self.db.one("""SELECT e.total_cents-COALESCE((SELECT SUM(amount_cents) FROM payments
+                WHERE expense_id=e.id AND accounting_excluded=0),0) n FROM expenses e WHERE id=?""",(eid,))['n'] for eid in ids)
+            custody=self.db.one("""SELECT COALESCE(a.receiver_registry_id,h.registry_head_id,h.id) registry_id
+                FROM cash_allocations a JOIN project_heads h ON h.id=COALESCE(a.custodian_head_id,a.responsible_head_id)
+                WHERE a.id=? AND a.voided=0""",(allocation_id,))
+            if not custody:raise ValueError('This cash allocation is no longer available.')
+            approval=self.app.authorize_registered_head('Distribute payroll payment',
+                f"{len(ids)} payroll expenses; {money(total)} from {data['allocation'].split(' | ')[0]}; funding: {data['funding']}.",registry_id=custody['registry_id'])
+            if not approval:return
+            head=self.db.project_head_for_registry(custody['registry_id'],self.db.one('SELECT project_id FROM expenses WHERE id=?',(ids[0],))['project_id'])
+            if not head:raise ValueError('The cash custodian is not assigned to an active project.')
+            result=self.db.pay_weekly_project_expenses(ids,allocation_id,data['date'],head['id'],funding[data['funding']])
+            self.app.refresh_all()
+            messagebox.showinfo(APP_TITLE,f"Payroll paid: {money(result['total_cents'])}\nAllocation remaining: {money(result['remaining_cents'])}",parent=self)
+        except (ValueError,sqlite3.Error,KeyError) as exc:messagebox.showerror(APP_TITLE,str(exc),parent=self)
+
+    def refresh_project_funding(self):
+        self.loan_project_options={ALL_PROJECTS_LABEL:None}
+        self.loan_project_options.update({f"{p['name']} [#{p['id']}]":p['id'] for p in self.db.all('SELECT id,name FROM projects ORDER BY name')})
+        self.loan_project_widget.configure(values=list(self.loan_project_options))
+        if self.loan_project.get() not in self.loan_project_options:self.loan_project.set(ALL_PROJECTS_LABEL)
+        pid=self.loan_project_options[self.loan_project.get()]
+        self.loan_rows={r['id']:r for r in self.db.interproject_loans(pid,include_inactive=True)}
+        self.loan_tree.delete(*self.loan_tree.get_children())
+        for row in self.loan_rows.values():
+            self.loan_tree.insert('','end',iid=row['id'],values=(row['reference'],row['lender'],row['borrower'],row['expense_name'],
+                row['kind'],money(row['amount_cents']),money(row['repaid_cents']),money(row['outstanding_cents']),
+                'Reversed' if not row['active'] else 'Outstanding' if row['outstanding_cents'] else 'Settled',row['loan_date']))
+        if pid:
+            receivable,payable=self.db.interproject_balance(pid)
+            self.loan_summary.configure(text=f'Recoverable: {money(receivable)} | Owed to other projects: {money(payable)}')
+        else:
+            total=sum(r['outstanding_cents'] for r in self.loan_rows.values())
+            self.loan_summary.configure(text=f'Outstanding project borrowing: {money(total)} (excluded from duplicate expense totals)')
+        self.refresh_project_repayments()
+
+    def refresh_project_repayments(self):
+        self.loan_repayments.delete(*self.loan_repayments.get_children())
+        selected=self.loan_tree.selection()
+        if not selected:return
+        for row in self.db.all('SELECT * FROM project_funding_repayments WHERE loan_id=? ORDER BY id',(int(selected[0]),)):
+            self.loan_repayments.insert('','end',iid=row['id'],values=(row['repayment_date'],money(row['amount_cents']),row['reference'],row['notes'],'Undone' if row['voided'] else 'Recorded'))
+
+    def open_borrowed_expense(self,_event=None):
+        selected=self.loan_tree.selection()
+        if selected:
+            row=self.loan_rows[int(selected[0])]
+            if row['expense_id']:self.show_expense_details(row['expense_id'])
+
+    def record_project_repayment(self):
+        selected=self.loan_tree.selection()
+        if not selected:return
+        loan=self.loan_rows[int(selected[0])]
+        if not loan['active'] or loan['outstanding_cents']<=0:return
+        data=dialog(self,'Repay project borrowing',[
+            ('_loan','Borrowing',None,'display'),('amount','Amount'),('repayment_date','Repayment date'),
+            ('reference','Supporting reference'),('notes','Notes')],
+            {'_loan':f"{loan['borrower']} owes {loan['lender']}: {loan['reference']}",
+             'amount':money(loan['outstanding_cents']),'repayment_date':date.today().isoformat()},required_keys=('amount','repayment_date','reference'))
+        if not data:return
+        try:
+            amount=cents(data['amount'])
+            head=self.app.authorize_for_project(loan['borrower_project_id'],'Repay project borrowing',
+                f"{loan['borrower']} returns {money(amount)} of available project funds to {loan['lender']}; no new expense or bank transaction.")
+            if not head:return
+            self.db.repay_project_funding(loan['id'],amount,data['repayment_date'],head['id'],data['reference'],data['notes'])
+            self.app.refresh_all()
+        except (ValueError,sqlite3.Error) as exc:messagebox.showerror(APP_TITLE,str(exc),parent=self)
+
+    def undo_project_repayment(self):
+        selected=self.loan_repayments.selection()
+        if not selected:return
+        repayment=self.db.one('SELECT * FROM project_funding_repayments WHERE id=?',(int(selected[0]),))
+        if repayment['voided']:return
+        loan=self.loan_rows[repayment['loan_id']]
+        try:
+            if self.db.project_budget(loan['lender_project_id'])[2]<repayment['amount_cents']:
+                raise ValueError('The lender has already used these repaid funds. Restore sufficient funds before undoing repayment.')
+            head=self.app.authorize_for_project(loan['borrower_project_id'],'Undo project repayment',
+                f"{loan['reference']}: undo {money(repayment['amount_cents'])} repayment; retain its audit history.")
+            if not head:return
+            with self.db.conn:
+                self.db.conn.execute('UPDATE project_funding_repayments SET voided=1 WHERE id=?',(repayment['id'],))
+                self.db.conn.execute('INSERT INTO audit_log(project_id,action,details) VALUES(?,?,?)',
+                    (loan['borrower_project_id'],'INTERPROJECT_REPAYMENT_UNDONE',f"{loan['reference']} repayment #{repayment['id']}: {money(repayment['amount_cents'])}"))
+            self.app.refresh_all()
+        except (ValueError,sqlite3.Error) as exc:messagebox.showerror(APP_TITLE,str(exc),parent=self)
+
     def add(self, initial=None):
         if not self.db.one("SELECT 1 FROM bank_accounts WHERE active=1 LIMIT 1"):
             messagebox.showerror(APP_TITLE, "Enroll a bank account in Remittances before adding expenses."); return
@@ -11563,7 +12455,7 @@ class ExpensesTab(BaseTab):
             paid_items = [item for items in groups.values() for item in items if item["payment_amount_cents"] > 0]
             staged_cash = sum(item["payment_amount_cents"] for item in paid_items
                               if "bank" not in item.get("payment_method", "").lower())
-            if staged_cash > self.db.cash_summary()[2]:
+            if staged_cash > 0 and staged_cash > self.db.cash_summary()[2]:
                 raise ValueError("This batch exceeds the shared cash on hand.")
             allocation_holders = {}
             cash_allocation_ids = {item.get("cash_allocation_id") for item in paid_items
@@ -11599,6 +12491,15 @@ class ExpensesTab(BaseTab):
                     )
                 details = (f"{len(items)} item(s) for {project['name']} totaling "
                            f"{money(sum(x['total_cents'] for x in items))}")
+                funding_totals={}
+                for item in items:
+                    if item['payment_amount_cents']>0:
+                        pid=item.get('funding_project_id',project_id)
+                        funding_totals[pid]=funding_totals.get(pid,0)+item['payment_amount_cents']
+                if funding_totals:
+                    details+='; funds: '+', '.join(f"{self.db.one('SELECT name FROM projects WHERE id=?',(pid,))['name']} {money(value)}" for pid,value in funding_totals.items())
+                    if any(pid!=project_id for pid in funding_totals):
+                        details+='; borrowed amounts remain owed to the funding project, not to the paid supplier'
                 if holder_ids:
                     registry_id = next(iter(holder_ids))
                     registered = self.app.authorize_registered_head(
@@ -11624,14 +12525,16 @@ class ExpensesTab(BaseTab):
                                   if item.get("bank_account_id") == bank_id)
                 if staged_bank > self.db.bank_balance(bank_id):
                     raise ValueError("This batch exceeds an enrolled bank account's available balance.")
+            for funding_pid in {item.get('funding_project_id',item['project_id']) for item in paid_items}:
+                required=sum(item['payment_amount_cents'] for item in paid_items
+                    if item.get('funding_project_id',item['project_id'])==funding_pid)
+                if required>self.db.project_budget(funding_pid)[2]:
+                    raise ValueError('This batch exceeds a funding project\'s available funds.')
             with self.db.conn:
                 for project_id, items in groups.items():
-                    _deposited, _paid, remaining = self.db.project_budget(project_id)
-                    _commit_deposit, _committed, commitment_remaining = self.db.project_commitment_budget(project_id)
+                    _contract, _committed, commitment_remaining = self.db.project_cost_budget(project_id)
                     if sum(x["total_cents"] for x in items) > commitment_remaining:
-                        raise ValueError("A project's batch exceeds its uncommitted deposited budget.")
-                    if remaining <= 0 or sum(x["payment_amount_cents"] for x in items) > remaining:
-                        raise ValueError("A project's staged payments exceed its remaining deposited budget.")
+                        raise ValueError("A project's batch exceeds its remaining contract spending limit.")
                     phases = self.phase_map(project_id)
                     committed_at = local_timestamp()
                     batch_reference = self.db._next_system_reference(
@@ -11660,15 +12563,15 @@ class ExpensesTab(BaseTab):
                     for item in items:
                         cursor = self.db.conn.execute("""INSERT INTO expenses(project_id,name,item,dimensions,supplier,
                             qty,unit,unit_price_cents,total_cents,phase_id,area,trade,expense_date,due_date,invoice_no,
-                            notes,authorized_by_head_id,status,default_cash_allocation_id,expense_batch_id)
-                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            notes,authorized_by_head_id,status,default_cash_allocation_id,expense_batch_id,funding_project_id)
+                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                             (project_id, item["name"], item["item"], item["dimensions"], item["supplier"], item["qty"],
                              item["unit"], item["unit_price_cents"], item["total_cents"], phases.get(item["phase"]),
                              item["area"], item["trade"], item["expense_date"], item["due_date"], item["invoice_no"],
                              ((item["notes"] + " | " if item["notes"] else "") +
                               (f"Import row {item.get('import_source_row')}" if item.get("import_source_row") else "")),
                              approvals[project_id]["id"], item["status"],
-                             item.get("cash_allocation_id"), batch_id))
+                             item.get("cash_allocation_id"), batch_id,item.get('funding_project_id',project_id)))
                         if item["payment_amount_cents"] > 0:
                             bank_transfer = "bank" in item["payment_method"].lower()
                             payment_reference = self.db._next_system_reference(
@@ -11676,12 +12579,13 @@ class ExpensesTab(BaseTab):
                             ) if bank_transfer else ""
                             payment_cursor = self.db.conn.execute("""INSERT INTO payments(expense_id,amount_cents,payment_date,method,
                                 reference,notes,bank_account_id,authorized_by_head_id,cash_allocation_id,
-                                system_reference,transaction_time)
-                                VALUES(?,?,?,?,?,'Initial payment from bulk entry',?,?,?,?,?)""",
+                                system_reference,transaction_time,funding_project_id)
+                                VALUES(?,?,?,?,?,'Initial payment from bulk entry',?,?,?,?,?,?)""",
                                 (cursor.lastrowid, item["payment_amount_cents"], item["expense_date"],
                                  item["payment_method"], "", item.get("bank_account_id"),
                                  approvals[project_id]["id"], item.get("cash_allocation_id"),
-                                 payment_reference, local_timestamp()))
+                                 payment_reference, local_timestamp(),item.get('funding_project_id',project_id)))
+                            self.db._sync_project_funding_loan(payment_cursor.lastrowid)
                             if item.get("cash_allocation_id"):
                                 self.db.register_allocation_payment(
                                     item["cash_allocation_id"], payment_cursor.lastrowid,
@@ -11720,7 +12624,7 @@ class ExpensesTab(BaseTab):
             messagebox.showerror(APP_TITLE, str(exc), parent=self)
 
     def verify_selected(self):
-        expense_ids = [int(value) for value in self.tree.selection()]
+        expense_ids = [int(value) for value in self.tree.selection() if int(value)>0]
         if not expense_ids:
             messagebox.showinfo(APP_TITLE, "Select one or more expenses to verify.", parent=self)
             return
@@ -11808,13 +12712,15 @@ class ExpensesTab(BaseTab):
     def edit(self):
         expense_id = self.selected_id(self.tree)
         if not expense_id: return
+        if self.db.one("SELECT 1 FROM payroll_batches WHERE expense_id=? AND status='Committed'",(expense_id,)):
+            messagebox.showinfo(APP_TITLE,'Reopen this payroll from Committed Weekly Payrolls to revise its linked attendance and advance deductions safely.',parent=self);return
         row = self.db.one("""SELECT e.*,COALESCE(ph.name,'') phase,
             COALESCE((SELECT SUM(amount_cents) FROM payments
                       WHERE expense_id=e.id AND accounting_excluded=0),0) payment_total FROM expenses e
             LEFT JOIN phases ph ON ph.id=e.phase_id WHERE e.id=?""", (expense_id,))
         projects = self.project_options(); current = next((label for label,pid in projects.items() if pid == row["project_id"]), "")
         areas = [r["name"] for r in self.db.all("SELECT name FROM expense_categories ORDER BY name COLLATE NOCASE")]
-        fields = [("project", "Project", list(projects)), ("name", "Expense name"), ("item", "Item / description"),
+        fields = [("project", "Expense project", list(projects)), ('funding_project','Intended funding project (new payments)',list(projects)), ("name", "Expense name"), ("item", "Item / description"),
             ("dimensions", "Size / dimensions"), ("supplier", "Supplier (optional)"), ("qty", "Quantity"),
             ("unit", "Unit"), ("unit_price", "Unit price"),
             ("phase", "Phase", [""] + list(self.phase_map(row["project_id"]))),
@@ -11822,6 +12728,7 @@ class ExpensesTab(BaseTab):
             ("expense_date", "Expense date"), ("due_date", "Due date"),
             ("invoice_no", "Invoice / reference"), ("notes", "Notes")]
         initial = dict(row); initial.update(project=current, unit_price=money(row["unit_price_cents"]))
+        initial['funding_project']=next((label for label,pid in projects.items() if pid==(row['funding_project_id'] or row['project_id'])),current)
         data = dialog(self, "Edit Expense — All Heads Required", fields, initial)
         if not data: return
         new_project_id = projects.get(data["project"])
@@ -11838,10 +12745,11 @@ class ExpensesTab(BaseTab):
                 raise ValueError("Select a project.")
             if total < row["payment_total"]:
                 raise ValueError("Expense total cannot be lower than its recorded payments.")
-            if new_project_id != row["project_id"] and row["payment_total"]:
-                _deposited, _paid, available = self.db.project_budget(new_project_id)
-                if row["payment_total"] > available:
-                    raise ValueError("The destination project cannot cover this expense's recorded payments.")
+            if new_project_id != row['project_id']:
+                self.db.assert_funding_reversal_allowed(expense_id)
+            _limit,_committed,available=self.db.project_cost_budget(new_project_id)
+            if total>available+(row['total_cents'] if new_project_id==row['project_id'] else 0):
+                raise ValueError('The revised expense exceeds the destination project\'s contract spending limit.')
             status = "Paid" if row["payment_total"] >= total and total > 0 else (
                 "Partially Paid" if row["payment_total"] > 0 else "Unpaid"
             )
@@ -11850,9 +12758,14 @@ class ExpensesTab(BaseTab):
                 valid_date(data["expense_date"], True), valid_date(data["due_date"]), data["invoice_no"], data["notes"],
                 status, expense_id)
             with self.db.conn:
+                if new_project_id!=row['project_id']:
+                    self.db.conn.execute('UPDATE payments SET funding_project_id=COALESCE(funding_project_id,?) WHERE expense_id=? AND accounting_excluded=0',(row['project_id'],expense_id))
                 self.db.conn.execute("""UPDATE expenses SET project_id=?,name=?,item=?,dimensions=?,supplier=?,qty=?,unit=?,
                     unit_price_cents=?,total_cents=?,phase_id=?,area=?,trade=?,expense_date=?,due_date=?,invoice_no=?,notes=?,
                     status=?,verification_status='Unverified',verified_at='' WHERE id=?""", values)
+                self.db.conn.execute('UPDATE expenses SET funding_project_id=? WHERE id=?',(projects.get(data['funding_project']) or new_project_id,expense_id))
+                for payment in self.db.all('SELECT id FROM payments WHERE expense_id=? AND accounting_excluded=0',(expense_id,)):
+                    self.db._sync_project_funding_loan(payment['id'])
                 self.db.conn.execute("INSERT INTO audit_log(project_id,action,details) VALUES(?,?,?)",
                     (new_project_id, "EXPENSE_EDITED_ALL_HEADS", f"#{expense_id} approved by {', '.join(approvals)}"))
             self.app.refresh_all()
@@ -11891,6 +12804,8 @@ class ExpensesTab(BaseTab):
         # before confirmation; the selected source determines which holder is
         # recorded for the completed form.
         allocation_lookup = self.db.active_allocation_options()
+        funding_projects={f"{p['name']} [#{p['id']}]":p['id'] for p in self.db.all("SELECT id,name FROM projects WHERE status<>'Completed' ORDER BY name")}
+        default_funding=next((label for label,pid in funding_projects.items() if pid==(row['funding_project_id'] or row['project_id'])), '')
         preferred_allocation = next(
             (label for label, allocation_id in allocation_lookup.items()
              if allocation_id == preferred_allocation_id), "",
@@ -11899,6 +12814,7 @@ class ExpensesTab(BaseTab):
             ("_cash_available", "Shared cash on-hand", None, "display"),
             ("_unallocated", "Unallocated cash", None, "display"),
             ("_project_budget", "Project payment budget", None, "display"),
+            ('funding_project','Funding project',list(funding_projects)),
             ("amount", f"Amount (expense balance {money(balance)})"),
             ("payment_date", "Payment date"), ("method", "Method", ["Cash", "Bank Transfer"]),
             ("allocation", "Petty cash / direct procurement ref.", [""] + list(allocation_lookup)),
@@ -11906,11 +12822,16 @@ class ExpensesTab(BaseTab):
             ("reference", "Reference"), ("notes", "Notes")],
             {"_cash_available": money(cash_available), "_unallocated": money(self.db.unallocated_cash()),
              "_project_budget": money(available),
+             'funding_project':default_funding,
              "amount": money(balance), "payment_date": date.today().isoformat(),
              "method": "Cash", "allocation": preferred_allocation},
             required_keys=("amount", "payment_date", "method"))
         if not data: return False
         try:
+            funding_project_id=funding_projects.get(data['funding_project'])
+            if not funding_project_id:
+                raise ValueError('Select an active funding project.')
+            available=self.db.project_budget(funding_project_id)[2]
             amount = cents(data["amount"])
             if amount <= 0 or amount > balance: raise ValueError("Payment must be positive and no more than the balance.")
             bank_account_id = banks.get(data["bank"]) if "bank" in data["method"].lower() else None
@@ -11940,7 +12861,7 @@ class ExpensesTab(BaseTab):
                     return False
                 amount = source_available
             self.db.validate_payment_source(
-                row["project_id"], amount, data["method"], bank_account_id,
+                funding_project_id, amount, data["method"], bank_account_id,
                 cash_allocation_id, require_cash_allocation=(data["method"] == "Cash"),
             )
             if cash_allocation_id:
@@ -11957,7 +12878,7 @@ class ExpensesTab(BaseTab):
                     raise ValueError("The selected petty-cash/direct-procurement reference is no longer active.")
                 payment_authorizer = self.app.authorize_registered_head(
                     "Authorize payment from assigned cash",
-                    f"{custody['reference']} will pay {money(amount)} toward expense #{expense_id}.",
+                    f"{custody['reference']} will pay {money(amount)} toward expense #{expense_id}; project funds: {data['funding_project']}.",
                     registry_id=custody["holder_registry"],
                 )
                 if not payment_authorizer:
@@ -11971,7 +12892,7 @@ class ExpensesTab(BaseTab):
                 payment_authorizer = self.app.authorize_for_project(
                     row["project_id"],
                     "Authorize bank-transfer payment",
-                    f"Expense #{expense_id}: {row['name']} — {money(amount)} from {data['bank']}.",
+                    f"Expense #{expense_id}: {row['name']} — {money(amount)} from {data['bank']}; project funds: {data['funding_project']}.",
                 )
                 if not payment_authorizer:
                     return False
@@ -11980,7 +12901,7 @@ class ExpensesTab(BaseTab):
             # Recheck immediately before committing in case a selected balance
             # changed while the confirmation window was open.
             self.db.validate_payment_source(
-                row["project_id"], amount, data["method"], bank_account_id,
+                funding_project_id, amount, data["method"], bank_account_id,
                 cash_allocation_id, require_cash_allocation=(data["method"] == "Cash"),
             )
             new_paid = row["paid"] + amount
@@ -11989,11 +12910,12 @@ class ExpensesTab(BaseTab):
             ) if "bank" in data["method"].lower() else ""
             with self.db.conn:
                 payment_cursor = self.db.conn.execute("""INSERT INTO payments(expense_id,amount_cents,payment_date,method,reference,notes,
-                    bank_account_id,authorized_by_head_id,cash_allocation_id,system_reference,transaction_time)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (expense_id, amount,
+                    bank_account_id,authorized_by_head_id,cash_allocation_id,system_reference,transaction_time,funding_project_id)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (expense_id, amount,
                     payment_date, data["method"], data["reference"], data["notes"],
                     bank_account_id, authorizing_identity["id"], cash_allocation_id,
-                    system_reference, local_timestamp()))
+                    system_reference, local_timestamp(),funding_project_id))
+                self.db._sync_project_funding_loan(payment_cursor.lastrowid)
                 if cash_allocation_id:
                     self.db.register_allocation_payment(
                         cash_allocation_id, payment_cursor.lastrowid, expense_id, amount,
@@ -12051,16 +12973,19 @@ class ExpensesTab(BaseTab):
         initial_bank = next(
             (label for label, bank_id in banks.items() if bank_id == row["bank_account_id"]), ""
         )
+        funding_projects={f"{p['name']} [#{p['id']}]":p['id'] for p in self.db.all("SELECT id,name FROM projects WHERE status<>'Completed' ORDER BY name")}
         initial = {
             "amount": money(row["amount_cents"]), "payment_date": row["payment_date"],
             "method": "Bank Transfer" if "bank" in (row["method"] or "").lower() else "Cash",
             "allocation": initial_allocation, "bank": initial_bank,
             "reference": row["reference"], "notes": row["notes"], "reason": "",
+            'funding_project':next((label for label,pid in funding_projects.items() if pid==(row['funding_project_id'] or row['project_id'])),''),
         }
         while True:
             data = dialog(parent, "Reassign Payment Source", [
                 ("amount", "Amount"), ("payment_date", "Payment date"),
                 ("method", "Method", ["Cash", "Bank Transfer"]),
+                ('funding_project','Funding project',list(funding_projects)),
                 ("allocation", "Petty cash / direct procurement ref.", [""] + list(allocations)),
                 ("bank", "Bank account for transfer", [""] + list(banks)),
                 ("reference", "Reference"), ("notes", "Notes"),
@@ -12076,6 +13001,8 @@ class ExpensesTab(BaseTab):
                 is_bank = "bank" in data["method"].lower()
                 bank_account_id = banks.get(data["bank"]) if is_bank else None
                 allocation_id = allocations.get(data["allocation"]) if not is_bank else None
+                funding_project_id=funding_projects.get(data['funding_project'])
+                if not funding_project_id:raise ValueError('Select an active funding project.')
                 if is_bank:
                     if not bank_account_id:
                         raise ValueError("Select the bank account used for this transfer.")
@@ -12092,6 +13019,10 @@ class ExpensesTab(BaseTab):
                     if "bank" not in (row["method"] or "").lower():
                         cash_available += row["amount_cents"]
                     source_available = min(source_available, cash_available)
+                project_available=self.db.project_budget(funding_project_id)[2]
+                if funding_project_id==(row['funding_project_id'] or row['project_id']):project_available+=row['amount_cents']
+                if funding_project_id!=(row['funding_project_id'] or row['project_id']) or amount>row['amount_cents']:
+                    source_available=min(source_available,project_available)
                 if amount > source_available:
                     if source_available <= 0:
                         raise ValueError("The selected funding source has no available balance.")
@@ -12117,7 +13048,7 @@ class ExpensesTab(BaseTab):
                     method=data["method"], cash_allocation_id=allocation_id,
                     bank_account_id=bank_account_id, reference=data["reference"],
                     notes=data["notes"], correction_reason=data["reason"],
-                    authorized_by_head_id=head["id"],
+                    authorized_by_head_id=head["id"],funding_project_id=funding_project_id,
                 )
                 messagebox.showinfo(
                     APP_TITLE,
@@ -12167,6 +13098,10 @@ class ExpensesTab(BaseTab):
                 )
                 return
         if expense_id and expense:
+            if not expense['voided']:
+                try:self.db.assert_funding_reversal_allowed(expense_id)
+                except ValueError as exc:
+                    messagebox.showerror(APP_TITLE,str(exc),parent=self);return
             action = "Restore expense" if expense["voided"] else "Void expense"
             head = self.app.authorize_for_project(
                 expense["project_id"], action,
@@ -12403,6 +13338,7 @@ class ExpensesTab(BaseTab):
 
     def refresh(self):
         projects = self.project_options()
+        self.refresh_project_funding()
         self.project_selector.set_projects([
             {"id": project_id, "name": label} for label, project_id in projects.items()
         ])
@@ -12423,6 +13359,9 @@ class ExpensesTab(BaseTab):
         self.funding_selector.set_options((label, label) for label in funding)
         self.tree.delete(*self.tree.get_children()); self.current_rows, project_ids = self.filtered_rows()
         total = 0; filtered_payments = 0; filtered_outstanding = 0; verified_total = 0
+        borrowing={}
+        for loan in self.db.interproject_loans():
+            borrowing[loan['expense_id']]=borrowing.get(loan['expense_id'],0)+loan['outstanding_cents']
         for row in self.current_rows:
             outstanding = max(0, row["total_cents"] - row["payment_total"])
             net_total = max(0, row["total_cents"] - row["recovery_total"])
@@ -12454,7 +13393,13 @@ class ExpensesTab(BaseTab):
                 money(row["recovery_total"]), money(net_total), money(row["payment_total"]),
                 money(outstanding), payment_dates, allocation, withdrawal, row["item"],
                 row["supplier"], row["area"], row["phase"],
-                row["authorized_by"] or "Legacy / not recorded"), tags=(row_tag,))
+                row["authorized_by"] or "Legacy / not recorded",
+                ' / '.join(p['name'] for p in self.db.all("""SELECT DISTINCT pr.name FROM projects pr
+                    JOIN payments p ON COALESCE(p.funding_project_id,?)=pr.id
+                    WHERE p.expense_id=? AND p.accounting_excluded=0""",(row['project_id'],row['id']))) or
+                self.db.one('SELECT name FROM projects WHERE id=?',(row['funding_project_id'] or row['project_id'],))['name'],
+                money(borrowing.get(row['id'],0))), tags=(row_tag,))
+        self._display_lender_recoverables(project_ids)
         _withdrawn, _cash_spent, cash = self.db.cash_summary()
         self.total_value.config(text=money(total))
         self.verified_value.config(text=money(verified_total), fg=GREEN)
@@ -12475,7 +13420,7 @@ class ExpensesTab(BaseTab):
             for pid in project_ids
         )
         committed = sum(self.db.project_commitment_budget(pid)[1] for pid in project_ids)
-        budget = deposited - committed
+        budget = sum(self.db.project_cost_budget(pid)[2] for pid in project_ids)
         collectible = contract - deposited
         self.deposit_value.config(text=money(deposited), fg="#2563EB")
         self.budget_value.config(text=money(budget), fg=GREEN if budget >= 0 else RED)
@@ -12490,8 +13435,9 @@ class ExpensesTab(BaseTab):
             "for this project selection."
         )
         self.reconciliation_label.config(
-            text=(f"Reconciliation: deposited {money(deposited)} = all active expenses {money(committed)} + "
-                  f"budget remaining {money(budget)}. {filter_note} Cash on-hand is shared across projects.")
+            text=(f"Cost budget remaining {money(budget)} | Available project funds {money(sum(self.db.project_budget(pid)[2] for pid in project_ids))} | "
+                  f"Recoverable {money(sum(self.db.interproject_balance(pid)[0] for pid in project_ids))}; owed {money(sum(self.db.interproject_balance(pid)[1] for pid in project_ids))}. "
+                  f"{filter_note} Cash on-hand is shared; supplier payments and project repayments are separate.")
         )
         self._refresh_head_cash_breakdown()
         self._refresh_cash_tab()
@@ -12536,7 +13482,10 @@ class ExpensesTab(BaseTab):
             f"Outstanding payments {money(sum(max(0, row['total_cents']-row['payment_total']) for row in rows if not row['voided']))}",
             f"Cash on-hand {money(cash)}",
             f"Deposited {money(deposited)}",
-            f"Budget remaining {money(deposited-committed)}",
+            f"Cost budget remaining {money(sum(self.db.project_cost_budget(pid)[2] for pid in project_ids))}",
+            f"Available project funds {money(sum(self.db.project_budget(pid)[2] for pid in project_ids))}",
+            f"Inter-project recoverable {money(sum(self.db.interproject_balance(pid)[0] for pid in project_ids))}",
+            f"Inter-project owed {money(sum(self.db.interproject_balance(pid)[1] for pid in project_ids))}",
             f"Total contract {money(contract)}",
             f"Contract collectible {money(contract-deposited)}",
         ]
@@ -13281,21 +14230,51 @@ class EmployeeProfileDialog(tk.Toplevel):
         self.transient(parent); self.grab_set(); self.bind("<Escape>",lambda _e:self.destroy())
 
 
+class ProjectPayrollReview(tk.Toplevel):
+    def __init__(self,parent,rows,week_start,week_end):
+        super().__init__(parent);self.title('Review project payroll breakdown');self.result=None
+        self.geometry('850x450');self.minsize(760,380)
+        body=ttk.Frame(self,padding=18);body.pack(fill='both',expand=True)
+        ttk.Label(body,text=f'Weekly payroll: {week_start} to {week_end}',style='DialogTitle.TLabel').pack(anchor='w')
+        ttk.Label(body,text='Each selected project gets its own unpaid net-payroll expense. Advances are deducted once across the shared week.',wraplength=790,style='Muted.TLabel').pack(anchor='w',pady=8)
+        self.choices={}
+        total=0
+        for row in rows:
+            var=tk.BooleanVar(value=True);self.choices[row['project_id']]=var
+            ttk.Checkbutton(body,variable=var,text=f"{row['name']} — Gross {money(row['gross'])}; CA {money(row['deductions'])}; Corrections {money(row['adjustments'])}; Net {money(row['net'])}").pack(anchor='w',pady=5)
+            total+=row['net']
+        ttk.Label(body,text=f'Combined net payroll: {money(total)}',style='Section.TLabel').pack(anchor='w',pady=12)
+        actions=ttk.Frame(body);actions.pack(side='bottom',fill='x')
+        ttk.Button(actions,text='Cancel',command=self.destroy).pack(side='right')
+        ttk.Button(actions,text='Continue to payroll authorization',command=self.finish,style='Primary.TButton').pack(side='right',padx=8)
+        self.transient(parent);self.grab_set()
+    def finish(self):
+        selected=[pid for pid,var in self.choices.items() if var.get()]
+        if not selected:
+            messagebox.showinfo(APP_TITLE,'Select at least one project.',parent=self);return
+        self.result=selected;self.destroy()
+
+
 class BatchAttendanceDialog(tk.Toplevel):
-    def __init__(self, parent, employees):
-        super().__init__(parent); self.title("Batch Attendance"); self.geometry("920x650"); self.result=None
+    def __init__(self, parent, employees, projects=None, default_project_id=None, on_submit=None):
+        super().__init__(parent); self.title("Batch Attendance"); self.geometry("1120x650"); self.result=None
+        self.projects=projects or {}
+        self.on_submit=on_submit
+        self.default_project=next((label for label,pid in self.projects.items() if pid==default_project_id),next(iter(self.projects),''))
         body=ttk.Frame(self,padding=18); body.pack(fill="both",expand=True)
         ttk.Label(body,text="Mark batch attendance",style="DialogTitle.TLabel").pack(anchor="w")
-        ttk.Label(body,text="Select employees and adjust individual times. Lunch overlap from 12:00-1:00 PM is unpaid.",style="Muted.TLabel").pack(anchor="w",pady=(2,10))
+        ttk.Label(body,text="Select the work project for each segment. Add another segment for split days; overlapping times are rejected. Lunch 12:00–13:00 is unpaid.",style="Muted.TLabel",wraplength=1050).pack(anchor="w",pady=(2,10))
         defaults=ttk.Frame(body); defaults.pack(fill="x")
         self.work_date=tk.StringVar(value=date.today().isoformat()); self.default_in=tk.StringVar(value="08:00"); self.default_out=tk.StringVar(value="17:00")
+        self.default_widgets=[]
         for label,var,width in (("Date",self.work_date,12),("Default in",self.default_in,8),("Default out",self.default_out,8)):
-            ttk.Label(defaults,text=label).pack(side="left",padx=(0,4)); ttk.Entry(defaults,textvariable=var,width=width).pack(side="left",padx=(0,10))
+            ttk.Label(defaults,text=label).pack(side="left",padx=(0,4))
+            widget=ttk.Entry(defaults,textvariable=var,width=width);widget.pack(side="left",padx=(0,10));self.default_widgets.append(widget)
         self.search=tk.StringVar(); ttk.Label(defaults,text="Search").pack(side="left",padx=(10,4))
         entry=ttk.Entry(defaults,textvariable=self.search); entry.pack(side="left",fill="x",expand=True)
         ttk.Button(defaults,text="Apply defaults",command=self.apply_defaults).pack(side="left",padx=(8,0))
         headings=ttk.Frame(body); headings.pack(fill="x",pady=(12,2))
-        for text,width in (("Present",9),("Employee",32),("Time in",12),("Time out",12)):
+        for text,width in (("Present",9),("Employee",32),("Time in",12),("Time out",12),("Work project",24)):
             ttk.Label(headings,text=text,width=width,style="Muted.TLabel").pack(side="left")
         outer=ttk.Frame(body); outer.pack(fill="both",expand=True)
         canvas=tk.Canvas(outer,bg=WHITE,highlightthickness=1,highlightbackground="#CBD5E1")
@@ -13304,42 +14283,66 @@ class BatchAttendanceDialog(tk.Toplevel):
         self.rows_frame=ttk.Frame(canvas); self.window=canvas.create_window((0,0),window=self.rows_frame,anchor="nw")
         self.rows=[]
         for employee in employees:
-            row=ttk.Frame(self.rows_frame,padding=(6,4)); row.pack(fill="x")
-            selected=tk.BooleanVar(); time_in=tk.StringVar(value="08:00"); time_out=tk.StringVar(value="17:00")
-            ttk.Checkbutton(row,variable=selected).pack(side="left",padx=(4,20))
-            ttk.Label(row,text=f"{employee['name']}  [{employee['employee_no']}]",width=37).pack(side="left")
-            ttk.Entry(row,textvariable=time_in,width=12).pack(side="left",padx=(0,20))
-            ttk.Entry(row,textvariable=time_out,width=12).pack(side="left")
-            self.rows.append((employee,row,selected,time_in,time_out))
+            self.add_employee_segment(employee)
         self.rows_frame.bind("<Configure>",lambda _e:canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>",lambda e:canvas.itemconfigure(self.window,width=e.width))
         entry.bind("<KeyRelease>",self.filter_rows)
         buttons=ttk.Frame(body); buttons.pack(fill="x",pady=(12,0))
         ttk.Button(buttons,text="Select all",command=lambda:self.select_all(True)).pack(side="left")
         ttk.Button(buttons,text="Clear",command=lambda:self.select_all(False)).pack(side="left",padx=5)
+        ttk.Button(buttons,text="Add segment for selected workers",command=self.add_selected_segments).pack(side="left",padx=5)
         ttk.Button(buttons,text="Cancel",command=self.destroy).pack(side="right")
-        ttk.Button(buttons,text="Authorize and Save",style="Primary.TButton",command=self.save).pack(side="right",padx=8)
+        ttk.Button(buttons,text="Review and Save",style="Primary.TButton",command=self.save).pack(side="right",padx=8)
         self.transient(parent); self.grab_set(); self.bind("<Escape>",lambda _e:self.destroy())
+
+    def add_employee_segment(self,employee):
+        row=ttk.Frame(self.rows_frame,padding=(6,4)); row.pack(fill="x")
+        selected=tk.BooleanVar(); time_in=tk.StringVar(value="08:00"); time_out=tk.StringVar(value="17:00")
+        ttk.Checkbutton(row,variable=selected).pack(side="left",padx=(4,20))
+        ttk.Label(row,text=f"{employee['name']}  [{employee['employee_no']}]",width=37).pack(side="left")
+        ttk.Entry(row,textvariable=time_in,width=12).pack(side="left",padx=(0,20))
+        ttk.Entry(row,textvariable=time_out,width=12).pack(side="left")
+        project=tk.StringVar(value=self.default_project)
+        ttk.Combobox(row,textvariable=project,values=list(self.projects),state='readonly',width=25).pack(side='left',padx=8)
+        self.rows.append((employee,row,selected,time_in,time_out,project))
+
+    def add_selected_segments(self):
+        employees={r[0]['id']:r[0] for r in self.rows if r[2].get()}
+        for employee in employees.values():
+            self.add_employee_segment(employee)
+            self.rows[-1][2].set(True)
+            self.rows[-1][3].set('13:00'); self.rows[-1][4].set('17:00')
     def select_all(self,value):
-        for _employee,row,var,_tin,_tout in self.rows:
+        for _employee,row,var,_tin,_tout,_project in self.rows:
             if row.winfo_manager(): var.set(value)
     def apply_defaults(self):
-        for _employee,_row,var,tin,tout in self.rows:
+        for _employee,_row,var,tin,tout,_project in self.rows:
             if var.get(): tin.set(self.default_in.get()); tout.set(self.default_out.get())
     def filter_rows(self,_event=None):
         text=self.search.get().strip().lower()
-        for employee,row,_var,_tin,_tout in self.rows:
+        for employee,row,_var,_tin,_tout,_project in self.rows:
             if text in f"{employee['name']} {employee['employee_no']} {employee['position']}".lower(): row.pack(fill="x")
             else: row.pack_forget()
     def save(self):
         try:
-            work_date=valid_date(self.work_date.get(),True); result=[]
-            for employee,_row,selected,tin,tout in self.rows:
+            try:work_date=valid_date(self.work_date.get(),True)
+            except ValueError:
+                flash_required_widgets(self,[self.default_widgets[0]]);raise
+            result=[]
+            for employee,row,selected,tin,tout,project in self.rows:
                 if not selected.get(): continue
-                started=datetime.fromisoformat(f"{work_date}T{datetime.strptime(tin.get().strip(),'%H:%M').strftime('%H:%M:%S')}")
-                ended=datetime.fromisoformat(f"{work_date}T{datetime.strptime(tout.get().strip(),'%H:%M').strftime('%H:%M:%S')}")
-                result.append((employee,started,ended))
+                try:
+                    started=datetime.fromisoformat(f"{work_date}T{datetime.strptime(tin.get().strip(),'%H:%M').strftime('%H:%M:%S')}")
+                    ended=datetime.fromisoformat(f"{work_date}T{datetime.strptime(tout.get().strip(),'%H:%M').strftime('%H:%M:%S')}")
+                except ValueError:
+                    flash_required_widgets(self,row.winfo_children()[2:4]);raise ValueError('Enter valid attendance times in HH:MM format.')
+                if ended<=started or not self.projects.get(project.get()):
+                    flash_required_widgets(self,row.winfo_children()[2:])
+                    raise ValueError('Select a project and enter a time out later than time in.')
+                result.append((employee,self.projects[project.get()],started,ended))
             if not result: raise ValueError("Select at least one employee.")
+            if self.on_submit and not self.on_submit(result):
+                return
             self.result=result; self.destroy()
         except ValueError as exc: messagebox.showerror(APP_TITLE,str(exc),parent=self)
 
@@ -13947,6 +14950,8 @@ class CashAdvanceExportDialog(tk.Toplevel):
 class AttendanceEditDialog(tk.Toplevel):
     def __init__(self, parent, attendance):
         super().__init__(parent); self.title("Correct Attendance"); self.result=None
+        self.db=parent.db
+        self.attendance=attendance
         self.resizable(False,False)
         body=ttk.Frame(self,padding=20); body.pack(fill="both",expand=True)
         ttk.Label(body,text="Correct closed attendance",style="DialogTitle.TLabel").grid(
@@ -14003,7 +15008,14 @@ class AttendanceEditDialog(tk.Toplevel):
         if ended<=started:raise ValueError("Time out must be later than time in.")
         daily_rate=cents(self.vars["daily_rate"].get())
         if daily_rate<=0:raise ValueError("Daily rate must be greater than zero.")
-        calculated=compute_shift_pay(started,ended,daily_rate)
+        regular_left=Decimal('8')
+        for segment in self.db.all("""SELECT * FROM attendance WHERE employee_id=? AND id<>?
+            AND SUBSTR(clock_in,1,10)=? AND clock_in<? AND clock_out<>'' ORDER BY clock_in,id""",
+            (self.attendance['employee_id'],self.attendance['id'],work_date,started.isoformat(timespec='seconds'))):
+            prior=compute_shift_pay(datetime.fromisoformat(segment['clock_in']),datetime.fromisoformat(segment['clock_out']),
+                segment['pay_rate_cents'],segment['day_type'],regular_limit=regular_left)
+            regular_left-=Decimal(prior['regular_hours'])
+        calculated=compute_shift_pay(started,ended,daily_rate,self.attendance['day_type'],regular_limit=regular_left)
         final_text=self.vars["final_pay"].get().strip()
         final_pay=cents(final_text) if final_text else None
         if final_pay is not None and final_pay<0:raise ValueError("Final daily pay cannot be negative.")
@@ -14682,36 +15694,44 @@ class PayrollTab(BaseTab):
                 f"{employee['name']} is clocked in under {project['name'] if project else 'another project'}. "
                 "Select that project before clocking out.",parent=parent);return False
         if not open_row:
+            week_start,_=payroll_week_bounds(now.date())
+            if self.db.one('SELECT 1 FROM payroll_week_plans WHERE employee_id=? AND period_start=?',(employee['id'],week_start)):
+                messagebox.showerror(APP_TITLE,'This employee\'s weekly payroll is locked. Reopen all affected project payrolls before adding attendance.',parent=parent);return False
+            if self.db.one("SELECT 1 FROM attendance WHERE employee_id=? AND clock_in<=? AND clock_out>?",(employee['id'],now.isoformat(timespec='seconds'),now.isoformat(timespec='seconds'))):
+                messagebox.showerror(APP_TITLE,'This time overlaps an existing attendance segment.',parent=parent);return False
             self.db.execute("INSERT INTO attendance(employee_id,project_id,clock_in,source) VALUES(?,?,?,'Kiosk')",(employee["id"],self.project_id,now.isoformat(timespec="seconds"))); messagebox.showinfo(APP_TITLE,f"Welcome, {employee['name']}!\nTime in: {now:%I:%M %p}",parent=parent)
         else:
-            result=compute_shift_pay(datetime.fromisoformat(open_row["clock_in"]),now,employee_daily_rate(employee))
-            daily_rate=employee_daily_rate(employee)
-            self.db.execute("""UPDATE attendance SET clock_out=?,hours=?,lunch_hours=?,regular_hours=?,overtime_hours=?,regular_pay_cents=?,overtime_pay_cents=?,gross_cents=?,pay_rate_cents=? WHERE id=?""",
-                (now.isoformat(timespec="seconds"),result["hours"],result["lunch_hours"],result["regular_hours"],result["overtime_hours"],result["regular_pay_cents"],result["overtime_pay_cents"],result["gross_cents"],daily_rate,open_row["id"]))
+            daily_rate=employee['deployment_daily_rate_cents'] or employee_daily_rate(employee)
+            result=compute_shift_pay(datetime.fromisoformat(open_row["clock_in"]),now,daily_rate)
+            try:
+                if self.db.one("""SELECT 1 FROM attendance WHERE employee_id=? AND id<>? AND clock_in<?
+                    AND clock_out>?""",(employee['id'],open_row['id'],now.isoformat(timespec='seconds'),open_row['clock_in'])):
+                    raise ValueError('This attendance overlaps another project segment.')
+                with self.db.conn:
+                    self.db.conn.execute("""UPDATE attendance SET clock_out=?,hours=?,lunch_hours=?,regular_hours=?,overtime_hours=?,regular_pay_cents=?,overtime_pay_cents=?,gross_cents=?,pay_rate_cents=? WHERE id=?""",
+                        (now.isoformat(timespec="seconds"),result["hours"],result["lunch_hours"],result["regular_hours"],result["overtime_hours"],result["regular_pay_cents"],result["overtime_pay_cents"],result["gross_cents"],daily_rate,open_row["id"]))
+                    self.db._recalculate_employee_day_segments(employee['id'],open_row['clock_in'][:10])
+                result=dict(self.db.one('SELECT * FROM attendance WHERE id=?',(open_row['id'],)))
+            except (ValueError,sqlite3.Error) as exc:
+                messagebox.showerror(APP_TITLE,str(exc),parent=parent);return False
             messagebox.showinfo(APP_TITLE,f"Goodbye, {employee['name']}!\nPaid hours: {result['hours']}\nOvertime: {result['overtime_hours']}\nGross: {money(result['gross_cents'])}",parent=parent)
         self.pin.set(""); self.app.refresh_all(); return True
 
     def batch_attendance(self):
         if not self.require_project():return
-        employees=self.db.employees_deployed_to(self.project_id)
+        employees=self.db.all('SELECT * FROM employees WHERE active=1 ORDER BY name COLLATE NOCASE')
         if not employees: messagebox.showinfo(APP_TITLE,"Add employees first."); return
-        win=BatchAttendanceDialog(self,employees); self.wait_window(win)
-        if not win.result:return
-        head=self.app.authorize("Record batch attendance",f"{len(win.result)} manually entered attendance record(s)")
-        if not head:return
-        try:
-            records=[]
-            for employee,started,ended in win.result:
-                if self.db.one("SELECT 1 FROM attendance WHERE employee_id=? AND clock_out=''",(employee["id"],)): raise ValueError(f"{employee['name']} currently has an open attendance record.")
-                daily_rate=employee_daily_rate(employee)
-                result=compute_shift_pay(started,ended,daily_rate)
-                records.append((employee["id"],started.isoformat(timespec="seconds"),ended.isoformat(timespec="seconds"),daily_rate,result))
-            with self.db.conn:
-                for employee_id,started,ended,daily_rate,result in records:
-                    self.db.conn.execute("""INSERT INTO attendance(employee_id,project_id,clock_in,clock_out,hours,lunch_hours,regular_hours,overtime_hours,regular_pay_cents,overtime_pay_cents,gross_cents,pay_rate_cents,day_type,source,authorized_by_head_id)
-                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'Ordinary Day','Manual Batch',?)""",(employee_id,self.project_id,started,ended,result["hours"],result["lunch_hours"],result["regular_hours"],result["overtime_hours"],result["regular_pay_cents"],result["overtime_pay_cents"],result["gross_cents"],daily_rate,head["id"]))
-            self.db.audit(self.project_id,"BATCH_ATTENDANCE_ADDED",f"{len(records)} entries authorized by {head['name']}"); self.app.refresh_all()
-        except (ValueError,sqlite3.Error) as exc: messagebox.showerror(APP_TITLE,str(exc))
+        projects={f"{p['name']} [#{p['id']}]":p['id'] for p in self.db.all("SELECT id,name FROM projects WHERE status<>'Completed' ORDER BY name")}
+        def commit_segments(entries):
+            head=self.app.authorize('Record batch attendance',f'{len(entries)} attendance segments across {len({r[1] for r in entries})} project(s).')
+            if not head:return False
+            try:
+                self.db.record_batch_project_attendance([(e['id'],pid,start,end) for e,pid,start,end in entries],head['id'])
+                self.app.refresh_all();return True
+            except (ValueError,sqlite3.Error) as exc:
+                messagebox.showerror(APP_TITLE,str(exc));return False
+        win=BatchAttendanceDialog(self,employees,projects,self.project_id,on_submit=commit_segments)
+        self.wait_window(win)
 
     def close_daily_attendance(self):
         if not self.require_project(): return
@@ -14766,7 +15786,9 @@ class PayrollTab(BaseTab):
         if not self.project_id:
             self.weekly_summary.config(text="Select one project to review and commit weekly payroll.")
             return
-        rows=self.db.weekly_payroll_summary(self.project_id,week_start)
+        try:rows=self.db.weekly_payroll_summary(self.project_id,week_start)
+        except ValueError as exc:
+            self.weekly_summary.config(text=str(exc));return
         gross=deductions=adjustments=net=closed_days=0
         for row in rows:
             gross+=row["gross_cents"]
@@ -14792,33 +15814,35 @@ class PayrollTab(BaseTab):
     def commit_weekly(self):
         if not self.require_project():return
         week_start,week_end=payroll_week_bounds(self.week_var.get() or date.today())
-        summary=[row for row in self.db.weekly_payroll_summary(self.project_id,week_start)
-                 if row["attendance_count"]]
-        if not summary:
-            messagebox.showinfo(APP_TITLE,
-                "Close at least one day's completed attendance for this week first.");return
-        gross=sum(row["gross_cents"] for row in summary)
-        deductions=sum(row["deduction_cents"] for row in summary)
-        adjustments=sum(row["adjustment_cents"] for row in summary)
-        net=gross-deductions+adjustments
-        if any(row["net_cents"]<0 for row in summary):
-            messagebox.showerror(APP_TITLE,
-                "One or more employees have salary deductions greater than their weekly gross pay.");return
-        head=self.app.authorize(
-            "Commit weekly payroll to Expenses",
-            f"Week {week_start} to {week_end}: {len(summary)} employee(s), gross {money(gross)}, "
-            f"deductions {money(deductions)}, corrections {money(adjustments)}, net payable {money(net)}."
-        )
-        if not head:return
         try:
-            result=self.db.commit_weekly_payroll(
-                self.project_id,week_start,head["id"])
+            employee_ids=[r['id'] for r in self.db.weekly_payroll_summary(self.project_id,week_start) if r['attendance_count']]
+            if not employee_ids:
+                raise ValueError('Close at least one completed attendance day in this project first.')
+            candidates=self.db.all(f"""SELECT DISTINCT COALESCE(a.project_id,e.project_id) project_id
+                FROM attendance a JOIN employees e ON e.id=a.employee_id WHERE a.employee_id IN ({','.join('?' for _ in employee_ids)})
+                AND SUBSTR(a.clock_in,1,10) BETWEEN ? AND ? AND a.closure_batch_id IS NOT NULL
+                AND a.payroll_batch_id IS NULL AND a.committed_expense_id IS NULL""",(*employee_ids,week_start,week_end))
+            rows=[]
+            for candidate in candidates:
+                pid=candidate['project_id'];summary=[r for r in self.db.weekly_payroll_summary(pid,week_start) if r['attendance_count']]
+                if any(r['net_cents']<0 for r in summary):
+                    raise ValueError('An employee has negative net payroll; review attendance corrections before committing.')
+                rows.append(dict(project_id=pid,name=self.db.one('SELECT name FROM projects WHERE id=?',(pid,))['name'],
+                    gross=sum(r['gross_cents'] for r in summary),deductions=sum(r['deduction_cents'] for r in summary),
+                    adjustments=sum(r['adjustment_cents'] for r in summary),net=sum(r['net_cents'] for r in summary)))
+            review=ProjectPayrollReview(self,rows,week_start,week_end);self.wait_window(review)
+            if not review.result:return
+            approvals={}
+            for row in rows:
+                if row['project_id'] not in review.result:continue
+                head=self.app.authorize_for_project(row['project_id'],'Commit weekly payroll to Expenses',
+                    f"{row['name']} | {week_start} to {week_end} | gross {money(row['gross'])}, CA {money(row['deductions'])}, net {money(row['net'])}.")
+                if not head:return
+                approvals[row['project_id']]=head['id']
+            results=self.db.commit_project_weekly_payrolls(approvals,week_start)
             messagebox.showinfo(APP_TITLE,
-                f"Weekly payroll committed as {result['reference']}.\n\n"
-                f"Gross: {money(result['gross_cents'])}\n"
-                f"Advance deductions: {money(result['deduction_cents'])}\n"
-                f"Attendance corrections: {money(result['adjustment_cents'])}\n"
-                f"Net payable: {money(result['net_cents'])}")
+                'Separate unpaid payroll expenses created:\n\n'+ '\n'.join(f"{r['reference']}: {money(r['net_cents'])}" for r in results)+
+                f"\n\nCombined net payable: {money(sum(r['net_cents'] for r in results))}\nUse a shared DP/PC allocation to record their actual payment.")
             self.app.refresh_all();self.lists.select(4)
         except (ValueError,sqlite3.Error) as exc:
             messagebox.showerror(APP_TITLE,str(exc))
@@ -16228,7 +17252,7 @@ class RemittancesTab(BaseTab):
         project_ids = [project_id] if project_id else list(projects.values())
         contract = sum(self.db.one("SELECT contract_value_cents FROM projects WHERE id=?", (pid,))["contract_value_cents"]
                        for pid in project_ids)
-        commitment_rows = [self.db.project_commitment_budget(pid) for pid in project_ids]
+        commitment_rows = [self.db.project_funding_budget(pid) for pid in project_ids]
         project_deposited = sum(row[0] for row in commitment_rows)
         committed = sum(row[1] for row in commitment_rows)
         budget = sum(row[2] for row in commitment_rows)
@@ -16249,7 +17273,7 @@ class RemittancesTab(BaseTab):
                 "expenses for the selected project scope, while withdrawn cash remains shared across projects."
             )
         self.budget_note.config(
-            text=(f"Project budget: deposited {money(project_deposited)} − active expense commitments "
+            text=(f"Project funding: deposited {money(project_deposited)} − commitments including net project funding "
                   f"{money(committed)} = {money(budget)}. {explanation}")
         )
 

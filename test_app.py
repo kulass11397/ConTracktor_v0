@@ -14,6 +14,13 @@ from app import (Database, PayrollTab, cents, hash_pin, money, resolve_db_path,
                  EXPENSE_IMPORT_REQUIRED_FIELDS)
 
 
+def create_test_allocation(db, **values):
+    # Fixtures explicitly supply their original FIFO-derived split. Production
+    # issuance now requires the user to select withdrawal amounts manually.
+    values['withdrawal_sources']=[(wid,amount) for wid,amount,_ref in db.fifo_withdrawal_sources(values['amount_cents'],values['allocation_date'])]
+    return db.create_cash_allocation(**values)
+
+
 class ContractorTrackerTests(unittest.TestCase):
     def test_direct_procurement_uses_single_issuer_approval(self):
         self.assertEqual(cash_allocation_approval_mode("Direct Procurement"), "Single Issuer")
@@ -38,18 +45,18 @@ class ContractorTrackerTests(unittest.TestCase):
                    'WD-20260901-TEST')""", (project_id,),
             )
             for number in range(2):
-                db.create_cash_allocation(
+                create_test_allocation(db,
                     project_id=project_id, allocation_type="Direct Procurement",
                     amount_cents=100000, allocation_date="2026-09-01",
                     issuer_head_id=issuer["id"], receiver_head_id=receiver["id"],
                     supplier=f"DP Supplier {number + 1}", purpose="Materials",
                 )
-            first_pc = db.create_cash_allocation(
+            first_pc = create_test_allocation(db,
                 project_id=project_id, allocation_type="Petty Cash", amount_cents=100000,
                 allocation_date="2026-09-01", issuer_head_id=issuer["id"],
                 receiver_head_id=receiver["id"], purpose="Site cash one",
             )
-            second_pc = db.create_cash_allocation(
+            second_pc = create_test_allocation(db,
                 project_id=project_id, allocation_type="Petty Cash", amount_cents=100000,
                 allocation_date="2026-09-01", issuer_head_id=issuer["id"],
                 receiver_head_id=receiver["id"], purpose="Site cash two",
@@ -57,7 +64,7 @@ class ContractorTrackerTests(unittest.TestCase):
             self.assertTrue(first_pc)
             self.assertTrue(second_pc)
             with self.assertRaisesRegex(ValueError, "two active petty-cash allocations"):
-                db.create_cash_allocation(
+                create_test_allocation(db,
                     project_id=project_id, allocation_type="Petty Cash", amount_cents=100000,
                     allocation_date="2026-09-01", issuer_head_id=issuer["id"],
                     receiver_head_id=receiver["id"], purpose="Site cash three",
@@ -124,12 +131,12 @@ class ContractorTrackerTests(unittest.TestCase):
                    system_reference) VALUES(?,'Withdrawal',500000,'2026-09-08',1,
                    'WD-20260908-TEST')""", (project_id,),
             ).lastrowid
-            petty_id = db.create_cash_allocation(
+            petty_id = create_test_allocation(db,
                 project_id=project_id, allocation_type="Petty Cash", amount_cents=100000,
                 allocation_date="2026-09-08", issuer_head_id=issuer["id"],
                 receiver_head_id=receiver["id"], purpose="Petty cash",
             )
-            direct_id = db.create_cash_allocation(
+            direct_id = create_test_allocation(db,
                 project_id=project_id, allocation_type="Direct Procurement", amount_cents=100000,
                 allocation_date="2026-09-08", issuer_head_id=issuer["id"],
                 receiver_head_id=receiver["id"], purpose="Direct materials", supplier="Vendor One",
@@ -170,7 +177,7 @@ class ContractorTrackerTests(unittest.TestCase):
                 "Returned to Shared Pool",
             )
             self.assertEqual(db.unallocated_cash(), 440000)
-            second_pc = db.create_cash_allocation(
+            second_pc = create_test_allocation(db,
                 project_id=project_id, allocation_type="Petty Cash", amount_cents=350000,
                 allocation_date="2026-09-08", issuer_head_id=issuer["id"],
                 receiver_head_id=receiver["id"], purpose="Correct allocation",
@@ -185,7 +192,7 @@ class ContractorTrackerTests(unittest.TestCase):
             db.return_cash_allocation_to_pool(
                 petty_id, 60000, "2026-09-08", "Close incorrect allocation", issuer["id"]
             )
-            third_pc = db.create_cash_allocation(
+            third_pc = create_test_allocation(db,
                 project_id=project_id, allocation_type="Petty Cash", amount_cents=100000,
                 allocation_date="2026-09-08", issuer_head_id=issuer["id"],
                 receiver_head_id=receiver["id"], purpose="Replacement PC",
@@ -224,7 +231,7 @@ class ContractorTrackerTests(unittest.TestCase):
                    system_reference) VALUES(?,'Withdrawal',500000,'2026-09-08',1,
                    'WD-20260908-SEPARATE')""", (project_id,),
             )
-            allocation_id = db.create_cash_allocation(
+            allocation_id = create_test_allocation(db,
                 project_id=project_id, allocation_type="Petty Cash", amount_cents=100000,
                 allocation_date="2026-09-08", issuer_head_id=issuer["id"],
                 receiver_head_id=receiver["id"], purpose="Custody test",
@@ -931,7 +938,7 @@ class ContractorTrackerTests(unittest.TestCase):
                    '2026-08-27','WD-20260827-0001')""",
                 (project_id, bank_id),
             )
-            allocation_id = db.create_cash_allocation(
+            allocation_id = create_test_allocation(db,
                 project_id=project_id, allocation_type="Petty Cash", amount_cents=50000,
                 allocation_date="2026-08-27", issuer_head_id=issuer["id"],
                 receiver_head_id=receiver["id"], purpose="Site operations",
@@ -1010,12 +1017,12 @@ class ContractorTrackerTests(unittest.TestCase):
                    txn_date,system_reference) VALUES(?,?,'Withdrawal',500000,
                    '2026-09-01','WD-20260901-0001')""", (project_id, bank_id)
             )
-            allocation_a = db.create_cash_allocation(
+            allocation_a = create_test_allocation(db,
                 project_id=project_id, allocation_type="Petty Cash", amount_cents=200000,
                 allocation_date="2026-09-01", issuer_head_id=issuer["id"],
                 receiver_head_id=custodian["id"], purpose="Payroll source A",
             )
-            allocation_b = db.create_cash_allocation(
+            allocation_b = create_test_allocation(db,
                 project_id=project_id, allocation_type="Petty Cash", amount_cents=200000,
                 allocation_date="2026-09-01", issuer_head_id=issuer["id"],
                 receiver_head_id=custodian["id"], purpose="Payroll source B",
@@ -1111,7 +1118,7 @@ class ContractorTrackerTests(unittest.TestCase):
                    '2026-09-04','WD-20260904-0001')""",
                 (project_id, bank_id),
             )
-            allocation_id = db.create_cash_allocation(
+            allocation_id = create_test_allocation(db,
                 project_id=project_id, allocation_type="Petty Cash", amount_cents=100000,
                 allocation_date="2026-09-04", issuer_head_id=issuer["id"],
                 receiver_head_id=holder["id"], purpose="Visible source",
@@ -1152,7 +1159,7 @@ class ContractorTrackerTests(unittest.TestCase):
                    txn_date,system_reference) VALUES(?,?,'Withdrawal',100000,
                    '2026-09-01','WD-20260901-0001')""", (project_id, bank_id)
             )
-            allocation_id = db.create_cash_allocation(
+            allocation_id = create_test_allocation(db,
                 project_id=project_id, allocation_type="Petty Cash", amount_cents=100000,
                 allocation_date="2026-09-01", issuer_head_id=issuer["id"],
                 receiver_head_id=custodian["id"], purpose="Site cash",
@@ -1215,7 +1222,7 @@ class ContractorTrackerTests(unittest.TestCase):
                    '2026-07-30','WD-20260730-0001',1)""",
                 (project_id, bank_id),
             ).lastrowid
-            allocation_id = db.create_cash_allocation(
+            allocation_id = create_test_allocation(db,
                 project_id=project_id, allocation_type="Petty Cash", amount_cents=44504500,
                 allocation_date="2026-07-30", issuer_head_id=issuer["id"],
                 receiver_head_id=receiver["id"], purpose="Site operations",

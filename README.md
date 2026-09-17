@@ -1,10 +1,23 @@
-# ConTracktor v1.6.11
+# ConTracktor v1.7.0
 
 ConTracktor is a local Windows contractor-management system built with Python,
 Tkinter, and SQLite. It manages projects, expenses, petty cash, remittances,
 attendance, weekly payroll, employee advances, inventory, contacts, and events.
 
-## v1.6.11 release highlights
+## v1.7.0 release highlights
+
+- Cross-project expense funding, linked recoverable balances and internal repayments without duplicate expenses.
+- Split-project batch attendance and employee-wide weekly CA deductions, allocated proportionally with exact-cent rounding.
+- Atomic related-project payroll review and shared-allocation payroll payment distribution.
+- Explicit manual WD references and contributions for new PC/DP allocations; silent FIFO issuance is removed.
+- Guarded one-time repair of 21 reviewed allocation trails, including returned-DP reuse and user-confirmed cancelled duplicates.
+- Record-preserving Windows EXE updater, installer/migration backups and old/new-source audit history.
+
+Download the updater from the [v1.7.0 release](https://github.com/kulass11397/ConTracktor_v0/releases/tag/v1.7.0). See [release notes](RELEASE_NOTES_1.7.0.md), [update instructions](UPDATE_GUIDE_1.7.0.txt) and [workflow details](CROSS_PROJECT_WORKFLOW.md). No client database is included in this repository or installer.
+
+Verification: 90 tests passed; isolated EXE installation/first launch preserved all financial/attendance fields and applied 21 reviewed trails. Windows Defender found no threats in the installer. It remains unsigned; warnings cannot be guaranteed absent.
+
+## v1.6.11 release highlights (retained history)
 
 - Repairs the reviewed PC/DP withdrawal-source links from the curated
   24 August 2026 boundary without changing financial amounts.

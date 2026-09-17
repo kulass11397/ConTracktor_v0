@@ -336,6 +336,7 @@ class CleanContractorApp(core.ContractorApp):
                  if page.tree.selection() else None),
                 ("Edit expense (all heads)", page.edit),
                 ("Record payment", page.pay),
+                ("Pay selected weekly payrolls from one allocation", page.pay_selected_weekly_payrolls),
                 ("Verify selected", page.verify_selected),
                 ("Batch verify all unverified", page.verify_all_unverified),
                 None,

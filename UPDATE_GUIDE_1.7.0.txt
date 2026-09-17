@@ -1,0 +1,26 @@
+ConTracktor v1.7.0 client update
+
+1. In the client's existing app, export a fresh database backup and keep it separately.
+2. Close all ConTracktor windows. Install under the same Windows account as before.
+3. Download ConTracktor_v1_Update_1.7.0.exe from the official GitHub v1.7.0 release.
+4. Run it and confirm. Do not uninstall the old app or replace its database.
+5. Open the existing desktop shortcut. The app adds the new tables and runs the guarded reference repair once.
+6. Check the repaired PC/DP references and confirm the dashboard totals are unchanged.
+
+The update contains NO database. It preserves existing records, saves application/database safety backups, and creates an extra SQLite snapshot before WD relinking.
+
+Known repair: 21 allocations in the reviewed 17 September backup. The returned 63,050 DP and replacement 63,250 DP trace to WD-20260904-0001. Two cancelled 37,000 attempts trace to voided WD-20260907-0001 for audit only; the actual purchase DP traces to WD-20260908-0001.
+
+If reviewed amounts/dates/statuses/links differ, the repair is skipped with a warning. Newer records are retained, not automatically guessed. Send a fresh backup for review rather than manually bypassing the checks.
+
+New PC/DP allocations: select WD checkboxes, enter the contribution per WD, and make their total exactly equal the allocation amount. Voided/future/depleted and pre-reviewed-cutoff withdrawals cannot be selected.
+
+Read CROSS_PROJECT_WORKFLOW.md for borrowing, repayments and multi-project payroll.
+
+Default program folder: %LOCALAPPDATA%\Programs\ConTracktor_v1
+Default records: %LOCALAPPDATA%\ConTracktor_v1\Data\contractor_tracker.db
+Installer database backups: %LOCALAPPDATA%\ConTracktor_v1\Data\Backups
+Installer application backups: %LOCALAPPDATA%\ConTracktor_v1\AppBackups
+Additional migration backups are beside the active database.
+
+This unsigned executable may still trigger reputation/antivirus warnings. Do not disable antivirus. Confirm the official download and SHA-256 checksum, and request review if security software blocks it.
