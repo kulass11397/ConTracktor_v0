@@ -1,4 +1,6 @@
-# ConTracktor v1.7.1
+# ConTracktor — v1.7.2 installer candidate
+
+**Security notice:** the v1.7.1 custom updater has a client-reported `Trojan:Win32/Wacatac.B!ml` detection. Keep that download removed. The [v1.7.2 prerelease](https://github.com/kulass11397/ConTracktor_v0/releases/tag/v1.7.2) replaces its custom updater with standard Inno Setup packaging and record-preserving safeguards. Local scans passed, but Microsoft review and affected-client confirmation are pending. Do not bypass antivirus protection. See [security review status](SECURITY_REVIEW_1.7.2.md) and [deployment instructions](UPDATE_GUIDE_1.7.2.txt).
 
 ConTracktor is a local Windows contractor-management system built with Python,
 Tkinter, and SQLite. It manages projects, expenses, petty cash, remittances,

@@ -1,0 +1,18 @@
+ConTracktor 1.7.2 - standard installer packaging update
+
+The prior custom 1.7.1 updater was reported as Trojan:Win32/Wacatac.B!ml on a client's PC. Keep that file removed. This installer uses Inno Setup rather than the prior custom self-extracting EXE. That packaging change is NOT Microsoft clearance of the reported detection, and does not guarantee acceptance by every antivirus product.
+
+Make a fresh database backup in your existing application. Close ConTracktor and all kiosk windows. Run this update under the same Windows account as the existing installation. Do not uninstall the app or copy over its database. Start the app manually after installation.
+
+Default app: %LOCALAPPDATA%\Programs\ConTracktor_v1
+Default database: %LOCALAPPDATA%\ConTracktor_v1\Data\contractor_tracker.db
+Data backups: %LOCALAPPDATA%\ConTracktor_v1\Data\Backups
+App backups: %LOCALAPPDATA%\ConTracktor_v1\AppBackups
+
+The installer has no client database or sample records. It backs up existing app/database files before replacing application files. First app startup also backs up the database before MONCON reference migration when that migration is still needed. Already migrated references are not renamed again.
+
+All v1.7.1 employee/payroll features are retained. The application source is unchanged. Monetary amounts, employee identities, project assignments and attendance are preserved.
+
+Do not disable Defender, add antivirus exclusions, restore quarantined files or remove download protection to install this update. If this replacement is detected, stop and send the full threat name and affected file. Microsoft review is required to resolve a reported incorrect malware detection. This installer is not digitally signed with a ConTracktor publisher certificate.
+
+Custom installation/data paths should be confirmed before using the default updater. Inno Setup is used under its published license: https://jrsoftware.org/files/is/license.txt
