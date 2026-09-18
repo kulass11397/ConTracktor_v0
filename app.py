@@ -648,7 +648,7 @@ def write_expense_ledger_pdf(path: Path | str, filters: list[tuple[str, str]],
         page_commands.append(
             f"0.65 0.69 0.76 RG 0.5 w {margin} 30 m {page_width-margin} 30 l S"
         )
-        footer = 'ContrackTor v1 | Expenses Summary'
+        footer = 'Montarra Solutions | Project Financial Summary'
         footer_x = (page_width - text_width(footer, 10)) / 2
         add_text(page_commands, footer_x, 16, footer, size=10, color="0.35 0.39 0.45")
         add_text(page_commands,page_width-margin-90,16,f'Page {page_number} of {page_count}',align='right',max_width=90,color='0.35 0.39 0.45')

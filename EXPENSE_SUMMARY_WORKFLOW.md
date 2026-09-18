@@ -8,7 +8,7 @@ The summary includes selected-period construction costs, gross committed payroll
 
 Running totals include all active expenses in the selected projects through the reporting end date, ignoring other row filters. Funding balances are current at export, not historical bank reconciliation. Materials/other non-labor costs include unclassified procurement; review categories before client approval. Gross labor adds back committed payroll deductions, while cash-advance issuances are excluded from construction costs to avoid charging the same advance twice. Phase/category/area/project tables regroup the same costs and must not be added together. Missing classifications are explicitly Unassigned/Uncategorized. Voided entries and excluded payment history are omitted.
 
-Footer: ContrackTor v1 | Expenses Summary.
+Footer: Montarra Solutions | Project Financial Summary.
 
 Validation: 116 regression tests passed. A UI export smoke test using a disposable copy of the 18 September client backup verified all three choices and unchanged financial/attendance history. Both the revised supplied sample and the system-generated report were rendered and visually inspected. No client database, confidential report or sample records are included in the source update.
 

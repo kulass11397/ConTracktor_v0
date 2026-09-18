@@ -1921,7 +1921,7 @@ class ContractorTrackerTests(unittest.TestCase):
             self.assertIn(b"APPLIED FILTERS", payload)
             self.assertIn(b"EXPENSE", payload)
             self.assertIn(b"/ ITEM", payload)
-            self.assertIn(b"ContrackTor v1 | Expenses Summary", payload)
+            self.assertIn(b"Montarra Solutions | Project Financial Summary", payload)
             self.assertIn(b"Page 1 of", payload)
             self.assertIn(b"/F1 10 Tf", payload)
             self.assertIn(b"TOTALS BY STATUS", payload)

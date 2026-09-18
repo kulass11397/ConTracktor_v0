@@ -102,7 +102,7 @@ class ExpenseSummaryTests(unittest.TestCase):
         self.assertIn(b'FINANCIAL SUMMARY',payload)
         self.assertIn(b'PHASE BREAKDOWN',payload)
         self.assertIn(b'CATEGORY / TRADE BREAKDOWN',payload)
-        self.assertIn(b'ContrackTor v1 | Expenses Summary',payload)
+        self.assertIn(b'Montarra Solutions | Project Financial Summary',payload)
         self.assertNotIn(b'TOTALS BY STATUS',payload)
         self.assertIn(b'Ar. Randy Fauni',payload)
         self.assertTrue(payload.rstrip().endswith(b'%%EOF'))
