@@ -1,10 +1,23 @@
-# ConTracktor v1.7.0
+# ConTracktor v1.7.1
 
 ConTracktor is a local Windows contractor-management system built with Python,
 Tkinter, and SQLite. It manages projects, expenses, petty cash, remittances,
 attendance, weekly payroll, employee advances, inventory, contacts, and events.
 
-## v1.7.0 release highlights
+## v1.7.1 release highlights
+
+- Company-wide MONCON references, with backed-up migration and former-reference history/search/kiosk compatibility.
+- Default all-employee roster and unified weekly payroll: one person, one combined staged summary across sites.
+- Project filters and project-labeled daily/committed ledgers preserve site-specific costs and separate payroll expenses.
+- Separate CA outstanding and weekly deduction columns, missing-attendance warnings and all-sites employee daily-log drill-down.
+- Cash-advance PDF export follows the selected ledger view and repayment-method filters.
+- Record-preserving EXE updater; no client database or sample data is included.
+
+Download the [v1.7.1 EXE updater](https://github.com/kulass11397/ConTracktor_v0/releases/tag/v1.7.1). See [release notes](RELEASE_NOTES_1.7.1.md), [deployment instructions](UPDATE_GUIDE_1.7.1.txt) and [employee workflow](MONCON_PAYROLL_WORKFLOW.md).
+
+Verification: 98 tests passed; company payroll GUI checks on a temporary client-backup copy preserved attendance and financial records. The updater remains unsigned; antivirus/reputation warnings cannot be ruled out.
+
+## v1.7.0 release highlights (retained history)
 
 - Cross-project expense funding, linked recoverable balances and internal repayments without duplicate expenses.
 - Split-project batch attendance and employee-wide weekly CA deductions, allocated proportionally with exact-cent rounding.

@@ -959,9 +959,10 @@ def write_cash_advance_pdf(path: Path | str, project_name: str, scope: str,
     Path(path).write_bytes(output)
 
 
-def export_cash_advance_pdf(db, project_id: int, scope, path: Path | str):
+def export_cash_advance_pdf(db, project_id: int | None, scope, path: Path | str):
     """Collect active cash advances and their recovery history for PDF export."""
-    project = db.one("SELECT name FROM projects WHERE id=?", (project_id,))
+    project = ({'name':'MONCON - All projects'} if project_id is None else
+               db.one("SELECT name FROM projects WHERE id=?", (project_id,)))
     if not project:
         raise ValueError("Select a project before exporting cash advances.")
     known_methods = ("Salary Deduction", "Cash Repayment", "Bank Repayment", "Manual / Mixed")
@@ -990,9 +991,9 @@ def export_cash_advance_pdf(db, project_id: int, scope, path: Path | str):
                       WHERE t.advance_id=a.id AND t.posted=1 AND t.voided=0
                         AND t.txn_type<>'Advance'),0) recovered
             FROM cash_advances a JOIN employees e ON e.id=a.employee_id
-            WHERE a.project_id=? AND a.voided=0{scope_clause}
+            WHERE (? IS NULL OR a.project_id=?) AND a.voided=0{scope_clause}
             ORDER BY a.advance_date,e.name COLLATE NOCASE,a.id""",
-        (project_id, *scope_params),
+        (project_id, project_id, *scope_params),
     )
     advance_rows = []
     for row in advances:
@@ -1012,9 +1013,9 @@ def export_cash_advance_pdf(db, project_id: int, scope, path: Path | str):
             JOIN cash_advances a ON a.id=t.advance_id
             JOIN employees e ON e.id=a.employee_id
             LEFT JOIN project_heads h ON h.id=t.authorized_by_head_id
-            WHERE a.project_id=? AND a.voided=0 AND t.voided=0
+            WHERE (? IS NULL OR a.project_id=?) AND a.voided=0 AND t.voided=0
               AND t.txn_type<>'Advance'{scope_clause}
-            ORDER BY t.txn_date,t.id""", (project_id, *scope_params)
+            ORDER BY t.txn_date,t.id""", (project_id, project_id, *scope_params)
     )
     transaction_rows = [{
         "date": row["txn_date"], "reference": row["advance_reference"] or f"CA-LEGACY-{row['advance_id']:06d}",
@@ -1684,6 +1685,64 @@ class Database:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
         self._create_schema()
+        self._migrate_company_employee_numbers()
+
+    def _migrate_company_employee_numbers(self):
+        """Rename profiles, not identities; keep former references as aliases."""
+        rows=self.all('SELECT id,project_id,employee_no FROM employees ORDER BY id')
+        seen=set()
+        changes=[]
+        maximum=max([r['id'] for r in rows]+[0])
+        for row in rows:
+            value=row['employee_no'].upper()
+            if value.startswith('MONCON-') and value[7:].isdigit():
+                maximum=max(maximum,int(value[7:]))
+                if value not in seen:
+                    seen.add(value)
+                    continue
+            changes.append(row)
+        if changes:
+            backup=Path(self.path).with_name(Path(self.path).stem+'_before_moncon_'+datetime.now().strftime('%Y%m%d_%H%M%S_%f')+'.db')
+            destination=sqlite3.connect(backup)
+            try:self.conn.backup(destination)
+            finally:destination.close()
+            self.moncon_migration_backup=backup
+        else:self.moncon_migration_backup=None
+        with self.conn:
+            self.conn.execute('''CREATE TABLE IF NOT EXISTS employee_reference_history(
+                employee_id INTEGER NOT NULL REFERENCES employees(id),
+                previous_reference TEXT NOT NULL, original_project_id INTEGER NOT NULL,
+                changed_at TEXT NOT NULL, PRIMARY KEY(employee_id,previous_reference))''')
+            # Temporary references prevent collisions during a bulk rename.
+            for row in changes:
+                self.conn.execute('INSERT OR IGNORE INTO employee_reference_history VALUES(?,?,?,?)',
+                    (row['id'],row['employee_no'],row['project_id'],local_timestamp()))
+                self.conn.execute('UPDATE employees SET employee_no=? WHERE id=?',
+                    ('__MONCON_MIGRATION_'+str(row['id']),row['id']))
+            for row in changes:
+                candidate=f"MONCON-{row['id']:03d}"
+                if candidate in seen:
+                    maximum+=1
+                    candidate=f'MONCON-{maximum:03d}'
+                seen.add(candidate)
+                self.conn.execute('UPDATE employees SET employee_no=? WHERE id=?',(candidate,row['id']))
+
+    def employee_for_clock(self, project_id, reference, on_date):
+        rows=self.all('''SELECT e.*,a.position deployment_position,
+            a.daily_rate_cents deployment_daily_rate_cents
+            FROM employees e JOIN employee_project_assignments a ON a.employee_id=e.id
+            WHERE a.project_id=? AND e.active=1 AND a.effective_from<=?
+              AND (a.effective_to='' OR a.effective_to>=?)
+              AND (e.employee_no=? COLLATE NOCASE OR EXISTS(
+                SELECT 1 FROM employee_reference_history h WHERE h.employee_id=e.id
+                AND h.previous_reference=? COLLATE NOCASE))
+            GROUP BY e.id ORDER BY e.id''',
+            (project_id,on_date,on_date,reference.strip(),reference.strip()))
+        direct=[r for r in rows if r['employee_no'].upper()==reference.strip().upper()]
+        matches=direct or rows
+        if len(matches)>1:
+            raise ValueError('This old employee reference matches multiple profiles. Use the MONCON number.')
+        return matches[0] if matches else None
 
     def _backup_before_project_funding(self):
         """Back up an existing database once before additive funding tables."""
@@ -3963,11 +4022,11 @@ class Database:
         return "-".join(words)[:20].rstrip("-") or "PRJ"
 
     def next_employee_number(self, project_id: int) -> str:
-        """Return PROJECT-NNN, continuing after the current project roster size."""
-        prefix = self.project_employee_code(project_id)
+        """Return a company-wide MONCON number, never a site-specific number."""
+        self.project_employee_code(project_id)  # Validate the initial deployment.
+        prefix = 'MONCON'
         rows = self.all(
-            "SELECT employee_no FROM employees WHERE project_id=? ORDER BY id",
-            (project_id,),
+            "SELECT employee_no FROM employees ORDER BY id",
         )
         suffixes = []
         for row in rows:
@@ -3977,8 +4036,8 @@ class Database:
         sequence = max([len(rows), *suffixes], default=0) + 1
         candidate = f"{prefix}-{sequence:03d}"
         while self.one(
-            "SELECT 1 FROM employees WHERE project_id=? AND employee_no=?",
-            (project_id, candidate),
+            "SELECT 1 FROM employees WHERE employee_no=? COLLATE NOCASE",
+            (candidate,),
         ):
             sequence += 1
             candidate = f"{prefix}-{sequence:03d}"
@@ -6279,6 +6338,34 @@ class Database:
                        net_cents=employee["gross_cents"] - deduction + adjustment)
             result.append(row)
         return result
+
+    def company_weekly_payroll_summary(self, week_value):
+        """One row per person; financial shares remain in their work projects."""
+        start,end=payroll_week_bounds(week_value)
+        people={r['id']:dict(r,project_name='',attendance_count=0,
+            regular_hours_total=0,overtime_hours_total=0,gross_cents=0,
+            deduction_cents=0,adjustment_cents=0,net_cents=0,
+            closure_references='',week_start=start,week_end=end)
+            for r in self.all('SELECT * FROM employees WHERE active=1 ORDER BY name COLLATE NOCASE')}
+        sites={};refs={}
+        for project in self.all('SELECT id,name FROM projects ORDER BY id'):
+            for row in self.weekly_payroll_summary(project['id'],start):
+                if not row['attendance_count']:continue
+                eid=row['id']
+                if eid not in people:
+                    people[eid]=dict(row,attendance_count=0,regular_hours_total=0,
+                        overtime_hours_total=0,gross_cents=0,deduction_cents=0,
+                        adjustment_cents=0,net_cents=0)
+                total=people[eid]
+                for key in ('attendance_count','regular_hours_total','overtime_hours_total',
+                            'gross_cents','deduction_cents','adjustment_cents','net_cents'):
+                    total[key]+=row[key]
+                sites.setdefault(eid,[]).append(project['name'])
+                refs.setdefault(eid,[]).extend(row['closure_references'].split(','))
+        for eid,row in people.items():
+            row['project_name']=', '.join(sites.get(eid,[])) or 'No attendance this week'
+            row['closure_references']=', '.join(sorted(set(filter(None,refs.get(eid,[])))))
+        return sorted(people.values(),key=lambda row:row['name'].casefold())
 
     @staticmethod
     def _proportional_cents(total, weights):
@@ -14177,7 +14264,9 @@ class EmployeeProfileDialog(tk.Toplevel):
         ttk.Label(profile_details, text=employee["name"],
                   style="DialogTitle.TLabel").pack(anchor="w")
         info = ttk.Frame(profile_details); info.pack(fill="x", pady=(10, 8))
-        details = [("Employee number", employee["employee_no"]), ("Position", employee["position"]),
+        former=', '.join(r['previous_reference'] for r in db.all(
+            'SELECT previous_reference FROM employee_reference_history WHERE employee_id=? ORDER BY changed_at',(employee['id'],)))
+        details = [("Employee number", employee["employee_no"]), ("Former references",former or '—'), ("Position", employee["position"]),
             ("Class", employee["class"]), ("Birthday", employee["birthday"] or "-"),
             ("Age", employee_age(employee["birthday"]) or "-"),
             ("Contact number", employee["contact_number"] or "-"),
@@ -15056,7 +15145,7 @@ class WeeklyEmployeeDetailsDialog(tk.Toplevel):
         body=ttk.Frame(self,padding=18); body.pack(fill="both",expand=True)
         ttk.Label(body,text=f"{employee['name']} — daily attendance",style="DialogTitle.TLabel").pack(anchor="w")
         ttk.Label(body,text=f"{employee['employee_no']} | {week_start} through {week_end}",style="Muted.TLabel").pack(anchor="w",pady=(2,8))
-        self.tree=make_tree(body,[("date","Date",90),("in","Time In",145),("out","Time Out",145),
+        self.tree=make_tree(body,[("date","Date",90),("project","Work Project",145),("in","Time In",145),("out","Time Out",145),
             ("regular","Regular",75),("ot","OT",65),("rate","Rate Used",95),
             ("override","Pay Override",100),("gross","Final Gross",95),("closure","Daily Close",135),
             ("payroll","Payroll Batch",145),("revisions","Corrections",80)])
@@ -15068,21 +15157,22 @@ class WeeklyEmployeeDetailsDialog(tk.Toplevel):
         self.refresh(); self.transient(parent); self.grab_set()
     def refresh(self):
         self.tree.delete(*self.tree.get_children())
-        rows=self.db.all("""SELECT a.*,COALESCE(cb.closure_ref,'') closure_ref,
+        rows=self.db.all("""SELECT a.*,p.name work_project_name,COALESCE(cb.closure_ref,'') closure_ref,
             COALESCE(pb.batch_ref,'') payroll_ref FROM attendance a
             JOIN employees e ON e.id=a.employee_id
+            JOIN projects p ON p.id=COALESCE(a.project_id,e.project_id)
             LEFT JOIN attendance_closure_batches cb ON cb.id=a.closure_batch_id
             LEFT JOIN payroll_batches pb ON pb.id=a.payroll_batch_id
-            WHERE a.employee_id=? AND COALESCE(a.project_id,e.project_id)=?
+            WHERE a.employee_id=? AND (? IS NULL OR COALESCE(a.project_id,e.project_id)=?)
               AND SUBSTR(a.clock_in,1,10) BETWEEN ? AND ? ORDER BY a.clock_in,a.id""",
-            (self.employee_id,self.project_id,self.week_start,self.week_end))
+            (self.employee_id,self.project_id,self.project_id,self.week_start,self.week_end))
         for row in rows:
             rate_used=(row["pay_rate_cents"] or
                 self.db.employee_daily_rate_at(row["employee_id"],row["clock_in"][:10],
-                                               self.project_id))
+                                               row['project_id']))
             override=(money(row["manual_pay_adjustment_cents"])
                       if row["manual_pay_adjustment_cents"] else "—")
-            self.tree.insert("","end",iid=row["id"],values=(row["clock_in"][:10],
+            self.tree.insert("","end",iid=row["id"],values=(row["clock_in"][:10],row['work_project_name'],
                 row["clock_in"].replace("T"," "),row["clock_out"].replace("T"," "),row["regular_hours"],
                 row["overtime_hours"],money(rate_used),override,money(row["gross_cents"]),
                 row["closure_ref"] or "—",row["payroll_ref"] or "Not committed",row["revision_count"]))
@@ -15237,6 +15327,14 @@ class PayrollTab(BaseTab):
     def __init__(self,app):
         super().__init__(app)
         ttk.Label(self,text="Attendance and payroll",style="Title.TLabel").pack(anchor="w")
+        view_bar=ttk.Frame(self);view_bar.pack(fill='x',pady=(5,2))
+        ttk.Label(view_bar,text='Employee ledger view').pack(side='left')
+        self.ledger_view=tk.StringVar(value='All employees / all projects')
+        self.ledger_combo=ttk.Combobox(view_bar,textvariable=self.ledger_view,state='readonly',width=32)
+        self.ledger_combo.pack(side='left',padx=6)
+        self.ledger_combo.bind('<<ComboboxSelected>>',lambda _event:self.refresh())
+        ttk.Label(view_bar,text='Viewing all sites does not change the project selected for new entries.',
+            style='Muted.TLabel').pack(side='left',padx=8)
         actions=ttk.Frame(self); actions.pack(fill="x",pady=(8,4))
         ttk.Button(actions,text="+ Add Employee",command=self.add_employee).pack(side="left")
         ttk.Button(actions,text="Edit Employee",command=self.edit_employee).pack(side="left",padx=5)
@@ -15266,14 +15364,20 @@ class PayrollTab(BaseTab):
                            (archive_page,"Employee Archive"),
                            (weekly_page,"Weekly Payroll"),(batch_page,"Committed Weekly Payrolls"),
                            (advance_page,"Cash Advances")): self.lists.add(page,text=title)
-        self.employees=make_tree(employee_page,[("no","Employee No.",105),("name","Name",155),("project","Project",130),("position","Position",120),("class","Class",75),("daily","Daily Rate",90),("hourly","Hourly Rate",90),("advance","Advance Balance",110),("state","Status",90)])
+        roster_controls=ttk.Frame(employee_page);roster_controls.pack(fill='x',pady=(0,4))
+        ttk.Label(roster_controls,text='Find employee').pack(side='left')
+        self.employee_search=tk.StringVar()
+        ttk.Entry(roster_controls,textvariable=self.employee_search,width=32).pack(side='left',padx=6)
+        ttk.Label(roster_controls,text='One company profile • deploy to multiple projects • do not create duplicates.',style='Muted.TLabel').pack(side='left')
+        self.employee_search.trace_add('write',lambda *_:self.refresh())
+        self.employees=make_tree(employee_page,[("no","MONCON No.",105),("name","Name",155),("project","Deployed Projects",180),("position","Position",120),("class","Class",75),("daily","Daily Rate",90),("hourly","Hourly Rate",90),("advance","Advance Balance",110),("state","Status",90)])
         archive_actions=ttk.Frame(archive_page); archive_actions.pack(fill="x",pady=(0,4))
         ttk.Label(archive_actions,text="Archived profiles retain attendance, payroll and cash-advance history.",style="Muted.TLabel").pack(side="left")
         ttk.Button(archive_actions,text="Reactivate Employee",style="Primary.TButton",command=self.reactivate_employee).pack(side="right")
         self.archived_employees=make_tree(archive_page,[("no","Employee No.",105),("name","Name",155),
             ("project","Last Project",135),("position","Position",120),("daily","Daily Rate",90),
             ("archived","Archived",145),("reason","Reason",220)])
-        self.attendance=make_tree(attendance_page,[("employee","Employee",145),("date","Date",90),("in","Time In",130),("out","Time Out",130),("lunch","Lunch",60),("regular","Regular",65),("ot","OT",55),("rate","Rate Used",90),("override","Pay Override",95),("gross","Final Gross",90),("source","Source",75),("closure","Daily Close Ref.",135),("workflow","Payroll Status",125),("revisions","Corrections",75)])
+        self.attendance=make_tree(attendance_page,[("employee","Employee",145),("project","Work Project",145),("date","Date",90),("in","Time In",130),("out","Time Out",130),("lunch","Lunch",60),("regular","Regular",65),("ot","OT",55),("rate","Rate Used",90),("override","Pay Override",95),("gross","Final Gross",90),("source","Source",75),("closure","Daily Close Ref.",135),("workflow","Payroll Status",125),("revisions","Corrections",75)])
         weekly_controls=ttk.Frame(weekly_page); weekly_controls.pack(fill="x",pady=(0,5))
         ttk.Label(weekly_controls,text="Payroll week").pack(side="left")
         self.week_var=tk.StringVar(value=payroll_week_bounds(date.today())[0])
@@ -15288,9 +15392,9 @@ class PayrollTab(BaseTab):
         ttk.Button(weekly_controls,text="Commit This Week to Expenses",style="Primary.TButton",
                    command=self.commit_weekly).pack(side="right")
         self.weekly_summary=ttk.Label(weekly_page,style="Section.TLabel"); self.weekly_summary.pack(anchor="w",pady=(0,5))
-        self.weekly=make_tree(weekly_page,[("employee","Employee",150),("project","Project",125),
-            ("days","Closed Days",75),("regular","Regular Hours",85),("ot","OT Hours",70),
-            ("gross","Gross",95),("deductions","Advance Deductions",115),("adjustments","Corrections",95),("net","Net Payable",100),
+        self.weekly=make_tree(weekly_page,[("employee","Employee",150),("project","Work Projects",180),
+            ("days","Closed Logs",75),("regular","Regular Hours",85),("ot","OT Hours",70),
+            ("gross","Gross",95),("deductions","CA Deduction This Week",145),("balance","CA Outstanding",110),("adjustments","Corrections",95),("net","Net Payable",100),
             ("refs","Daily Close References",220),("status","Status",100)])
         batch_actions=ttk.Frame(batch_page); batch_actions.pack(fill="x",pady=(0,5))
         ttk.Label(batch_actions,text="Double-click a batch for its summary and attendance details.",
@@ -15299,7 +15403,7 @@ class PayrollTab(BaseTab):
                    command=self.export_selected_batch_pdf).pack(side="right")
         ttk.Button(batch_actions,text="Reopen for Correction",
                    command=self.reopen_selected_payroll).pack(side="right",padx=(0,6))
-        self.batches=make_tree(batch_page,[("ref","Batch",145),("start","Period Start",95),("end","Period End",95),("count","Entries",65),("gross","Gross",100),("deductions","Deductions",95),("adjustments","Corrections",95),("net","Net Payable",100),("status","Status",105),("replacement","Replacement",145),("head","Authorized by",120),("created","Committed",145)])
+        self.batches=make_tree(batch_page,[("ref","Batch",145),("project","Project",145),("start","Period Start",95),("end","Period End",95),("count","Entries",65),("gross","Gross",100),("deductions","Deductions",95),("adjustments","Corrections",95),("net","Net Payable",100),("status","Status",105),("replacement","Replacement",145),("head","Authorized by",120),("created","Committed",145)])
         advance_actions=ttk.Frame(advance_page); advance_actions.pack(fill="x",pady=(0,4))
         ttk.Button(advance_actions,text="+ Grant Cash Advance",style="Primary.TButton",command=self.grant_cash_advance).pack(side="left")
         ttk.Button(advance_actions,text="+ Batch Cash Advances",style="Primary.TButton",
@@ -15315,7 +15419,7 @@ class PayrollTab(BaseTab):
         pane=ttk.Panedwindow(advance_page,orient="vertical"); pane.pack(fill="both",expand=True)
         advances_frame=ttk.Frame(pane); transactions_frame=ttk.Frame(pane); pane.add(advances_frame,weight=1); pane.add(transactions_frame,weight=1)
         ttk.Label(advances_frame,text="Employee advances",style="Section.TLabel").pack(anchor="w")
-        self.advances=make_tree(advances_frame,[("date","Date",90),("batch","Batch Ref.",145),("reference","Advance Ref.",135),("employee","Employee",150),("original","Original",90),("recovered","Recovered",90),("net","Net Amount",90),("mop","Funding Source",110),("plan","Repayment Plan",120),("status","Recovery Status",120),("reason","Reason",180)])
+        self.advances=make_tree(advances_frame,[("date","Date",90),("batch","Batch Ref.",145),("reference","Advance Ref.",135),("employee","Employee",150),("project","Issuing Project",145),("original","Original",90),("recovered","Recovered",90),("net","Net Amount",90),("mop","Funding Source",110),("plan","Repayment Plan",120),("status","Recovery Status",120),("reason","Reason",180)])
         ttk.Label(transactions_frame,text="Every advance and recovery transaction",style="Section.TLabel").pack(anchor="w",pady=(5,0))
         self.advance_transactions=make_tree(transactions_frame,[("date","Date",90),("employee","Employee",140),("type","Transaction",125),("amount","Amount",90),("mop","MOP",100),("reference","Reference",115),("head","Authorized by",115),("balance","Balance after",95)])
         self.employees.bind("<Double-1>",self.open_employee_profile)
@@ -15574,9 +15678,9 @@ class PayrollTab(BaseTab):
 
     def open_weekly_employee_details(self,_event=None):
         selected=self.weekly.selection()
-        if not selected or not self.project_id:return
+        if not selected:return
         week_start,week_end=payroll_week_bounds(self.week_var.get() or date.today())
-        win=WeeklyEmployeeDetailsDialog(self,int(selected[0]),self.project_id,week_start,week_end)
+        win=WeeklyEmployeeDetailsDialog(self,int(selected[0]),self.ledger_project_id,week_start,week_end)
         self.wait_window(win);self.refresh_weekly()
 
     def open_employee_profile(self,_event=None):
@@ -15653,10 +15757,11 @@ class PayrollTab(BaseTab):
         except (ValueError,OSError,sqlite3.Error) as exc:
             messagebox.showerror(APP_TITLE,str(exc),parent=self)
     def export_cash_advances_pdf(self):
-        if not self.require_project(): return
         selector=CashAdvanceExportDialog(self); self.wait_window(selector)
         if not selector.result:return
-        project=self.db.one("SELECT name FROM projects WHERE id=?",(self.project_id,))
+        scope=self.ledger_project_id
+        project=({'name':'MONCON_All_projects'} if scope is None else
+                 self.db.one("SELECT name FROM projects WHERE id=?",(scope,)))
         safe_project="".join(character if character.isalnum() or character in "-_" else "_"
                              for character in project["name"]).strip("_") or "project"
         scope_name=("all_methods" if len(selector.result)==len(CashAdvanceExportDialog.METHODS)
@@ -15667,7 +15772,7 @@ class PayrollTab(BaseTab):
             initialfile=f"{safe_project}_cash_advances_{scope_name}.pdf")
         if not destination:return
         try:
-            export_cash_advance_pdf(self.db,self.project_id,selector.result,destination)
+            export_cash_advance_pdf(self.db,scope,selector.result,destination)
             messagebox.showinfo(APP_TITLE,f"Cash advance PDF saved:\n{destination}",parent=self)
         except (ValueError,OSError,sqlite3.Error) as exc:
             messagebox.showerror(APP_TITLE,str(exc),parent=self)
@@ -15677,13 +15782,9 @@ class PayrollTab(BaseTab):
     def process_clock(self,direction,employee_no,pin,parent=None):
         if not self.require_project():return False
         today_text=date.today().isoformat()
-        employee=self.db.one("""SELECT e.*,a.position deployment_position,
-            a.daily_rate_cents deployment_daily_rate_cents
-            FROM employees e JOIN employee_project_assignments a ON a.employee_id=e.id
-            WHERE a.project_id=? AND e.employee_no=? AND e.active=1
-              AND a.effective_from<=? AND (a.effective_to='' OR a.effective_to>=?)
-            ORDER BY a.effective_from DESC,a.id DESC LIMIT 1""",
-            (self.project_id,employee_no.strip(),today_text,today_text))
+        try:employee=self.db.employee_for_clock(self.project_id,employee_no,today_text)
+        except ValueError as exc:
+            messagebox.showerror(APP_TITLE,str(exc),parent=parent);return False
         if not employee or not verify_pin(pin,employee["pin_salt"],employee["pin_hash"]): messagebox.showerror(APP_TITLE,"Employee number or PIN is incorrect.",parent=parent); return False
         open_row=self.db.one("SELECT * FROM attendance WHERE employee_id=? AND clock_out=''",(employee["id"],)); now=datetime.now()
         if direction=="in" and open_row: messagebox.showinfo(APP_TITLE,f"{employee['name']} is already clocked in.",parent=parent); return False
@@ -15776,6 +15877,7 @@ class PayrollTab(BaseTab):
     def refresh_weekly(self):
         if not hasattr(self,"weekly"):return
         self.weekly.delete(*self.weekly.get_children())
+        self.weekly.showing_all=True
         try:
             week_start,week_end=payroll_week_bounds(self.week_var.get() or date.today())
         except ValueError:
@@ -15783,26 +15885,31 @@ class PayrollTab(BaseTab):
         if self.week_var.get()!=week_start:
             self.week_var.set(week_start);return
         self.week_range_label.config(text=f"Saturday {week_start} through Friday {week_end}")
-        if not self.project_id:
-            self.weekly_summary.config(text="Select one project to review and commit weekly payroll.")
-            return
-        try:rows=self.db.weekly_payroll_summary(self.project_id,week_start)
+        scope=self.ledger_project_id
+        try:rows=(self.db.weekly_payroll_summary(scope,week_start) if scope else
+                  self.db.company_weekly_payroll_summary(week_start))
         except ValueError as exc:
             self.weekly_summary.config(text=str(exc));return
         gross=deductions=adjustments=net=closed_days=0
         for row in rows:
             gross+=row["gross_cents"]
+            ca_balance=self.db.one('''SELECT COALESCE(SUM(a.original_cents),0)-
+                COALESCE(SUM((SELECT SUM(t.amount_cents) FROM cash_advance_transactions t
+                WHERE t.advance_id=a.id AND t.posted=1 AND t.voided=0 AND t.txn_type<>'Advance')),0) n
+                FROM cash_advances a WHERE a.employee_id=? AND a.voided=0''',(row['id'],))['n']
             if row["attendance_count"]:
                 deductions+=row["deduction_cents"]
                 adjustments+=row["adjustment_cents"]
                 net+=row["net_cents"]
                 closed_days+=row["attendance_count"]
-            status=("No closed attendance" if not row["attendance_count"] else
+            status=("CA awaiting attendance" if ca_balance and not row['attendance_count'] else
+                    "No closed attendance" if not row["attendance_count"] else
                     "Check deductions" if row["net_cents"]<0 else "Ready")
             self.weekly.insert("","end",iid=row["id"],values=(
-                row["name"],row["project_name"],row["attendance_count"],
+                f"{row['name']} [{row['employee_no']}]",row["project_name"],row["attendance_count"],
                 f"{row['regular_hours_total']:.2f}",f"{row['overtime_hours_total']:.2f}",
                 money(row["gross_cents"]),money(row["deduction_cents"] if row["attendance_count"] else 0),
+                money(max(0,ca_balance)),
                 money(row["adjustment_cents"] if row["attendance_count"] else 0),
                 money(max(0,row["net_cents"]) if row["attendance_count"] else 0),
                 row["closure_references"] or "—",status))
@@ -15812,12 +15919,14 @@ class PayrollTab(BaseTab):
                  f"Net payable: {money(net)}")
 
     def commit_weekly(self):
-        if not self.require_project():return
         week_start,week_end=payroll_week_bounds(self.week_var.get() or date.today())
         try:
-            employee_ids=[r['id'] for r in self.db.weekly_payroll_summary(self.project_id,week_start) if r['attendance_count']]
+            scope=self.ledger_project_id
+            summary=(self.db.weekly_payroll_summary(scope,week_start) if scope else
+                     self.db.company_weekly_payroll_summary(week_start))
+            employee_ids=[r['id'] for r in summary if r['attendance_count']]
             if not employee_ids:
-                raise ValueError('Close at least one completed attendance day in this project first.')
+                raise ValueError('Close at least one completed attendance day in this view first.')
             candidates=self.db.all(f"""SELECT DISTINCT COALESCE(a.project_id,e.project_id) project_id
                 FROM attendance a JOIN employees e ON e.id=a.employee_id WHERE a.employee_id IN ({','.join('?' for _ in employee_ids)})
                 AND SUBSTR(a.clock_in,1,10) BETWEEN ? AND ? AND a.closure_batch_id IS NOT NULL
@@ -16235,13 +16344,24 @@ class PayrollTab(BaseTab):
         self.db.audit(self.project_id,"PAYROLL_COMMITTED",f"{batch_ref}: gross {money(gross)}, deductions {money(deduction_total)}, net {money(net)} authorized by {head['name']}")
         messagebox.showinfo(APP_TITLE,f"Payroll committed.\nGross: {money(gross)}\nAdvance deductions: {money(deduction_total)}\nNet payable: {money(net)}");self.app.refresh_all()
 
+    @property
+    def ledger_project_id(self):
+        return getattr(self,'ledger_projects',{}).get(self.ledger_view.get())
+
     def refresh(self):
         for tree in (self.employees,self.archived_employees,self.attendance,self.weekly,self.batches,self.advances,self.advance_transactions):tree.delete(*tree.get_children())
-        attendance_project_filter=" AND COALESCE(a.project_id,e.project_id)=?" if self.project_id else ""
-        batch_project_filter=" AND b.project_id=?" if self.project_id else ""
-        advance_project_filter=" AND a.project_id=?" if self.project_id else ""
-        employee_params=(self.project_id,) if self.project_id else ()
-        if self.project_id:
+        self.employees.showing_all=True
+        self.archived_employees.showing_all=True
+        self.ledger_projects={'All employees / all projects':None}
+        self.ledger_projects.update({f"{p['name']} [#{p['id']}]":p['id'] for p in self.db.all('SELECT id,name FROM projects ORDER BY name COLLATE NOCASE')})
+        self.ledger_combo.configure(values=list(self.ledger_projects))
+        if self.ledger_view.get() not in self.ledger_projects:self.ledger_view.set('All employees / all projects')
+        scope=self.ledger_project_id
+        attendance_project_filter=" AND COALESCE(a.project_id,e.project_id)=?" if scope else ""
+        batch_project_filter=" AND b.project_id=?" if scope else ""
+        advance_project_filter=" AND a.project_id=?" if scope else ""
+        employee_params=(scope,) if scope else ()
+        if scope:
             employees=self.db.all("""SELECT e.*,p.name project_name,
                 assignment.position deployment_position,
                 assignment.daily_rate_cents deployment_daily_rate_cents,
@@ -16254,7 +16374,7 @@ class PayrollTab(BaseTab):
                 WHERE assignment.project_id=? AND assignment.effective_from<=?
                   AND (assignment.effective_to='' OR assignment.effective_to>=?)
                   AND e.active=1 ORDER BY e.name COLLATE NOCASE""",
-                (self.project_id,date.today().isoformat(),date.today().isoformat()))
+                (scope,date.today().isoformat(),date.today().isoformat()))
         else:
             employees=self.db.all("""SELECT e.*,home.name home_project,
                 COALESCE(GROUP_CONCAT(DISTINCT deployed.name),'') project_name,
@@ -16269,6 +16389,9 @@ class PayrollTab(BaseTab):
                 WHERE e.active=1 GROUP BY e.id ORDER BY e.name COLLATE NOCASE""",
                 (date.today().isoformat(),date.today().isoformat()))
         for e in employees:
+            search=self.employee_search.get().strip().casefold()
+            aliases=self.db.all('SELECT previous_reference FROM employee_reference_history WHERE employee_id=?',(e['id'],))
+            if search and search not in ' '.join([e['employee_no'],e['name'],e['project_name'],e['position'],*[r['previous_reference'] for r in aliases]]).casefold():continue
             daily=employee_daily_rate(e); outstanding=self.db.one("""SELECT COALESCE(SUM(a.original_cents),0)-COALESCE(SUM((SELECT SUM(t.amount_cents) FROM cash_advance_transactions t WHERE t.advance_id=a.id AND t.posted=1 AND t.voided=0 AND t.txn_type<>'Advance')),0) total FROM cash_advances a WHERE a.employee_id=? AND a.voided=0""",(e["id"],))["total"]
             position=(e["deployment_position"] if "deployment_position" in e.keys()
                       and e["deployment_position"] else e["position"])
@@ -16279,8 +16402,10 @@ class PayrollTab(BaseTab):
             e["name"],e["project_name"],e["position"],money(employee_daily_rate(e)),
             e["archived_at"] or "Legacy archive",e["archive_reason"] or "Not recorded"))
         attendance=self.db.all(f"""SELECT a.*,e.name,
+            COALESCE(work.name,'Unknown project') work_project_name,
             COALESCE(cb.closure_ref,'') closure_ref,COALESCE(pb.batch_ref,'') weekly_ref
             FROM attendance a JOIN employees e ON e.id=a.employee_id
+            LEFT JOIN projects work ON work.id=COALESCE(a.project_id,e.project_id)
             LEFT JOIN attendance_closure_batches cb ON cb.id=a.closure_batch_id
             LEFT JOIN payroll_batches pb ON pb.id=a.payroll_batch_id
             WHERE 1=1{attendance_project_filter} ORDER BY a.clock_in DESC""",employee_params)
@@ -16293,24 +16418,26 @@ class PayrollTab(BaseTab):
                                                r["project_id"] or None))
             override=(money(r["manual_pay_adjustment_cents"])
                       if r["manual_pay_adjustment_cents"] else "—")
-            self.attendance.insert("","end",iid=r["id"],values=(r["name"],r["clock_in"][:10],
+            self.attendance.insert("","end",iid=r["id"],values=(r["name"],r['work_project_name'],r["clock_in"][:10],
                 r["clock_in"].replace("T"," "),r["clock_out"].replace("T"," "),r["lunch_hours"],
                 r["regular_hours"],r["overtime_hours"],money(rate_used),override,
                 money(r["gross_cents"]),r["source"],
                 r["closure_ref"] or "—",workflow,r["revision_count"]))
-        batches=self.db.all(f"""SELECT b.*,
+        batches=self.db.all(f"""SELECT b.*,project.name work_project_name,
             COALESCE((SELECT SUM(s.attendance_entries) FROM payroll_batch_employee_snapshots s
                       WHERE s.payroll_batch_id=b.id),COUNT(a.id)) attendance_count,
             COALESCE((SELECT replacement.batch_ref FROM payroll_batches replacement
                       WHERE replacement.id=b.replacement_batch_id),'') replacement_ref,
             COALESCE(h.name,'Legacy / not recorded') head
             FROM payroll_batches b LEFT JOIN attendance a ON a.payroll_batch_id=b.id
+            JOIN projects project ON project.id=b.project_id
             LEFT JOIN project_heads h ON h.id=b.authorized_by_head_id
             WHERE 1=1{batch_project_filter} GROUP BY b.id ORDER BY b.created_at DESC,b.id DESC""",employee_params)
-        for b in batches:self.batches.insert("","end",iid=b["id"],values=(b["batch_ref"],b["period_start"],b["period_end"],b["attendance_count"],money(b["gross_cents"]),money(b["deduction_cents"]),money(b["adjustment_cents"]),money(b["net_cents"]),b["status"],b["replacement_ref"] or "—",b["head"],b["created_at"]))
-        advances=self.db.all(f"""SELECT a.*,e.name employee,COALESCE(b.batch_ref,'Individual') batch_ref,
+        for b in batches:self.batches.insert("","end",iid=b["id"],values=(b["batch_ref"],b['work_project_name'],b["period_start"],b["period_end"],b["attendance_count"],money(b["gross_cents"]),money(b["deduction_cents"]),money(b["adjustment_cents"]),money(b["net_cents"]),b["status"],b["replacement_ref"] or "—",b["head"],b["created_at"]))
+        advances=self.db.all(f"""SELECT a.*,e.name employee,p.name issuing_project,COALESCE(b.batch_ref,'Individual') batch_ref,
             COALESCE((SELECT SUM(t.amount_cents) FROM cash_advance_transactions t WHERE t.advance_id=a.id AND t.posted=1 AND t.voided=0 AND t.txn_type<>'Advance'),0) recovered
             FROM cash_advances a JOIN employees e ON e.id=a.employee_id
+            JOIN projects p ON p.id=a.project_id
             LEFT JOIN cash_advance_batches b ON b.id=a.batch_id
             WHERE a.voided=0{advance_project_filter} ORDER BY a.advance_date DESC,a.id DESC""",employee_params)
         advanced=recovered_total=0
@@ -16318,6 +16445,7 @@ class PayrollTab(BaseTab):
             net=max(0,a["original_cents"]-a["recovered"]); status="Settled" if net==0 else "Partially Recovered" if a["recovered"] else "Outstanding"; advanced+=a["original_cents"];recovered_total+=a["recovered"]
             self.advances.insert("","end",iid=a["id"],values=(a["advance_date"],a["batch_ref"],
                 a["system_reference"] or f"CA-LEGACY-{a['id']:06d}",a["employee"],
+                a['issuing_project'],
                 money(a["original_cents"]),money(a["recovered"]),money(net),a["method"],
                 a["repayment_plan"],status,a["reason"]))
         txns=self.db.all(f"""SELECT t.*,a.original_cents,e.name employee,COALESCE(h.name,'Legacy / not recorded') head FROM cash_advance_transactions t JOIN cash_advances a ON a.id=t.advance_id JOIN employees e ON e.id=a.employee_id LEFT JOIN project_heads h ON h.id=t.authorized_by_head_id WHERE a.voided=0 AND t.voided=0{advance_project_filter} ORDER BY t.txn_date,t.id""",employee_params);balances={}

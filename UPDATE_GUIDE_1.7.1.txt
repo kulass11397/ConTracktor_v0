@@ -1,0 +1,23 @@
+ConTracktor 1.7.1 update — retain existing records
+
+1. In the client's current app, make a fresh SQLite backup and keep a separate copy.
+2. Close ConTracktor completely, including any open kiosk window.
+3. Download ConTracktor_v1_Update_1.7.1.exe from the GitHub v1.7.1 release.
+4. Run the updater under the SAME Windows user that runs the existing app. Do not uninstall the app or replace its database.
+5. Confirm the update. It updates the existing per-user installation and creates timestamped app/data backups.
+6. On first launch, employee references become MONCON references. Another database backup is created before this migration; former references remain preserved.
+7. Check employee profiles, project deployments, weekly payroll and cash-advance balances. Monetary amounts and employee identity links are preserved.
+
+Default app: %LOCALAPPDATA%\Programs\ConTracktor_v1
+Default data: %LOCALAPPDATA%\ConTracktor_v1\Data\contractor_tracker.db
+Installer data backups: %LOCALAPPDATA%\ConTracktor_v1\Data\Backups
+Application backups: %LOCALAPPDATA%\ConTracktor_v1\AppBackups
+MONCON database backup: beside the active database, *_before_moncon_*.db
+
+For a custom database/installation location, confirm the existing setup before running the default updater. Do not switch databases accidentally.
+
+The Payroll ledger-view filter is independent of the project selected in the header. New entries and daily closure use the header's project. Weekly commitment reviews project totals before posting separate expenses.
+
+Do not add missing attendance unless work was actually performed. Scheduled CA deductions depend on closed salary and may carry forward if wages are insufficient.
+
+The updater is unsigned. If security software blocks it, record the detection name and contact the maintainer; do not disable antivirus or add blanket exclusions.
