@@ -6,6 +6,8 @@ The [v1.7.3 prerelease updater](https://github.com/kulass11397/ConTracktor_v0/re
 
 See [release notes](RELEASE_NOTES_1.7.3.md), [client update guide](UPDATE_GUIDE_1.7.3.txt), and [workflow](MONCON_PAYROLL_WORKFLOW.md).
 
+All earlier feature, development, and deployment documentation is retained in [historical notes](HISTORICAL_FEATURES.md). Use the current guide for installation; older release references there are history, not recommendations.
+
 The standard Inno Setup updater backs up the existing app/database and packages no client records. 107 regression tests and isolated record-preservation checks passed.
 
 Security notice: local Defender scans are clean, but Microsoft review and client download acceptance remain unconfirmed following the earlier v1.7.1 Wacatac report. Do not bypass antivirus protection. See [review status](SECURITY_REVIEW_1.7.3.md).
