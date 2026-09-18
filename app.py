@@ -162,8 +162,119 @@ def write_simple_pdf(path: Path | str, title: str, lines: list[str]):
     Path(path).write_bytes(output)
 
 
+def build_expense_client_summary(db, rows, project_ids, date_from='', date_to='', metadata=None):
+    """Read-only report context; cost and cash-flow figures are kept separate."""
+    metadata=metadata or {}
+    project_ids=sorted(set(project_ids))
+    if not project_ids:
+        raise ValueError('Select at least one project for the expense summary.')
+    for value in (date_from,date_to):
+        if value: valid_date(value,True)
+    if date_from and date_to and date_from>date_to:
+        raise ValueError('The report start date must not be after its end date.')
+    slots=','.join('?' for _ in project_ids)
+    projects=db.all(f'SELECT * FROM projects WHERE id IN ({slots}) ORDER BY name',tuple(project_ids))
+    selected={r['id']:dict(r) for r in rows}
+    active=[r for r in selected.values() if not r['voided']]
+    dates=sorted(r['expense_date'] for r in active if r['expense_date'])
+    cutoff=date_to or (dates[-1] if dates else date.today().isoformat())
+    def period_date(value):
+        return datetime.strptime(value,'%Y-%m-%d').strftime('%m/%d/%Y')
+    start=date_from or (dates[0] if dates else '')
+    period=(f'{period_date(start)} to {period_date(cutoff)}' if start else f'Through {period_date(cutoff)}')
+    running=db.all(f"""SELECT e.*,COALESCE(ph.name,'') phase,
+        COALESCE((SELECT SUM(p.amount_cents) FROM payments p WHERE p.expense_id=e.id AND p.accounting_excluded=0),0) payment_total,
+        COALESCE((SELECT SUM(t.amount_cents) FROM cash_advances ca JOIN cash_advance_transactions t ON t.advance_id=ca.id
+            WHERE ca.expense_id=e.id AND ca.voided=0 AND t.voided=0 AND t.posted=1
+              AND t.txn_type IN ('Cash Repayment','Bank Repayment','Repayment')),0) recovery_total,
+        COALESCE((SELECT ca.id FROM cash_advances ca WHERE ca.expense_id=e.id AND ca.voided=0 LIMIT 1),0) cash_advance_id
+        FROM expenses e LEFT JOIN phases ph ON ph.id=e.phase_id
+        WHERE e.project_id IN ({slots}) AND e.voided=0 AND (e.expense_date<=? OR e.expense_date='')
+        ORDER BY e.id""",tuple(project_ids)+(cutoff,))
+    payroll={r['expense_id']:r for r in db.all("SELECT * FROM payroll_batches WHERE status='Committed' AND expense_id IS NOT NULL")}
+    def deduction(row):
+        batch=payroll.get(row['id'])
+        return batch['deduction_cents'] if batch else 0
+    def is_labor(row):
+        return row['id'] in payroll or bool(row.get('payroll_batch')) or row.get('trade','').strip().casefold() in {'labor','labour','payroll','salary','salaries'}
+    def is_fee(row):
+        return row.get('area','').strip().upper()=='BANK FEES' or row.get('trade','').strip().casefold() in {'bank charges','bank fees'}
+    def net(row):return max(0,row['total_cents']-row['recovery_total'])
+    def construction(row):return 0 if row['cash_advance_id'] else net(row)+deduction(row)
+    costs=[r for r in active if not r['cash_advance_id']]
+    materials=sum(construction(r) for r in costs if not is_labor(r) and not is_fee(r))
+    labor=sum(construction(r) for r in costs if is_labor(r))
+    fees=sum(construction(r) for r in costs if is_fee(r) and not is_labor(r))
+    phases={};categories={};areas={};sites={};sources={}
+    for row in costs:
+        amount=construction(row)
+        for result,key in ((phases,row.get('phase') or 'Unassigned phase'),
+                           (categories,row.get('trade') or 'Uncategorized'),
+                           (areas,row.get('area') or 'Unassigned area'),
+                           (sites,next((p['name'] for p in projects if p['id']==row['project_id']),'Unknown project'))):
+            result[key]=result.get(key,0)+amount
+    ids=[r['id'] for r in active]
+    if ids:
+        pslots=','.join('?' for _ in ids)
+        for row in db.all(f"""SELECT COALESCE(NULLIF(ca.reference,''),NULLIF(ba.bank_name,''),NULLIF(p.method,''),'Unspecified') source,
+            SUM(p.amount_cents) amount FROM payments p JOIN expenses e ON e.id=p.expense_id
+            LEFT JOIN cash_allocations ca ON ca.id=p.cash_allocation_id
+            LEFT JOIN bank_accounts ba ON ba.id=p.bank_account_id
+            WHERE p.expense_id IN ({pslots}) AND p.accounting_excluded=0 AND e.voided=0 GROUP BY source""",tuple(ids)):
+            sources[row['source']]=row['amount']
+    heads=[]
+    for row in db.all(f'SELECT name FROM project_heads WHERE project_id IN ({slots}) AND active=1 ORDER BY name',tuple(project_ids)):
+        if row['name'] not in heads:heads.append(row['name'])
+    signers=[name.strip() for name in metadata.get('signatures',', '.join(heads)).split(',') if name.strip()]
+    if len(signers)>9:raise ValueError('Use no more than nine contractor names for signatures.')
+    contract=sum(p['contract_value_cents'] for p in projects)
+    deposited=sum(db.project_budget(pid)[0] for pid in project_ids)
+    budgets=[db.project_cost_budget(pid) for pid in project_ids]
+    loans=[db.interproject_balance(pid) for pid in project_ids]
+    selected_total=sum(net(r) for r in active)
+    metrics=[
+        ('Materials / other non-labor costs',materials),
+        ('Labor - gross committed payroll / recorded labor',labor),
+        ('Bank fees / charges',fees),
+        ('Total recorded construction cost - selected period',materials+labor+fees),
+        ('Selected-period ledger total - after cash recoveries',selected_total),
+        ('Employee advances issued - separate from construction cost',sum(r['total_cents'] for r in active if r['cash_advance_id'])),
+        ('Payroll deductions already advanced - included in gross labor',sum(deduction(r) for r in costs)),
+        ('Payments recorded - selected expenses',sum(r['payment_total'] for r in active)),
+        ('Cash / bank recoveries - selected expenses',sum(r['recovery_total'] for r in active)),
+        ('Outstanding payments - selected expenses',sum(max(0,r['total_cents']-r['payment_total']) for r in active)),
+        ('Verified ledger expenses - selected period',sum(net(r) for r in active if r.get('verification_status')=='Verified')),
+        ('Unverified ledger expenses - selected period',sum(net(r) for r in active if r.get('verification_status')!='Verified')),
+    ]
+    funding=[
+        ('Running construction cost - all selected-project records through '+period_date(cutoff),sum(construction(dict(r)) for r in running)),
+        ('Running ledger total - all selected-project records through '+period_date(cutoff),sum(net(r) for r in running)),
+        ('Project contract / cost budget',contract),('Project deposits',deposited),
+        ('Contract collectible',contract-deposited),
+        ('Remaining ledger cost budget - current',sum(b[2] for b in budgets)),
+        ('Available project funds - current',sum(db.project_budget(pid)[2] for pid in project_ids)),
+        ('Inter-project recoverable - current',sum(b[0] for b in loans)),
+        ('Inter-project owed - current',sum(b[1] for b in loans)),
+    ]
+    return dict(title=metadata.get('title') or ' / '.join(p['name'] for p in projects),
+        address=metadata.get('address',' / '.join(dict.fromkeys(p['address'] for p in projects if p['address']))),
+        client=' / '.join(dict.fromkeys(p['client'] for p in projects if p['client'])),
+        period=period,period_label=metadata.get('period_label') or 'Reporting period',
+        counts=f"Listed entries: {len(selected)} | Active entries: {len(active)} | Void entries excluded: {len(selected)-len(active)}",
+        metrics=metrics,funding=funding,phases=phases,categories=categories,areas=areas,sites=sites,sources=sources,
+        construction_cents=materials+labor+fees,signatures=signers,
+        notes=[
+            'Summary uses the active, filtered expense ledger. Void entries and excluded payment history are not counted.',
+            'Materials / other costs includes non-labor procurement and unclassified costs; review categories before client approval.',
+            'Gross labor adds back committed payroll salary deductions. Advance issues are shown separately and not added again to construction cost.',
+            'Phase, category, area and project tables regroup the same construction total; do not add those tables together.',
+            'Running totals ignore other row filters and include all selected-project expenses through the stated end date. Recoveries and funding balances are current at export, not a historical bank reconciliation.',
+        ])
+
+
 def write_expense_ledger_pdf(path: Path | str, filters: list[tuple[str, str]],
-                             summary: list[str], rows: list[dict]):
+                             summary: list[str], rows: list[dict], *, client_summary=None,
+                             include_details=True):
     """Write a readable, dependency-free A4 landscape expense table at 10 pt."""
     page_width, page_height = 842, 595  # ISO A4 landscape in PDF points.
     margin, footer_height = 36, 38
@@ -250,6 +361,97 @@ def write_expense_ledger_pdf(path: Path | str, filters: list[tuple[str, str]],
     filter_text = " | ".join(f"{clean(label)}: {clean(value)}" for label, value in filters)
     summary_text = " | ".join(clean(value) for value in summary)
     pages = []
+    if not include_details and client_summary is None:
+        raise ValueError('A summary context is required for a summary-only report.')
+    summary_y=0
+    if client_summary is not None:
+        def summary_page():
+            commands=[];pages.append(commands)
+            y=page_height-42
+            for line in wrap_cell(client_summary['title'],content_width*10/16,bold=True):
+                add_text(commands,margin,y,line,font='F2',size=16);y-=20
+            for value in (client_summary.get('client'),client_summary.get('address'),
+                          f"{client_summary['period_label']} ({client_summary['period']})",
+                          client_summary.get('counts')):
+                if value:
+                    for line in wrap_cell(value,content_width):
+                        add_text(commands,margin,y,line,color='0.35 0.39 0.45');y-=12
+            y-=8
+            return commands,y
+        commands,summary_y=summary_page()
+        def summary_section(title,values,percentage=False):
+            nonlocal commands,summary_y
+            widths=[500,130,140] if percentage else [570,200]
+            headers=['GROUP / DESCRIPTION','AMOUNT (PHP)','SHARE'] if percentage else ['DESCRIPTION','AMOUNT (PHP)']
+            def heading():
+                nonlocal summary_y
+                add_text(commands,margin,summary_y,title,font='F2',size=12);summary_y-=12
+                commands.append(f'q 0.07 0.12 0.22 rg {margin} {summary_y-26:.2f} {content_width} 26 re f Q')
+                x=margin
+                for label,width in zip(headers,widths):
+                    add_text(commands,x+6,summary_y-17,label,font='F2',color='1 1 1');x+=width
+                summary_y-=26
+            if summary_y<130:commands,summary_y=summary_page()
+            heading()
+            for index,(label,value) in enumerate(values):
+                wrapped=wrap_cell(label,widths[0]);height=max(24,len(wrapped)*12+10)
+                if summary_y-height<52:
+                    commands,summary_y=summary_page();heading()
+                bottom=summary_y-height
+                if index%2:commands.append(f'q 0.96 0.97 0.98 rg {margin} {bottom:.2f} {content_width} {height} re f Q')
+                x=margin
+                for width in widths:
+                    commands.append(f'0.78 0.81 0.85 RG 0.45 w {x:.2f} {bottom:.2f} {width} {height} re S');x+=width
+                for offset,line in enumerate(wrapped):add_text(commands,margin+6,summary_y-16-offset*12,line)
+                add_text(commands,margin+widths[0]+6,summary_y-16,money(value),align='right',max_width=widths[1]-12)
+                if percentage:
+                    denominator=client_summary['construction_cents']
+                    share=f'{100*value/denominator:.2f}%' if denominator else '-'
+                    add_text(commands,margin+widths[0]+widths[1]+6,summary_y-16,share,align='right',max_width=widths[2]-12)
+                summary_y=bottom
+            summary_y-=20
+        summary_section('FINANCIAL SUMMARY - '+client_summary['period_label'],
+            client_summary['metrics'][:5]+[client_summary['funding'][0]])
+        def compact_breakdown(title,values,x,top):
+            add_text(commands,x,top,title,font='F2',size=11)
+            y=top-12
+            commands.append(f'q 0.07 0.12 0.22 rg {x:.2f} {y-26:.2f} 375 26 re f Q')
+            add_text(commands,x+6,y-17,'GROUP',font='F2',color='1 1 1')
+            add_text(commands,x+255,y-17,'AMOUNT (PHP)',font='F2',color='1 1 1')
+            y-=26
+            entries=sorted(values.items(),key=lambda item:item[0].casefold())
+            if len(entries)>5:
+                entries=entries[:5]+[('Other groups - see full breakdown',sum(v for _,v in entries[5:]))]
+            entries.append(('TOTAL',sum(values.values())))
+            for index,(label,value) in enumerate(entries):
+                if len(label)>42:label=label[:39]+'...'
+                if index%2:commands.append(f'q 0.96 0.97 0.98 rg {x:.2f} {y-24:.2f} 375 24 re f Q')
+                commands.append(f'0.78 0.81 0.85 RG 0.45 w {x:.2f} {y-24:.2f} 375 24 re S')
+                commands.append(f'0.78 0.81 0.85 RG 0.45 w {x+249:.2f} {y-24:.2f} m {x+249:.2f} {y:.2f} l S')
+                add_text(commands,x+6,y-16,label)
+                add_text(commands,x+255,y-16,money(value),align='right',max_width=114)
+                y-=24
+            return y
+        if summary_y<240:commands,summary_y=summary_page()
+        left=compact_breakdown('PHASES',client_summary['phases'],margin,summary_y)
+        right=compact_breakdown('CATEGORIES / TRADES',client_summary['categories'],margin+395,summary_y)
+        summary_y=min(left,right)-16
+        if summary_y>=48:
+            add_text(commands,margin,summary_y,'Gross labor includes salary deductions; advance issues are reported separately, not added again to construction cost.',color='0.35 0.39 0.45')
+        commands,summary_y=summary_page()
+        summary_section('PAYMENTS, RECOVERIES AND VERIFICATION',client_summary['metrics'][5:])
+        summary_section('RUNNING TOTALS AND PROJECT FUNDING',client_summary['funding'])
+        for title,key in (('PHASE BREAKDOWN','phases'),('CATEGORY / TRADE BREAKDOWN','categories'),
+                          ('AREA BREAKDOWN','areas'),('PROJECT BREAKDOWN','sites'),('PAYMENT SOURCES - CURRENT RECORDED PAYMENTS','sources')):
+            values=sorted(client_summary[key].items(),key=lambda item:item[0].casefold())
+            if values:
+                percentage=key!='sources'
+                summary_section(title,values+[('TOTAL',sum(v for _,v in values))],percentage)
+        for note in ['Applied filters: '+filter_text]+client_summary.get('notes',[]):
+            for line in wrap_cell(note,content_width):
+                if summary_y<52:commands,summary_y=summary_page()
+                add_text(commands,margin,summary_y,line,color='0.35 0.39 0.45');summary_y-=12
+            summary_y-=6
 
     def start_page(continued=False):
         commands = []
@@ -296,139 +498,160 @@ def write_expense_ledger_pdf(path: Path | str, filters: list[tuple[str, str]],
         pages.append(commands)
         return commands, y - header_height
 
-    commands, y = start_page()
-    for row_index, row in enumerate(rows):
-        wrapped = {
-            key: wrap_cell(row.get(key, ""), width)
-            for key, _heading, width, _align in columns
-        }
-        line_count = max(len(lines) for lines in wrapped.values())
-        row_height = max(26, line_count * leading + 8)
-        if y - row_height < footer_height + 12:
-            commands, y = start_page(continued=True)
-        row_bottom = y - row_height
-        if row_index % 2:
-            commands.append(
-                f"q 0.96 0.97 0.98 rg {margin} {row_bottom:.2f} {content_width} {row_height:.2f} re f Q"
-            )
-        x = margin
-        for key, _heading, width, align in columns:
-            commands.append(
-                f"q {x+1:.2f} {row_bottom+1:.2f} {width-2:.2f} {row_height-2:.2f} re W n"
-            )
-            baseline = y - 15
-            for line in wrapped[key]:
-                if align == "right":
-                    add_text(
-                        commands, x + 4, baseline, line, size=10, align="right",
-                        max_width=width - 8,
-                    )
-                else:
-                    add_text(commands, x + 4, baseline, line, size=10)
-                baseline -= leading
-            commands.append("Q")
-            commands.append(
-                f"0.78 0.81 0.85 RG 0.45 w {x:.2f} {row_bottom:.2f} {width:.2f} {row_height:.2f} re S"
-            )
-            x += width
-        y = row_bottom
+    if include_details:
+        commands, y = start_page()
+        for row_index, row in enumerate(rows):
+            wrapped = {
+                key: wrap_cell(row.get(key, ""), width)
+                for key, _heading, width, _align in columns
+            }
+            line_count = max(len(lines) for lines in wrapped.values())
+            row_height = max(26, line_count * leading + 8)
+            if y - row_height < footer_height + 12:
+                commands, y = start_page(continued=True)
+            row_bottom = y - row_height
+            if row_index % 2:
+                commands.append(
+                    f"q 0.96 0.97 0.98 rg {margin} {row_bottom:.2f} {content_width} {row_height:.2f} re f Q"
+                )
+            x = margin
+            for key, _heading, width, align in columns:
+                commands.append(
+                    f"q {x+1:.2f} {row_bottom+1:.2f} {width-2:.2f} {row_height-2:.2f} re W n"
+                )
+                baseline = y - 15
+                for line in wrapped[key]:
+                    if align == "right":
+                        add_text(
+                            commands, x + 4, baseline, line, size=10, align="right",
+                            max_width=width - 8,
+                        )
+                    else:
+                        add_text(commands, x + 4, baseline, line, size=10)
+                    baseline -= leading
+                commands.append("Q")
+                commands.append(
+                    f"0.78 0.81 0.85 RG 0.45 w {x:.2f} {row_bottom:.2f} {width:.2f} {row_height:.2f} re S"
+                )
+                x += width
+            y = row_bottom
 
-    if not rows:
-        add_text(commands, margin + 8, y - 24, "No expense rows matched the selected filters.", size=10)
+        if not rows:
+            add_text(commands, margin + 8, y - 24, "No expense rows matched the selected filters.", size=10)
 
-    def amount_cents(value):
-        try:
-            return int((Decimal(clean(value).replace(",", "")) * 100).quantize(
-                Decimal("1"), rounding=ROUND_HALF_UP
+        def amount_cents(value):
+            try:
+                return int((Decimal(clean(value).replace(",", "")) * 100).quantize(
+                    Decimal("1"), rounding=ROUND_HALF_UP
+                ))
+            except (InvalidOperation, ValueError):
+                return 0
+
+        active_rows = [row for row in rows if clean(row.get("status", "")).upper() != "VOID"]
+        status_groups = (
+            ("PAID SUBTOTAL", "PAID"),
+            ("UNPAID SUBTOTAL", "UNPAID"),
+            ("PARTIALLY PAID SUBTOTAL", "PARTIALLY PAID"),
+        )
+        totals_rows = []
+        for label, status in status_groups:
+            matching = [row for row in active_rows if (
+                clean(row.get("status", "")).upper().startswith("PARTIALLY PAID")
+                if status == "PARTIALLY PAID" else clean(row.get("status", "")).upper().startswith(status)
+            )]
+            totals_rows.append((
+                label,
+                sum(amount_cents(row.get("net") or row.get("total")) for row in matching),
+                sum(amount_cents(row.get("paid")) for row in matching),
+                sum(amount_cents(row.get("outstanding")) for row in matching),
             ))
-        except (InvalidOperation, ValueError):
-            return 0
-
-    active_rows = [row for row in rows if clean(row.get("status", "")).upper() != "VOID"]
-    status_groups = (
-        ("PAID SUBTOTAL", "PAID"),
-        ("UNPAID SUBTOTAL", "UNPAID"),
-        ("PARTIALLY PAID SUBTOTAL", "PARTIALLY PAID"),
-    )
-    totals_rows = []
-    for label, status in status_groups:
-        matching = [row for row in active_rows if (
-            clean(row.get("status", "")).upper().startswith("PARTIALLY PAID")
-            if status == "PARTIALLY PAID" else clean(row.get("status", "")).upper().startswith(status)
-        )]
         totals_rows.append((
-            label,
-            sum(amount_cents(row.get("net") or row.get("total")) for row in matching),
-            sum(amount_cents(row.get("paid")) for row in matching),
-            sum(amount_cents(row.get("outstanding")) for row in matching),
+            "OVERALL TOTAL",
+            sum(amount_cents(row.get("net") or row.get("total")) for row in active_rows),
+            sum(amount_cents(row.get("paid")) for row in active_rows),
+            sum(amount_cents(row.get("outstanding")) for row in active_rows),
         ))
-    totals_rows.append((
-        "OVERALL TOTAL",
-        sum(amount_cents(row.get("net") or row.get("total")) for row in active_rows),
-        sum(amount_cents(row.get("paid")) for row in active_rows),
-        sum(amount_cents(row.get("outstanding")) for row in active_rows),
-    ))
 
-    totals_height = 30 + 25 * (len(totals_rows) + 1) + 18
-    if y - totals_height < footer_height + 12:
-        commands = []
-        add_text(commands, margin, page_height - 42,
-                 "ConTracktor_v1 - Filtered Expense Ledger Totals", font="F2", size=16)
-        add_text(commands, margin, page_height - 61,
-                 f"Exported {datetime.now():%Y-%m-%d %H:%M}", size=10, color="0.35 0.39 0.45")
-        pages.append(commands)
-        y = page_height - 86
-    else:
-        y -= 18
+        totals_height = 30 + 25 * (len(totals_rows) + 1) + 18
+        if y - totals_height < footer_height + 12:
+            commands = []
+            add_text(commands, margin, page_height - 42,
+                     "ConTracktor_v1 - Filtered Expense Ledger Totals", font="F2", size=16)
+            add_text(commands, margin, page_height - 61,
+                     f"Exported {datetime.now():%Y-%m-%d %H:%M}", size=10, color="0.35 0.39 0.45")
+            pages.append(commands)
+            y = page_height - 86
+        else:
+            y -= 18
 
-    add_text(commands, margin, y, "TOTALS BY STATUS", font="F2", size=12)
-    y -= 12
-    total_columns = (
-        ("CATEGORY", 200, "left"),
-        ("EXPENSE TOTAL", 190, "right"),
-        ("PAYMENTS RECORDED", 190, "right"),
-        ("OUTSTANDING", 190, "right"),
-    )
-    header_height = 25
-    commands.append(
-        f"q 0.07 0.12 0.22 rg {margin} {y-header_height:.2f} {content_width} {header_height} re f Q"
-    )
-    x = margin
-    for heading, width, align in total_columns:
-        add_text(commands, x + 4, y - 16, heading, font="F2", size=10, color="1 1 1",
-                 align=align, max_width=width - 8)
-        commands.append(f"0.65 0.69 0.76 RG 0.5 w {x:.2f} {y-header_height:.2f} {width:.2f} {header_height:.2f} re S")
-        x += width
-    y -= header_height
-    for index, (label, expense_total, payments_total, outstanding_total) in enumerate(totals_rows):
-        row_height = 25
-        row_bottom = y - row_height
-        if label == "OVERALL TOTAL":
-            commands.append(
-                f"q 0.88 0.92 0.97 rg {margin} {row_bottom:.2f} {content_width} {row_height:.2f} re f Q"
-            )
-        elif index % 2:
-            commands.append(
-                f"q 0.96 0.97 0.98 rg {margin} {row_bottom:.2f} {content_width} {row_height:.2f} re f Q"
-            )
-        values = (label, money(expense_total), money(payments_total), money(outstanding_total))
+        add_text(commands, margin, y, "TOTALS BY STATUS", font="F2", size=12)
+        y -= 12
+        total_columns = (
+            ("CATEGORY", 200, "left"),
+            ("EXPENSE TOTAL", 190, "right"),
+            ("PAYMENTS RECORDED", 190, "right"),
+            ("OUTSTANDING", 190, "right"),
+        )
+        header_height = 25
+        commands.append(
+            f"q 0.07 0.12 0.22 rg {margin} {y-header_height:.2f} {content_width} {header_height} re f Q"
+        )
         x = margin
-        for (heading, width, align), value in zip(total_columns, values):
-            add_text(commands, x + 4, y - 16, value,
-                     font="F2" if label == "OVERALL TOTAL" else "F1", size=10,
+        for heading, width, align in total_columns:
+            add_text(commands, x + 4, y - 16, heading, font="F2", size=10, color="1 1 1",
                      align=align, max_width=width - 8)
-            commands.append(f"0.78 0.81 0.85 RG 0.45 w {x:.2f} {row_bottom:.2f} {width:.2f} {row_height:.2f} re S")
+            commands.append(f"0.65 0.69 0.76 RG 0.5 w {x:.2f} {y-header_height:.2f} {width:.2f} {header_height:.2f} re S")
             x += width
-        y = row_bottom
+        y -= header_height
+        for index, (label, expense_total, payments_total, outstanding_total) in enumerate(totals_rows):
+            row_height = 25
+            row_bottom = y - row_height
+            if label == "OVERALL TOTAL":
+                commands.append(
+                    f"q 0.88 0.92 0.97 rg {margin} {row_bottom:.2f} {content_width} {row_height:.2f} re f Q"
+                )
+            elif index % 2:
+                commands.append(
+                    f"q 0.96 0.97 0.98 rg {margin} {row_bottom:.2f} {content_width} {row_height:.2f} re f Q"
+                )
+            values = (label, money(expense_total), money(payments_total), money(outstanding_total))
+            x = margin
+            for (heading, width, align), value in zip(total_columns, values):
+                add_text(commands, x + 4, y - 16, value,
+                         font="F2" if label == "OVERALL TOTAL" else "F1", size=10,
+                         align=align, max_width=width - 8)
+                commands.append(f"0.78 0.81 0.85 RG 0.45 w {x:.2f} {row_bottom:.2f} {width:.2f} {row_height:.2f} re S")
+                x += width
+            y = row_bottom
+
+    if client_summary and client_summary.get('signatures'):
+        signers=client_summary['signatures']
+        signature_rows=(len(signers)+2)//3
+        available_y=y if include_details else summary_y
+        if available_y<90+signature_rows*52:
+            commands=[];pages.append(commands)
+            add_text(commands,margin,page_height-42,client_summary['title'],font='F2',size=16)
+            add_text(commands,margin,page_height-66,'CONTRACTOR SIGNATURES',font='F2',size=12)
+        else:
+            commands=pages[-1]
+        for index,name in enumerate(signers):
+            row,col=divmod(index,3)
+            center=margin+(col+.5)*content_width/3
+            baseline=62+(signature_rows-1-row)*52
+            commands.append(f'0.35 0.39 0.45 RG 0.7 w {center-90:.2f} {baseline:.2f} m {center+90:.2f} {baseline:.2f} l S')
+            lines=wrap_cell(name,content_width/3,bold=True)
+            for offset,line in enumerate(lines):
+                add_text(commands,center-text_width(line,bold=True)/2,baseline-17-offset*12,line,font='F2')
 
     page_count = len(pages)
     for page_number, page_commands in enumerate(pages, 1):
         page_commands.append(
             f"0.65 0.69 0.76 RG 0.5 w {margin} 30 m {page_width-margin} 30 l S"
         )
-        footer = f"ConTracktor_v1 | Page {page_number} of {page_count}"
+        footer = 'ContrackTor v1 | Expenses Summary'
         footer_x = (page_width - text_width(footer, 10)) / 2
         add_text(page_commands, footer_x, 16, footer, size=10, color="0.35 0.39 0.45")
+        add_text(page_commands,page_width-margin-90,16,f'Page {page_number} of {page_count}',align='right',max_width=90,color='0.35 0.39 0.45')
 
     font_regular_id = 3 + len(pages) * 2
     font_bold_id = font_regular_id + 1
@@ -13537,6 +13760,25 @@ class ExpensesTab(BaseTab):
     def export_pdf(self):
         rows, project_ids = self.filtered_rows()
         if not rows: messagebox.showinfo(APP_TITLE, "There are no filtered rows to export."); return
+        try:
+            context=build_expense_client_summary(self.db,rows,project_ids,
+                self.date_from_filter.get(),self.date_to_filter.get())
+        except (ValueError,sqlite3.Error) as exc:
+            messagebox.showerror(APP_TITLE,str(exc),parent=self);return
+        options=dialog(self,'Expense PDF Report',[
+            ('layout','Report contents',['Summary + Detailed Ledger','Summary Only','Detailed Ledger Only']),
+            ('title','Report / project title'),('address','Project address'),
+            ('period_label','Period label (for example: 1st week)'),
+            ('signatures','Contractors for signatures (comma-separated; optional)'),
+        ],dict(layout='Summary + Detailed Ledger',title=context['title'],address=context['address'],
+            period_label=context['period_label'],signatures=', '.join(context['signatures'])),
+            required_keys=('layout','title'))
+        if not options:return
+        try:
+            context=build_expense_client_summary(self.db,rows,project_ids,
+                self.date_from_filter.get(),self.date_to_filter.get(),options)
+        except (ValueError,sqlite3.Error) as exc:
+            messagebox.showerror(APP_TITLE,str(exc),parent=self);return
         destination = filedialog.asksaveasfilename(title="Export Filtered Expense Ledger",
             initialfile=f"expenses_{date.today():%Y%m%d}.pdf", defaultextension=".pdf",
             filetypes=[("PDF document", "*.pdf")])
@@ -13604,7 +13846,9 @@ class ExpensesTab(BaseTab):
             "authorized": row["authorized_by"] or "Legacy / not recorded",
         } for row in rows]
         write_expense_ledger_pdf(
-            destination, applied_filters, financial_summary, report_rows
+            destination, applied_filters, financial_summary, report_rows,
+            client_summary=context if options['layout']!='Detailed Ledger Only' else None,
+            include_details=options['layout']!='Summary Only',
         )
         messagebox.showinfo(APP_TITLE, f"Filtered expense PDF saved:\n{destination}")
 
