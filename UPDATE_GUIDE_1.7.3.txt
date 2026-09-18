@@ -1,0 +1,24 @@
+ConTracktor 1.7.3 - company-wide batch workflow updater
+
+1. Make a fresh database backup from the client's existing app.
+2. Close ConTracktor and all kiosk windows.
+3. Download ConTracktor_v1_Update_1.7.3.exe from the v1.7.3 GitHub release.
+4. Run under the SAME Windows user as the existing app. Do not uninstall or replace the database.
+5. The installer backs up app/data files and updates application files only. Open the app manually after installation.
+6. In Payroll > Attendance Actions > Batch attendance, select MONCON employees and choose the work project per segment. For split days, use Add segment for selected workers; for example 08:00-12:00 at Oasis and 13:00-17:00 at Grace.
+7. Close daily attendance for each work project to bring completed shifts into Weekly Payroll.
+8. In Batch Cash Advance, choose employees from the company roster, then select the Funding project INSIDE the batch window and a PC/DP allocation or bank. The top project selector is not required.
+9. Funding project determines expense/budget accounting only. Scheduled salary deductions split automatically by employee earnings across work projects after attendance is closed.
+10. Save Draft retains the funding project and staged entries. Open Draft lists cash-advance drafts across all projects.
+
+Default app: %LOCALAPPDATA%\Programs\ConTracktor_v1
+Default data: %LOCALAPPDATA%\ConTracktor_v1\Data\contractor_tracker.db
+Data backups: %LOCALAPPDATA%\ConTracktor_v1\Data\Backups
+App backups: %LOCALAPPDATA%\ConTracktor_v1\AppBackups
+
+No database or sample records are included. Existing attendance, financial history and employee IDs are retained. No retroactive repair of WD references or monetary records is performed by this patch.
+
+Security status: prerelease candidate, NOT confirmed Microsoft clearance. Do not disable Defender, add exclusions, restore quarantined files or remove download protection. Stop if the updater is detected and obtain Microsoft review: https://www.microsoft.com/en-us/wdsi/filesubmission
+The installer/launcher are not signed with a trusted ConTracktor publisher identity. Local clean scans do not guarantee download acceptance on every PC.
+
+Confirm custom installation/data paths before using the default updater.

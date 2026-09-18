@@ -1397,6 +1397,7 @@ class ContractorTrackerTests(unittest.TestCase):
                     self.result = {
                         "date": "2026-08-12", "method": "Bank Transfer",
                         "bank": bank_name, "allocation": "",
+                        "funding_project_id": project_id,
                         "entries": [
                             {"employee_id": employees[0]["id"], "employee": employees[0]["name"],
                              "amount_cents": 50000, "reason": "Wednesday advance",
@@ -1410,7 +1411,7 @@ class ContractorTrackerTests(unittest.TestCase):
             class FakeApp:
                 def __init__(self, selected_project_id):
                     self.project_id = selected_project_id
-                def authorize(self, *_args): return head
+                def authorize_for_project(self, *_args): return head
                 def refresh_all(self): pass
 
             class FakeLists:

@@ -1,43 +1,20 @@
-# Company-wide employee and payroll views
+# MONCON company-wide batch workflow
 
-The main app.py now opens Payroll with an independent, company-wide ledger view.
-The project chosen in the app header remains the context for new employees,
-deployment, kiosk attendance, cash-advance grants and daily attendance closure.
-The Payroll view dropdown is a viewing filter, not a project-transfer action.
+Employees belong to MONCON, not exclusively to a work project. The payroll ledger defaults to all employees/all projects.
 
-## Employee references
+## Batch attendance
+Open Batch attendance without selecting a top-level project. All active employees are listed. Select the actual work project for each time segment. Prior deployment is not required for manual batch attendance.
+For a split day, enter 08:00–12:00 at Oasis and add a segment 13:00–17:00 at Grace. Times must not overlap across any work sites. Lunch 12:00–13:00 is unpaid. The eight-hour regular limit is shared across the whole employee day.
+A valid work-project rate takes precedence; otherwise the employee's standard rate is used. Close each work site's daily attendance to include its shifts in staged weekly payroll.
 
-- Existing profiles receive unique MONCON-NNN references on first database startup.
-- The database is backed up before references are renamed.
-- Former references are retained in employee_reference_history and displayed in profiles.
-- Roster searches also match former references.
-- Kiosk lookup accepts an unambiguous former reference for a currently deployed employee.
-- Employee IDs, PINs, assignments, attendance, financial amounts and historical payroll snapshots are preserved.
-- New references use a company-wide sequence, including archived profiles.
-- Employees remain one profile deployed to multiple sites; names are not automatically merged.
+## Batch cash advances
+No top-level project is required. Every active MONCON employee can receive an advance regardless of home or deployment project.
+Choose Funding project in the batch window to identify the budget/expense ledger funding the advance, and choose its actual payment allocation or bank. That field does not affect which employees are available.
+Save Draft stores funding and staged entries without moving money. Open Draft lists company-wide advance drafts, including older project-specific drafts. Cancelling authorization preserves the staged payload.
 
-## Unified ledgers
+## Weekly deductions
+Salary Deduction advances are recovered once per employee, capped by eligible available weekly pay and configured weekly deduction caps. The employee-wide deduction is allocated proportionally to gross wages earned at each work project, with exact-cent rounding. A worker with no closed attendance cannot yet have a payroll deduction applied; their outstanding advance remains visible.
+Weekly payroll expenses remain separate for each work project and can be paid using multiple recorded sources. Cash Repayment/Bank Repayment/Manual methods are not automatically treated as scheduled salary deductions.
 
-- All active employees are shown by default, without the prior first-20 limit in the roster or weekly summary.
-- Weekly Payroll combines staged project wage and deduction shares into one row per employee.
-- Archived employees with unpaid staged attendance remain included in the weekly summary.
-- Daily attendance and committed payroll ledgers identify the work project.
-- Cash Advances identifies the issuing project; CA Outstanding is shown separately from this week's deduction.
-- Double-clicking a weekly employee row shows daily logs across the projects in the current view.
-- CA PDF export respects the Payroll view filter and the chosen repayment-method filters.
-- Payroll commitment still reviews and posts separate expenses per work project, retaining existing authorization.
-
-## Suggested daily workflow
-
-1. Search the company roster and deploy the existing profile to each work site.
-2. Record actual attendance segments under their work projects; do not duplicate profiles.
-3. Close completed daily attendance per site.
-4. Review the company weekly summary, then drill into employee daily logs if needed.
-5. Review each site's amounts before committing payroll to expenses.
-
-This update does not invent attendance or change the amount of advances already paid.
-Insufficient salary continues to carry unpaid CA balances forward.
-The client's supplied backup was used only through temporary copies for testing.
-
-Source backup: Updates/pre_moncon_payroll_20260918_142900.
-Client distribution uses the record-preserving v1.7.1 EXE updater and its release-specific deployment instructions.
+## Update safeguards
+Existing financial and attendance history is retained. This patch does not repair client withdrawal matches or change historical amounts. Back up first, close the app, and install under the same Windows user. Stop on any Defender detection; security review is separate from application correctness.

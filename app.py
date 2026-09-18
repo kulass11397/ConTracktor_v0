@@ -6239,9 +6239,9 @@ class Database:
         for employee_id,pid,started,ended in segments:
             if ended<=started or ended.date()!=started.date():
                 raise ValueError('Each attendance segment must finish later on the same date.')
-            deployed={e['id']:e for e in self.employees_deployed_to(pid,on_date=started.date().isoformat())}
-            if employee_id not in deployed or not self.project_is_active(pid):
-                raise ValueError('The employee must be deployed to the selected active project on the work date.')
+            employee=self.one('SELECT * FROM employees WHERE id=? AND active=1',(employee_id,))
+            if not employee or not self.project_is_active(pid):
+                raise ValueError('Select an active MONCON employee and an active work project.')
             week_start,_=payroll_week_bounds(started.date())
             if self.one('SELECT 1 FROM payroll_week_plans WHERE employee_id=? AND period_start=?',(employee_id,week_start)):
                 raise ValueError('This employee\'s weekly payroll is locked. Reopen all affected project payrolls before adding attendance.')
@@ -6251,8 +6251,8 @@ class Database:
                 (employee_id,ended.isoformat(timespec='seconds'),started.isoformat(timespec='seconds')))
             overlap=existing or any(eid==employee_id and max(started,s)<min(ended,e) for eid,_pid,s,e,_rate in checked)
             if overlap:
-                raise ValueError(f"Overlapping attendance for {deployed[employee_id]['name']}; one worker cannot be paid in two projects at the same time.")
-            checked.append((employee_id,pid,started,ended,deployed[employee_id]['deployment_daily_rate_cents'] or employee_daily_rate(deployed[employee_id])))
+                raise ValueError(f"Overlapping attendance for {employee['name']}; one worker cannot be paid in two projects at the same time.")
+            checked.append((employee_id,pid,started,ended,self.employee_daily_rate_at(employee_id,started.date().isoformat(),pid)))
         if not checked:
             raise ValueError('Select at least one employee.')
         with self.conn:
@@ -14551,6 +14551,10 @@ class CashAdvanceBatchDialog(tk.Toplevel):
         self.editing_employee_id = None
         self.employees = {str(row["id"]): row for row in employees}
         self.banks, self.allocations = banks, allocations
+        self.funding_projects = {
+            f"{row['name']} [#{row['id']}]": row['id']
+            for row in db.all("SELECT id,name FROM projects WHERE status<>'Completed' ORDER BY name")
+        }
         self.staged = {}
         body = ttk.Frame(self, padding=18); body.pack(fill="both", expand=True)
         body.columnconfigure(0, weight=1); body.rowconfigure(3, weight=1); body.rowconfigure(4, weight=2)
@@ -14559,7 +14563,7 @@ class CashAdvanceBatchDialog(tk.Toplevel):
             row=0, column=0, sticky="w")
         self.instructions_widget = ttk.Label(
             body,
-            text="Use one effective date and one funding source. Stage each employee amount, then authorize the complete batch once.",
+            text="All active MONCON employees are available. Choose the funding project and cash source; deductions follow each employee's earnings across work sites.",
             style="Muted.TLabel",
         )
         self.instructions_widget.grid(row=1, column=0, sticky="w", pady=(2, 10))
@@ -14575,6 +14579,7 @@ class CashAdvanceBatchDialog(tk.Toplevel):
             "amount": tk.StringVar(), "reason": tk.StringVar(),
             "repayment_plan": tk.StringVar(value="Salary Deduction"),
             "weekly_cap": tk.StringVar(), "search": tk.StringVar(),
+            "funding_project": tk.StringVar(value=next((label for label,pid in self.funding_projects.items() if pid==project_id),'')),
         }
         self.widgets = {}
         ttk.Label(shared, text="Effective advance date *").grid(row=0, column=0, sticky="w")
@@ -14601,6 +14606,10 @@ class CashAdvanceBatchDialog(tk.Toplevel):
             shared, textvariable=self.vars["bank"], values=list(banks), state="readonly")
         self.bank_widget.grid(row=1, column=3, sticky="ew")
         self.widgets["bank"] = self.bank_widget
+        ttk.Label(shared, text="Funding project * (expense accounting only)").grid(row=2,column=0,columnspan=2,sticky="w",pady=(6,0))
+        self.widgets['funding_project'] = ttk.Combobox(
+            shared,textvariable=self.vars['funding_project'],values=list(self.funding_projects),state='readonly')
+        self.widgets['funding_project'].grid(row=3,column=0,columnspan=2,sticky='ew',padx=(0,8))
 
         self.entry_area = ttk.Panedwindow(body, orient="horizontal")
         self.entry_area.grid(row=3, column=0, sticky="nsew", pady=(10, 8))
@@ -14739,6 +14748,8 @@ class CashAdvanceBatchDialog(tk.Toplevel):
 
     def snapshot(self):
         return {
+            "funding_project": self.vars['funding_project'].get(),
+            "funding_project_id": self.funding_projects.get(self.vars['funding_project'].get()),
             "date": self.vars["date"].get(), "method": self.vars["method"].get(),
             "allocation": self.vars["allocation"].get(), "bank": self.vars["bank"].get(),
             "entries": list(self.staged.values()), "draft_id": self.draft_id,
@@ -14748,7 +14759,7 @@ class CashAdvanceBatchDialog(tk.Toplevel):
     def restore_snapshot(self, payload):
         if not isinstance(payload, dict):
             return
-        for key in ("date", "method", "allocation", "bank"):
+        for key in ("date", "method", "allocation", "bank", "funding_project"):
             if key in payload:
                 self.vars[key].set(str(payload.get(key) or ""))
         self.staged = {}
@@ -14773,11 +14784,11 @@ class CashAdvanceBatchDialog(tk.Toplevel):
             return
         try:
             saved = self.db.save_workflow_draft(
-                self.project_id, "cash_advance_batch", self.snapshot(), self.draft_id,
+                self.funding_projects.get(self.vars['funding_project'].get()), "cash_advance_batch", self.snapshot(), self.draft_id,
             )
             self.draft_id = saved["id"]; self.draft_reference = saved["reference"]
             saved = self.db.save_workflow_draft(
-                self.project_id, "cash_advance_batch", self.snapshot(), self.draft_id,
+                self.funding_projects.get(self.vars['funding_project'].get()), "cash_advance_batch", self.snapshot(), self.draft_id,
             )
             messagebox.showinfo(
                 APP_TITLE, f"Cash-advance draft {saved['reference']} saved.\n\n"
@@ -14787,7 +14798,7 @@ class CashAdvanceBatchDialog(tk.Toplevel):
             messagebox.showerror(APP_TITLE, str(exc), parent=self)
 
     def open_draft(self):
-        drafts = self.db.workflow_drafts("cash_advance_batch", self.project_id)
+        drafts = self.db.workflow_drafts("cash_advance_batch", None)
         if not drafts:
             messagebox.showinfo(APP_TITLE, "There are no saved cash-advance batch drafts.", parent=self)
             return
@@ -14803,6 +14814,8 @@ class CashAdvanceBatchDialog(tk.Toplevel):
             row, payload = self.db.load_workflow_draft(picker.result, "cash_advance_batch")
             payload["draft_id"] = row["id"]
             payload["draft_reference"] = row["reference"]
+            if not payload.get('funding_project'):
+                payload['funding_project'] = next((label for label,pid in self.funding_projects.items() if pid==row['project_id']),'')
             self.restore_snapshot(payload)
         except (ValueError, sqlite3.Error) as exc:
             messagebox.showerror(APP_TITLE, str(exc), parent=self)
@@ -14887,12 +14900,15 @@ class CashAdvanceBatchDialog(tk.Toplevel):
     def save(self):
         if not self.staged:
             messagebox.showerror(APP_TITLE, "Stage at least one employee advance.", parent=self); return
-        required = ["date", "method"]
+        required = ["date", "method", "funding_project"]
         required.append("bank" if self.vars["method"].get() == "Bank Transfer" else "allocation")
         if flash_missing_fields(self, self.vars, self.widgets, required):
             return
         try:
             valid_date(self.vars["date"].get(), True)
+            if self.vars['funding_project'].get() not in self.funding_projects:
+                flash_required_widgets(self,[self.widgets['funding_project']])
+                raise ValueError('Select an active funding project for the advance expenses.')
         except ValueError as exc:
             flash_required_widgets(self, [self.widgets["date"]])
             messagebox.showerror(APP_TITLE, str(exc), parent=self); return
@@ -15333,7 +15349,7 @@ class PayrollTab(BaseTab):
         self.ledger_combo=ttk.Combobox(view_bar,textvariable=self.ledger_view,state='readonly',width=32)
         self.ledger_combo.pack(side='left',padx=6)
         self.ledger_combo.bind('<<ComboboxSelected>>',lambda _event:self.refresh())
-        ttk.Label(view_bar,text='Viewing all sites does not change the project selected for new entries.',
+        ttk.Label(view_bar,text='MONCON roster: choose work sites in batch attendance and funding in batch advances.',
             style='Muted.TLabel').pack(side='left',padx=8)
         actions=ttk.Frame(self); actions.pack(fill="x",pady=(8,4))
         ttk.Button(actions,text="+ Add Employee",command=self.add_employee).pack(side="left")
@@ -15819,12 +15835,13 @@ class PayrollTab(BaseTab):
         self.pin.set(""); self.app.refresh_all(); return True
 
     def batch_attendance(self):
-        if not self.require_project():return
         employees=self.db.all('SELECT * FROM employees WHERE active=1 ORDER BY name COLLATE NOCASE')
         if not employees: messagebox.showinfo(APP_TITLE,"Add employees first."); return
         projects={f"{p['name']} [#{p['id']}]":p['id'] for p in self.db.all("SELECT id,name FROM projects WHERE status<>'Completed' ORDER BY name")}
+        if not projects:
+            messagebox.showinfo(APP_TITLE,"Create an active work project first.");return
         def commit_segments(entries):
-            head=self.app.authorize('Record batch attendance',f'{len(entries)} attendance segments across {len({r[1] for r in entries})} project(s).')
+            head=self.app.authorize_for_project(entries[0][1],'Record batch attendance',f'{len(entries)} attendance segments across {len({r[1] for r in entries})} project(s).')
             if not head:return False
             try:
                 self.db.record_batch_project_attendance([(e['id'],pid,start,end) for e,pid,start,end in entries],head['id'])
@@ -16014,10 +16031,11 @@ class PayrollTab(BaseTab):
         except (ValueError,sqlite3.Error) as exc:messagebox.showerror(APP_TITLE,str(exc))
 
     def grant_cash_advance_batch(self, initial=None):
-        if not self.require_project(): return
-        employees = self.db.employees_deployed_to(self.project_id)
+        employees = self.db.all('SELECT * FROM employees WHERE active=1 ORDER BY name COLLATE NOCASE')
         if not employees:
             messagebox.showinfo(APP_TITLE, "Add employees first."); return
+        if not self.db.one("SELECT 1 FROM projects WHERE status<>'Completed'"):
+            messagebox.showinfo(APP_TITLE, "Create an active funding project first."); return
         banks = {
             f"{row['bank_name']} - {row['account_name']} (..{row['account_number'][-4:]})": row["id"]
             for row in self.db.all(
@@ -16043,6 +16061,9 @@ class PayrollTab(BaseTab):
         if not win.result: return
         data = win.result
         try:
+            funding_project_id = data.get('funding_project_id')
+            if not self.db.project_is_active(funding_project_id):
+                raise ValueError('Select an active funding project inside the batch window.')
             advance_date = valid_date(data["date"], True)
             total = sum(row["amount_cents"] for row in data["entries"])
             is_bank = data["method"] == "Bank Transfer"
@@ -16050,9 +16071,9 @@ class PayrollTab(BaseTab):
             allocation = allocations.get(data["allocation"]) if not is_bank else None
             allocation_id = allocation["id"] if allocation else None
             if is_bank:
-                self.db.validate_payment_source(self.project_id, total, "Bank Transfer", bank_id)
+                self.db.validate_payment_source(funding_project_id, total, "Bank Transfer", bank_id)
             else:
-                self.db.validate_cash_allocation_payment(self.project_id, allocation_id, total)
+                self.db.validate_cash_allocation_payment(funding_project_id, allocation_id, total)
                 if allocation["allocation_type"] == "Direct Procurement" and not messagebox.askyesno(
                     APP_TITLE,
                     f"Use Direct Procurement {allocation['reference']} for this employee-advance batch?\n\n"
@@ -16061,22 +16082,23 @@ class PayrollTab(BaseTab):
                 ):
                     self.after(0, lambda payload=data: self.grant_cash_advance_batch(payload))
                     return
-            _deposited, _committed, remaining = self.db.project_commitment_budget(self.project_id)
+            _deposited, _committed, remaining = self.db.project_commitment_budget(funding_project_id)
             if total > remaining:
                 raise ValueError(
                     f"Batch exceeds the project's uncommitted budget of {money(remaining)}.")
             source_name = data["bank"] if is_bank else allocation["reference"]
+            funding_name = self.db.one('SELECT name FROM projects WHERE id=?',(funding_project_id,))['name']
             employee_preview = ", ".join(row["employee"] for row in data["entries"][:5])
             if len(data["entries"]) > 5: employee_preview += f" and {len(data['entries']) - 5} more"
             if is_bank:
-                head = self.app.authorize(
+                head = self.app.authorize_for_project(funding_project_id,
                     "Grant batch employee cash advances",
-                    f"{len(data['entries'])} employees; {money(total)} via {source_name}; "
+                    f"{len(data['entries'])} employees; {money(total)} via {source_name}; funding {funding_name}; "
                     f"effective {advance_date}. {employee_preview}")
             else:
                 head = self.app.authorize_registered_head(
                     "Release batch employee cash advances",
-                    f"{len(data['entries'])} employees; {money(total)} from {source_name}; "
+                    f"{len(data['entries'])} employees; {money(total)} from {source_name}; funding {funding_name}; "
                     f"effective {advance_date}. {employee_preview}",
                     allocation["receiver_registry_id"] or None)
             if not head:
@@ -16093,12 +16115,14 @@ class PayrollTab(BaseTab):
                        project_id,batch_ref,advance_date,funding_method,bank_account_id,
                        cash_allocation_id,total_cents,entry_count,authorized_by_head_id,
                        recorded_at_local,notes) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                    (self.project_id, batch_ref, advance_date, data["method"], bank_id,
+                    (funding_project_id, batch_ref, advance_date, data["method"], bank_id,
                      allocation_id, total, len(data["entries"]), authorizing_head_id,
                      recorded_at, f"Employees: {employee_preview}"),
                 ).lastrowid
                 for item in data["entries"]:
                     employee = self.db.one("SELECT * FROM employees WHERE id=?", (item["employee_id"],))
+                    if not employee or not employee['active']:
+                        raise ValueError('A staged employee is no longer active. Remove them or reactivate their profile.')
                     reference = self.db._next_system_reference(
                         "CA", "cash_advances", "system_reference", advance_date)
                     expense_id = self.db.conn.execute(
@@ -16106,7 +16130,7 @@ class PayrollTab(BaseTab):
                            unit_price_cents,total_cents,area,trade,expense_date,due_date,
                            invoice_no,notes,authorized_by_head_id,status,default_cash_allocation_id)
                            VALUES(?,?,?,?, '1','advance',?,?,?,?,?,?,?,?,?,'Paid',?)""",
-                        (self.project_id, f"CASH ADVANCE - {employee['name']}",
+                        (funding_project_id, f"CASH ADVANCE - {employee['name']}",
                          f"CASH ADVANCE - {employee['name']}", employee["name"],
                          item["amount_cents"], item["amount_cents"], "PAYROLL",
                          "Recoverable Employee Advance", advance_date, advance_date,
@@ -16128,7 +16152,7 @@ class PayrollTab(BaseTab):
                            authorized_by_head_id,cash_allocation_id,repayment_plan,
                            weekly_deduction_cap_cents,batch_id,system_reference,recorded_at_local)
                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (self.project_id, employee["id"], expense_id, item["amount_cents"],
+                        (funding_project_id, employee["id"], expense_id, item["amount_cents"],
                          advance_date, item["reason"], data["method"], bank_id,
                          authorizing_head_id, allocation_id, item["repayment_plan"],
                          item["weekly_cap_cents"], batch_id, reference, recorded_at),
@@ -16162,7 +16186,7 @@ class PayrollTab(BaseTab):
                 self.db.conn.execute(
                     """INSERT INTO audit_log(project_id,action,details,created_at)
                        VALUES(?,'CASH_ADVANCE_BATCH_GRANTED',?,?)""",
-                    (self.project_id,
+                    (funding_project_id,
                      f"{batch_ref}: {len(data['entries'])} advances totaling {money(total)} "
                      f"from {source_name}; authorized by {head['name']}", recorded_at),
                 )
