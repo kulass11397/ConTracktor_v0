@@ -1,0 +1,18 @@
+ConTracktor 1.7.5 - clean-interface weekly attendance patch
+
+1. Back up the client database and close ConTracktor and all kiosk windows.
+2. Download ConTracktor_v1_Update_1.7.5.exe from the v1.7.5 GitHub release.
+3. Run the updater under the SAME Windows user as the existing installation. Do not uninstall the app or replace its database. The installer makes timestamped application and data backups.
+4. Reopen ConTracktor, go to Payroll > Attendance Actions > Batch attendance (weekly grid).
+5. Choose the Saturday-Friday week. Use one tab per work project; All Projects is a combined review. Click a blank cell for the default 08:00-17:00 shift, click a marked cell to edit times, or double-click to mark absent. Two projects on one day are supported with non-overlapping shifts.
+6. Use Save Weekly Draft when work is incomplete. Review and Finalize Week records approved shifts and closes affected project days for Weekly Payroll. The old single-day Batch Attendance form is no longer in the menu.
+7. Recorded attendance remains correctable via Edit attendance / pay and the existing payroll-reopen workflow.
+
+Default app: %LOCALAPPDATA%\Programs\ConTracktor_v1
+Default data: %LOCALAPPDATA%\ConTracktor_v1\Data\contractor_tracker.db
+Data backups: %LOCALAPPDATA%\ConTracktor_v1\Data\Backups
+App backups: %LOCALAPPDATA%\ConTracktor_v1\AppBackups
+
+The installer includes no database or sample records. Financial history, attendance, advances and employee identities are retained. No retroactive accounting repair is performed.
+
+Security: the updater is unsigned. Do not disable Defender or add exclusions if it is flagged. Report the file to Microsoft: https://www.microsoft.com/en-us/wdsi/filesubmission

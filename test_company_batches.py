@@ -70,18 +70,12 @@ class CompanyBatchTests(unittest.TestCase):
                 authorize_registered_head=Mock(return_value={'id':self.heads[0],'name':'Manager'}),refresh_all=Mock()),
             wait_window=Mock(),after=Mock(),lists=SimpleNamespace(select=Mock()))
 
-    def test_attendance_opens_and_saves_with_all_projects_header(self):
+    def test_batch_attendance_routes_to_weekly_grid_without_project_header(self):
         page=self.page()
-        employee=self.db.one('SELECT * FROM employees WHERE id=?',(self.employee,))
-        def opened(parent,employees,projects,default_project_id,on_submit):
-            self.assertIsNone(default_project_id)
-            self.assertEqual(len(employees),1)
-            self.assertTrue(on_submit([(employee,self.grace,datetime(2026,9,14,13),datetime(2026,9,14,17))]))
-            return Mock()
-        with patch.object(app,'BatchAttendanceDialog',side_effect=opened):
-            app.PayrollTab.batch_attendance(page)
-        self.assertEqual(self.db.one('SELECT project_id FROM attendance')['project_id'],self.grace)
-        self.assertEqual(page.app.authorize_for_project.call_args.args[0],self.grace)
+        page.open_weekly_attendance_grid=Mock(return_value='opened')
+        self.assertEqual(app.PayrollTab.batch_attendance(page),'opened')
+        page.open_weekly_attendance_grid.assert_called_once_with()
+        page.require_project.assert_not_called()
 
     def test_company_advance_grant_uses_explicit_funding_not_employee_home(self):
         page=self.page()

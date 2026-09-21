@@ -449,7 +449,7 @@ class CleanContractorApp(core.ContractorApp):
             ("Archive employee", page.archive_employee),
         ], disabled=True)
         self._action_menu(actions, "Attendance Actions", [
-            ("Batch attendance", page.batch_attendance),
+            ("Batch attendance (weekly grid)", page.batch_attendance),
             ("Close daily attendance", page.close_daily_attendance),
             ("Edit attendance / pay", page.edit_selected_attendance),
         ])

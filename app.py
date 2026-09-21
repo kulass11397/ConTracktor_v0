@@ -16046,7 +16046,6 @@ class PayrollTab(BaseTab):
         ttk.Button(actions,text="Add Existing to Project",command=self.deploy_existing_employee).pack(side="left")
         ttk.Button(actions,text="Archive Employee",command=self.archive_employee).pack(side="left",padx=5)
         ttk.Button(actions,text="Weekly Attendance Grid",style="Primary.TButton",command=self.open_weekly_attendance_grid).pack(side="left")
-        ttk.Button(actions,text="Batch Attendance",command=self.batch_attendance).pack(side="left",padx=5)
         ttk.Button(actions,text="Close Daily Attendance",command=self.close_daily_attendance).pack(side="left",padx=5)
         ttk.Button(actions,text="Edit Attendance / Pay",
                    command=self.edit_selected_attendance).pack(side="left")
@@ -16530,21 +16529,8 @@ class PayrollTab(BaseTab):
         self.refresh_weekly()
 
     def batch_attendance(self):
-        employees=self.db.all('SELECT * FROM employees WHERE active=1 ORDER BY name COLLATE NOCASE')
-        if not employees: messagebox.showinfo(APP_TITLE,"Add employees first."); return
-        projects={f"{p['name']} [#{p['id']}]":p['id'] for p in self.db.all("SELECT id,name FROM projects WHERE status<>'Completed' ORDER BY name")}
-        if not projects:
-            messagebox.showinfo(APP_TITLE,"Create an active work project first.");return
-        def commit_segments(entries):
-            head=self.app.authorize_for_project(entries[0][1],'Record batch attendance',f'{len(entries)} attendance segments across {len({r[1] for r in entries})} project(s).')
-            if not head:return False
-            try:
-                self.db.record_batch_project_attendance([(e['id'],pid,start,end) for e,pid,start,end in entries],head['id'])
-                self.app.refresh_all();return True
-            except (ValueError,sqlite3.Error) as exc:
-                messagebox.showerror(APP_TITLE,str(exc));return False
-        win=BatchAttendanceDialog(self,employees,projects,self.project_id,on_submit=commit_segments)
-        self.wait_window(win)
+        """Keep old action/shortcut callers on the current weekly grid."""
+        return self.open_weekly_attendance_grid()
 
     def close_daily_attendance(self):
         if not self.require_project(): return
