@@ -1,0 +1,20 @@
+ConTracktor 1.7.4 - weekly attendance and reporting update
+
+1. Make a fresh database backup from the client's existing app.
+2. Close ConTracktor and all kiosk windows.
+3. Download ConTracktor_v1_Update_1.7.4.exe from the v1.7.4 GitHub release.
+4. Run it under the SAME Windows user as the existing app. Do not uninstall or replace the database. Confirm a custom installation/data path before using the default updater.
+5. The installer backs up existing app and data files and updates application files only. Open the app after installation and verify the existing records.
+6. In Payroll, open Weekly Attendance Grid. Choose the Saturday-Friday week. Each project has its own tab and All Projects provides a combined review.
+7. Click an empty cell for the default 08:00-17:00 present shift, click a marked cell or right-click to edit hours, and double-click to mark absent. For split sites, enter non-overlapping times in the relevant project tabs.
+8. Use Save Weekly Draft to pause. Review and Finalize Week requests project-head approval and posts the shifts to the existing Weekly Payroll workflow. Drafts do not affect payroll. Older batch/daily tools remain available for corrections and kiosk use.
+9. In Expenses, choose Export PDF. Select project scope, from/to dates and report contents. The billing option creates construction and management-fee pages (default 15%); check title, client and issuer before sharing. This report does not post a new expense or receivable.
+
+Default app: %LOCALAPPDATA%\Programs\ConTracktor_v1
+Default data: %LOCALAPPDATA%\ConTracktor_v1\Data\contractor_tracker.db
+Data backups: %LOCALAPPDATA%\ConTracktor_v1\Data\Backups
+App backups: %LOCALAPPDATA%\ConTracktor_v1\AppBackups
+
+No database or sample records are included. Existing financial, attendance and employee records are retained. No retroactive financial repair is performed.
+
+Security status: unsigned prerelease, NOT guaranteed Microsoft clearance. Do not disable Defender, add exclusions, restore quarantined files or remove download protection. Stop if detected and submit the updater for Microsoft review: https://www.microsoft.com/en-us/wdsi/filesubmission

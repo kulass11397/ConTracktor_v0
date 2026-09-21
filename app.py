@@ -205,9 +205,15 @@ def build_expense_client_summary(db, rows, project_ids, date_from='', date_to=''
     materials=sum(construction(r) for r in costs if not is_labor(r) and not is_fee(r))
     labor=sum(construction(r) for r in costs if is_labor(r))
     fees=sum(construction(r) for r in costs if is_fee(r) and not is_labor(r))
-    phases={};categories={};areas={};sites={};sources={}
+    phases={};categories={};areas={};sites={};sources={};weekly={}
     for row in costs:
         amount=construction(row)
+        if row.get('expense_date'):
+            day=date.fromisoformat(row['expense_date'])
+            week_start=day-timedelta(days=(day.weekday()+2)%7)
+            key=f"{week_start:%Y-%m-%d} to {week_start+timedelta(days=6):%Y-%m-%d}"
+            group=weekly.setdefault(key,{'Materials / other':0,'Labor':0,'Bank fees':0})
+            group['Labor' if is_labor(row) else 'Bank fees' if is_fee(row) else 'Materials / other']+=amount
         for result,key in ((phases,row.get('phase') or 'Unassigned phase'),
                            (categories,row.get('trade') or 'Uncategorized'),
                            (areas,row.get('area') or 'Unassigned area'),
@@ -261,7 +267,7 @@ def build_expense_client_summary(db, rows, project_ids, date_from='', date_to=''
         client=' / '.join(dict.fromkeys(p['client'] for p in projects if p['client'])),
         period=period,period_label=metadata.get('period_label') or 'Reporting period',
         counts=f"Listed entries: {len(selected)} | Active entries: {len(active)} | Void entries excluded: {len(selected)-len(active)}",
-        metrics=metrics,funding=funding,phases=phases,categories=categories,areas=areas,sites=sites,sources=sources,
+        metrics=metrics,funding=funding,phases=phases,categories=categories,areas=areas,sites=sites,sources=sources,weekly=weekly,
         construction_cents=materials+labor+fees,signatures=signers,
         notes=[
             'Summary uses the active, filtered expense ledger. Void entries and excluded payment history are not counted.',
@@ -270,6 +276,34 @@ def build_expense_client_summary(db, rows, project_ids, date_from='', date_to=''
             'Phase, category, area and project tables regroup the same construction total; do not add those tables together.',
             'Running totals ignore other row filters and include all selected-project expenses through the stated end date. Recoveries and funding balances are current at export, not a historical bank reconciliation.',
         ])
+
+
+def build_expense_billing_context(db, rows, context, rate_text='15', client_name='', issuer_name=''):
+    """Billing is a presentation calculation; no receivable or payment is posted."""
+    try:
+        rate=Decimal(str(rate_text).strip())
+    except InvalidOperation as exc:
+        raise ValueError('Enter a valid management fee percentage.') from exc
+    if not rate.is_finite() or rate<0 or rate>100:
+        raise ValueError('Management fee percentage must be between 0 and 100.')
+    expense_ids=[r['id'] for r in rows if not r['voided']]
+    payroll=[]
+    if expense_ids:
+        slots=','.join('?' for _ in expense_ids)
+        batches=db.all(f'''SELECT pb.* FROM payroll_batches pb
+            WHERE pb.expense_id IN ({slots}) ORDER BY pb.period_start,pb.batch_ref''',tuple(expense_ids))
+        for batch in batches:
+            employees=db.all('''SELECT employee_no,employee_name,position,attendance_days,
+                attendance_entries,regular_hours,overtime_hours,gross_cents,deduction_cents
+                FROM payroll_batch_employee_snapshots WHERE payroll_batch_id=?
+                ORDER BY employee_name COLLATE NOCASE''',(batch['id'],))
+            payroll.append(dict(reference=batch['batch_ref'],start=batch['period_start'],end=batch['period_end'],
+                gross_cents=batch['gross_cents'],deduction_cents=batch['deduction_cents'],
+                net_cents=batch['net_cents'],employees=[dict(r) for r in employees]))
+    basis=context['construction_cents']
+    fee=int((Decimal(basis)*rate/Decimal(100)).quantize(Decimal('1'),rounding=ROUND_HALF_UP))
+    return dict(client=client_name.strip() or context['client'] or 'Client',issuer=issuer_name.strip() or 'Project representative',
+        rate=str(rate.normalize()),basis_cents=basis,fee_cents=fee,overall_cents=basis+fee,payroll=payroll)
 
 
 def write_expense_ledger_pdf(path: Path | str, filters: list[tuple[str, str]],
@@ -441,6 +475,9 @@ def write_expense_ledger_pdf(path: Path | str, filters: list[tuple[str, str]],
         commands,summary_y=summary_page()
         summary_section('PAYMENTS, RECOVERIES AND VERIFICATION',client_summary['metrics'][5:])
         summary_section('RUNNING TOTALS AND PROJECT FUNDING',client_summary['funding'])
+        for week,groups in sorted(client_summary.get('weekly',{}).items()):
+            summary_section('WEEKLY CONSTRUCTION COST - '+week,
+                list(groups.items())+[('WEEK TOTAL',sum(groups.values()))])
         for title,key in (('PHASE BREAKDOWN','phases'),('CATEGORY / TRADE BREAKDOWN','categories'),
                           ('AREA BREAKDOWN','areas'),('PROJECT BREAKDOWN','sites'),('PAYMENT SOURCES - CURRENT RECORDED PAYMENTS','sources')):
             values=sorted(client_summary[key].items(),key=lambda item:item[0].casefold())
@@ -624,7 +661,55 @@ def write_expense_ledger_pdf(path: Path | str, filters: list[tuple[str, str]],
                 x += width
             y = row_bottom
 
-    if client_summary and client_summary.get('signatures'):
+    billing=client_summary.get('billing') if client_summary else None
+    if billing:
+        def billing_page(title,subtitle):
+            commands=[];pages.append(commands)
+            add_text(commands,margin,page_height-45,client_summary['title'],font='F2',size=16)
+            add_text(commands,margin,page_height-65,client_summary.get('address',''),color='0.35 0.39 0.45')
+            add_text(commands,margin,page_height-94,title,font='F2',size=14)
+            add_text(commands,margin,page_height-112,subtitle,color='0.35 0.39 0.45')
+            return commands,page_height-145
+        def billing_line(commands,y,label,value,emphasis=False):
+            commands.append(f'0.78 0.81 0.85 RG 0.45 w {margin} {y-27:.2f} {content_width} 27 re S')
+            add_text(commands,margin+9,y-18,label,font='F2' if emphasis else 'F1')
+            add_text(commands,margin+560,y-18,money(value),font='F2' if emphasis else 'F1',align='right',max_width=200)
+            return y-27
+        def billing_signatures(commands,left,right):
+            for center,name,role in ((margin+190,left,'Prepared / billed by'),(page_width-margin-190,right,'Received / acknowledged by')):
+                commands.append(f'0.35 0.39 0.45 RG 0.7 w {center-125} 92 m {center+125} 92 l S')
+                add_text(commands,center-text_width(name,bold=True)/2,74,name,font='F2')
+                add_text(commands,center-text_width(role)/2,59,role,color='0.35 0.39 0.45')
+        commands,y=billing_page('CONSTRUCTION EXPENSES BILLING',client_summary['period'])
+        for label,value in client_summary['metrics'][:3]:y=billing_line(commands,y,label,value)
+        y-=10
+        y=billing_line(commands,y,'TOTAL CONSTRUCTION COST',billing['basis_cents'],True)
+        add_text(commands,margin,y-24,'Amounts are drawn from the selected expense ledger. Cash advances are excluded as separate financing entries.',color='0.35 0.39 0.45')
+        billing_signatures(commands,billing['issuer'],billing['client'])
+        for batch in billing['payroll']:
+            commands,y=billing_page('PAYROLL BREAKDOWN - '+batch['reference'],batch['start']+' to '+batch['end'])
+            add_text(commands,margin,y,'EMPLOYEE',font='F2');add_text(commands,margin+260,y,'DAYS / LOGS',font='F2')
+            add_text(commands,margin+410,y,'HOURS',font='F2');add_text(commands,margin+600,y,'GROSS',font='F2')
+            y-=19
+            for person in batch['employees']:
+                if y<88:
+                    commands,y=billing_page('PAYROLL BREAKDOWN - '+batch['reference']+' (continued)',batch['start']+' to '+batch['end'])
+                add_text(commands,margin,y,person['employee_name']+' / '+person['employee_no'])
+                add_text(commands,margin+260,y,f"{person['attendance_days']} / {person['attendance_entries']}")
+                add_text(commands,margin+410,y,f"{person['regular_hours']:.2f} + {person['overtime_hours']:.2f} OT")
+                add_text(commands,margin+600,y,money(person['gross_cents']))
+                y-=17
+            if y<88:commands,y=billing_page('PAYROLL TOTAL - '+batch['reference'],batch['start']+' to '+batch['end'])
+            billing_line(commands,y,'GROSS PAYROLL - deductions already advanced '+money(batch['deduction_cents']),batch['gross_cents'],True)
+        commands,y=billing_page('MANAGEMENT FEE BILLING',client_summary['period'])
+        y=billing_line(commands,y,'Construction expenses - fee basis',billing['basis_cents'])
+        y=billing_line(commands,y,'Management fee ('+billing['rate']+'%)',billing['fee_cents'],True)
+        y-=10
+        y=billing_line(commands,y,'Expenses plus management fee',billing['overall_cents'],True)
+        add_text(commands,margin,y-24,'Management fee is a billing calculation only; it has not been posted as an expense or payment.',color='0.35 0.39 0.45')
+        billing_signatures(commands,billing['issuer'],billing['client'])
+
+    if client_summary and client_summary.get('signatures') and not billing:
         signers=client_summary['signatures']
         signature_rows=(len(signers)+2)//3
         available_y=y if include_details else summary_y
@@ -2219,6 +2304,26 @@ class Database:
             gross_cents INTEGER NOT NULL DEFAULT 0,
             authorized_by_head_id INTEGER REFERENCES project_heads(id),
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS weekly_attendance_drafts (
+            week_start TEXT NOT NULL,
+            employee_id INTEGER NOT NULL REFERENCES employees(id),
+            work_date TEXT NOT NULL,
+            project_id INTEGER NOT NULL REFERENCES projects(id),
+            state TEXT NOT NULL CHECK(state IN ('Present','Absent')),
+            segments_json TEXT NOT NULL DEFAULT '[]',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(week_start,employee_id,work_date,project_id)
+        );
+        CREATE TABLE IF NOT EXISTS weekly_attendance_marks (
+            week_start TEXT NOT NULL,
+            employee_id INTEGER NOT NULL REFERENCES employees(id),
+            work_date TEXT NOT NULL,
+            project_id INTEGER NOT NULL REFERENCES projects(id),
+            state TEXT NOT NULL CHECK(state='Absent'),
+            authorized_by_head_id INTEGER NOT NULL REFERENCES project_heads(id),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(week_start,employee_id,work_date,project_id)
         );
         CREATE TABLE IF NOT EXISTS employee_project_assignments (
             id INTEGER PRIMARY KEY,
@@ -6455,6 +6560,123 @@ class Database:
             )
         return {"id": batch_id, "reference": reference, "work_date": work_date,
                 "count": len(rows), "gross_cents": gross}
+
+    def weekly_attendance_draft(self, week_value):
+        start,_=payroll_week_bounds(week_value)
+        return {(r['employee_id'],r['work_date'],r['project_id']):
+                {'state':r['state'],'segments':json.loads(r['segments_json'])}
+            for r in self.all('SELECT * FROM weekly_attendance_drafts WHERE week_start=?',(start,))}
+
+    def _validated_weekly_cells(self, week_value, cells):
+        start,end=payroll_week_bounds(week_value)
+        normalized={};segments=[]
+        for (employee_id,work_date,project_id),cell in cells.items():
+            employee_id,project_id=int(employee_id),int(project_id)
+            if not start<=work_date<=end:
+                raise ValueError('A draft attendance date is outside the selected Saturday-Friday week.')
+            employee=self.one('SELECT id,name FROM employees WHERE id=? AND active=1',(employee_id,))
+            if not employee or not self.project_is_active(project_id):
+                raise ValueError('Draft attendance requires an active employee and work project.')
+            state=cell.get('state')
+            if state not in ('Present','Absent'):
+                raise ValueError('Choose Present or Absent for each marked attendance cell.')
+            raw=cell.get('segments',[])
+            if state=='Absent' and raw:
+                raise ValueError('An absent cell cannot contain work times.')
+            if state=='Present' and not raw:
+                raise ValueError('A present cell needs at least one work segment.')
+            clean=[]
+            for pair in raw:
+                if not isinstance(pair,(list,tuple)) or len(pair)!=2:
+                    raise ValueError('Enter each work segment as a time-in/time-out pair.')
+                try:
+                    tin=datetime.strptime(str(pair[0]).strip(),'%H:%M').strftime('%H:%M')
+                    tout=datetime.strptime(str(pair[1]).strip(),'%H:%M').strftime('%H:%M')
+                    started=datetime.fromisoformat(f'{work_date}T{tin}:00')
+                    ended=datetime.fromisoformat(f'{work_date}T{tout}:00')
+                except ValueError as exc:
+                    raise ValueError(f"Invalid work time for {employee['name']} on {work_date}; use HH:MM.") from exc
+                if ended<=started:
+                    raise ValueError(f"Time out must be later than time in for {employee['name']} on {work_date}.")
+                clean.append([tin,tout]);segments.append((employee_id,project_id,started,ended))
+            normalized[(employee_id,work_date,project_id)]={'state':state,'segments':clean}
+        for index,(eid,pid,started,ended) in enumerate(segments):
+            if any(eid==other_eid and max(started,other_start)<min(ended,other_end)
+                   for other_eid,_other_pid,other_start,other_end in segments[index+1:]):
+                raise ValueError(f'Overlapping work segments for employee #{eid} on {started.date()}.')
+            if self.one('''SELECT 1 FROM attendance WHERE employee_id=? AND clock_in<? AND clock_out>?''',
+                        (eid,ended.isoformat(timespec='seconds'),started.isoformat(timespec='seconds'))):
+                raise ValueError(f'Employee #{eid} has overlapping recorded attendance on {started.date()}.')
+        return start,end,normalized,segments
+
+    def save_weekly_attendance_draft(self, week_value, cells):
+        start,_end,normalized,_segments=self._validated_weekly_cells(week_value,cells)
+        with self.conn:
+            self.conn.execute('DELETE FROM weekly_attendance_drafts WHERE week_start=?',(start,))
+            self.conn.executemany('''INSERT INTO weekly_attendance_drafts
+                (week_start,employee_id,work_date,project_id,state,segments_json)
+                VALUES(?,?,?,?,?,?)''',[(start,eid,day,pid,cell['state'],json.dumps(cell['segments']))
+                    for (eid,day,pid),cell in normalized.items()])
+        return len(normalized)
+
+    def finalize_weekly_attendance_draft(self,week_value,head_ids):
+        cells=self.weekly_attendance_draft(week_value)
+        start,end,_normalized,segments=self._validated_weekly_cells(week_value,cells)
+        if not cells:
+            raise ValueError('Mark attendance cells before finalizing the week.')
+        projects={pid for _eid,_day,pid in cells}
+        for pid in projects:
+            head=self.one('SELECT id FROM project_heads WHERE id=? AND project_id=? AND active=1',
+                          (head_ids.get(pid),pid))
+            if not head:raise ValueError('An active head must approve each affected project.')
+        checked=[]
+        for eid,pid,started,ended in segments:
+            employee=self.one('SELECT name FROM employees WHERE id=? AND active=1',(eid,))
+            if self.one('SELECT 1 FROM payroll_week_plans WHERE employee_id=? AND period_start=?',(eid,start)):
+                raise ValueError(f"{employee['name']}'s weekly payroll is locked; reopen it before adding attendance.")
+            if self.one("SELECT 1 FROM attendance WHERE employee_id=? AND clock_out=''",(eid,)):
+                raise ValueError(f"Clock {employee['name']} out before finalizing attendance.")
+            if self.one('SELECT 1 FROM attendance WHERE employee_id=? AND clock_in<? AND clock_out>?',
+                        (eid,ended.isoformat(timespec='seconds'),started.isoformat(timespec='seconds'))):
+                raise ValueError(f"{employee['name']} has overlapping recorded attendance on {started.date()}.")
+            checked.append((eid,pid,started,ended,self.employee_daily_rate_at(eid,started.date().isoformat(),pid)))
+        with self.conn:
+            for (eid,day,pid),cell in cells.items():
+                if cell['state']=='Absent':
+                    self.conn.execute('''INSERT INTO weekly_attendance_marks
+                        (week_start,employee_id,work_date,project_id,state,authorized_by_head_id)
+                        VALUES(?,?,?,?,?,?) ON CONFLICT(week_start,employee_id,work_date,project_id)
+                        DO UPDATE SET state=excluded.state,authorized_by_head_id=excluded.authorized_by_head_id''',
+                        (start,eid,day,pid,'Absent',head_ids[pid]))
+                else:
+                    self.conn.execute('''DELETE FROM weekly_attendance_marks WHERE week_start=?
+                        AND employee_id=? AND work_date=? AND project_id=?''',(start,eid,day,pid))
+            for eid,pid,started,ended,rate in checked:
+                result=compute_shift_pay(started,ended,rate)
+                self.conn.execute('''INSERT INTO attendance(employee_id,project_id,clock_in,
+                    clock_out,hours,lunch_hours,regular_hours,overtime_hours,regular_pay_cents,
+                    overtime_pay_cents,gross_cents,pay_rate_cents,day_type,source,authorized_by_head_id)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'Ordinary Day','Weekly Grid',?)''',
+                    (eid,pid,started.isoformat(timespec='seconds'),ended.isoformat(timespec='seconds'),
+                     result['hours'],result['lunch_hours'],result['regular_hours'],result['overtime_hours'],
+                     result['regular_pay_cents'],result['overtime_pay_cents'],result['gross_cents'],rate,head_ids[pid]))
+            for eid,day in {(eid,started.date().isoformat()) for eid,_pid,started,_end,_rate in checked}:
+                self._recalculate_employee_day_segments(eid,day)
+            for pid,day in sorted({(pid,started.date().isoformat()) for _eid,pid,started,_end,_rate in checked}):
+                rows=self.all('''SELECT id,gross_cents FROM attendance WHERE project_id=? AND SUBSTR(clock_in,1,10)=?
+                    AND clock_out<>'' AND closure_batch_id IS NULL AND payroll_batch_id IS NULL
+                    AND committed_expense_id IS NULL ORDER BY id''',(pid,day))
+                if not rows:continue
+                reference=self._next_system_reference('ATD','attendance_closure_batches','closure_ref',day)
+                batch_id=self.conn.execute('''INSERT INTO attendance_closure_batches
+                    (project_id,closure_ref,work_date,attendance_count,gross_cents,authorized_by_head_id)
+                    VALUES(?,?,?,?,?,?)''',(pid,reference,day,len(rows),sum(r['gross_cents'] for r in rows),head_ids[pid])).lastrowid
+                self.conn.executemany('UPDATE attendance SET closure_batch_id=? WHERE id=?',
+                                      [(batch_id,r['id']) for r in rows])
+                self.conn.execute('INSERT INTO audit_log(project_id,action,details) VALUES(?,?,?)',
+                    (pid,'WEEKLY_GRID_ATTENDANCE_CLOSED',f'{start} to {end}; {reference}; {len(rows)} records'))
+            self.conn.execute('DELETE FROM weekly_attendance_drafts WHERE week_start=?',(start,))
+        return len(checked)
 
     def record_batch_project_attendance(self, segments, head_id):
         """Stage multiple projects/segments per worker with global overlap guards."""
@@ -13429,10 +13651,11 @@ class ExpensesTab(BaseTab):
             )
             self.app.refresh_all()
 
-    def filtered_rows(self):
+    def filtered_rows(self,date_from=None,date_to=None,project_ids_override=None):
         projects = self.project_options(); where, params = ["1=1"], []
         all_project_ids = list(projects.values())
-        project_ids = self.project_selector.selected_ids()
+        project_ids = (list(project_ids_override) if project_ids_override is not None
+                       else self.project_selector.selected_ids())
         if not project_ids:
             where.append("0=1")
         elif len(project_ids) != len(all_project_ids):
@@ -13613,10 +13836,12 @@ class ExpensesTab(BaseTab):
         for term in self.filter_var.get().strip().lower().replace(",", "").split():
             where.append(f"REPLACE({search_columns}, ',', '') LIKE ?")
             params.append(f"%{term}%")
-        if self.date_from_filter.get():
-            where.append("e.expense_date>=?"); params.append(self.date_from_filter.get())
-        if self.date_to_filter.get():
-            where.append("e.expense_date<=?"); params.append(self.date_to_filter.get())
+        date_from=self.date_from_filter.get() if date_from is None else date_from
+        date_to=self.date_to_filter.get() if date_to is None else date_to
+        if date_from:
+            where.append("e.expense_date>=?"); params.append(date_from)
+        if date_to:
+            where.append("e.expense_date<=?"); params.append(date_to)
         return self.db.all(f"""SELECT e.*,pr.name project,COALESCE(ph.name,'') phase,
             COALESCE(h.name,'') authorized_by,COALESCE(SUM(pay.amount_cents),0) payment_total,
             COALESCE(GROUP_CONCAT(DISTINCT NULLIF(TRIM(pay.method),'')),'') payment_methods,
@@ -13758,25 +13983,38 @@ class ExpensesTab(BaseTab):
         self._ledger_size_changed()
 
     def export_pdf(self):
-        rows, project_ids = self.filtered_rows()
-        if not rows: messagebox.showinfo(APP_TITLE, "There are no filtered rows to export."); return
-        try:
-            context=build_expense_client_summary(self.db,rows,project_ids,
-                self.date_from_filter.get(),self.date_to_filter.get())
-        except (ValueError,sqlite3.Error) as exc:
-            messagebox.showerror(APP_TITLE,str(exc),parent=self);return
-        options=dialog(self,'Expense PDF Report',[
-            ('layout','Report contents',['Summary + Detailed Ledger','Summary Only','Detailed Ledger Only']),
-            ('title','Report / project title'),('address','Project address'),
+        projects=self.project_options()
+        scope_choices=['Current ledger selection','All Projects',*projects]
+        options=dialog(self,'Expense Report / Billing',[
+            ('layout','Report contents',['Summary + Detailed Ledger + Billing','Summary + Detailed Ledger',
+                                         'Summary Only','Detailed Ledger Only']),
+            ('scope','Project(s)',scope_choices),
+            ('report_start','From date (YYYY-MM-DD; blank = earliest)'),
+            ('report_end','To date (YYYY-MM-DD; blank = today)'),
+            ('title','Report / project title (blank = project name)'),
+            ('address','Project address (blank = project address)'),
             ('period_label','Period label (for example: 1st week)'),
-            ('signatures','Contractors for signatures (comma-separated; optional)'),
-        ],dict(layout='Summary + Detailed Ledger',title=context['title'],address=context['address'],
-            period_label=context['period_label'],signatures=', '.join(context['signatures'])),
-            required_keys=('layout','title'))
+            ('management_rate','Management fee percent'),
+            ('client_name','Client / billed to (blank = project client)'),
+            ('issuer_name','Billed by / issuer'),
+        ],dict(layout='Summary + Detailed Ledger + Billing',scope='Current ledger selection',
+            report_start=self.date_from_filter.get(),report_end=self.date_to_filter.get(),
+            period_label='Reporting period',management_rate='15'),required_keys=('layout','scope'))
         if not options:return
         try:
+            start=valid_date(options['report_start'],False) if options['report_start'] else ''
+            end=valid_date(options['report_end'],False) if options['report_end'] else ''
+            if start and end and start>end:raise ValueError('Report start date must not be after the end date.')
+            project_ids=(list(projects.values()) if options['scope']=='All Projects' else
+                         [projects[options['scope']]] if options['scope'] in projects else
+                         self.project_selector.selected_ids())
+            rows,project_ids=self.filtered_rows(start,end,project_ids)
+            if not rows:raise ValueError('There are no expenses in the chosen report period and active ledger filters.')
             context=build_expense_client_summary(self.db,rows,project_ids,
-                self.date_from_filter.get(),self.date_to_filter.get(),options)
+                start,end,options)
+            if options['layout'].endswith('+ Billing'):
+                context['billing']=build_expense_billing_context(self.db,rows,context,
+                    options['management_rate'],options['client_name'],options['issuer_name'])
         except (ValueError,sqlite3.Error) as exc:
             messagebox.showerror(APP_TITLE,str(exc),parent=self);return
         destination = filedialog.asksaveasfilename(title="Export Filtered Expense Ledger",
@@ -13785,22 +14023,21 @@ class ExpensesTab(BaseTab):
         if not destination: return
         total = sum(max(0,row["total_cents"]-row["recovery_total"]) for row in rows if not row["voided"])
         _withdrawn, _cash_spent, cash = self.db.cash_summary()
-        projects = self.project_options()
         deposited = sum(self.db.project_budget(pid)[0] for pid in project_ids)
         contract = sum(self.db.one(
             "SELECT contract_value_cents FROM projects WHERE id=?", (pid,)
         )["contract_value_cents"] for pid in project_ids)
         committed = sum(self.db.project_commitment_budget(pid)[1] for pid in project_ids)
         applied_filters = [
-            ("Project", self.project_selector.display_text()),
+            ("Project", options['scope']),
             ("Status", self.status_selector.display_text()),
             ("Verification", self.verification_selector.display_text()),
             ("MOP", self.mop_selector.display_text()),
             ("Funding source", self.funding_selector.display_text()),
             ("Area", self.area_selector.display_text()),
             ("Supplier", self.supplier_selector.display_text()),
-            ("Date from", self.date_from_filter.get() or "All dates"),
-            ("Date to", self.date_to_filter.get() or "All dates"),
+            ("Date from", start or "All dates"),
+            ("Date to", end or "Today"),
             ("Search", self.filter_var.get() or "(none)"),
         ]
         financial_summary = [
@@ -14586,6 +14823,214 @@ class ProjectPayrollReview(tk.Toplevel):
         if not selected:
             messagebox.showinfo(APP_TITLE,'Select at least one project.',parent=self);return
         self.result=selected;self.destroy()
+
+
+class WeeklyAttendanceGridDialog(tk.Toplevel):
+    """One company week, viewed by project; drafts do not affect payroll."""
+    def __init__(self,parent,db,app,week_value):
+        super().__init__(parent)
+        self.db,self.app=db,app
+        self.week_start,self.week_end=payroll_week_bounds(week_value)
+        self.dates=[(date.fromisoformat(self.week_start)+timedelta(days=i)).isoformat() for i in range(7)]
+        self.projects=db.all("SELECT id,name FROM projects WHERE status<>'Completed' ORDER BY name")
+        self.employees=db.all('SELECT id,name,employee_no FROM employees WHERE active=1 ORDER BY name COLLATE NOCASE')
+        self.cells=db.weekly_attendance_draft(self.week_start)
+        self.finalized_absences={(r['employee_id'],r['work_date'],r['project_id']) for r in
+            db.all('SELECT employee_id,work_date,project_id FROM weekly_attendance_marks WHERE week_start=?',
+                   (self.week_start,))}
+        self._pending_click=None
+        self._suppress_release=False
+        self.recorded={}
+        for row in db.all('''SELECT a.employee_id,a.project_id,a.clock_in,a.clock_out,
+                a.payroll_batch_id,p.name project_name FROM attendance a
+                JOIN projects p ON p.id=a.project_id
+                WHERE SUBSTR(a.clock_in,1,10) BETWEEN ? AND ? AND a.clock_out<>''
+                ORDER BY a.clock_in''',(self.week_start,self.week_end)):
+            key=(row['employee_id'],row['clock_in'][:10],row['project_id'])
+            self.recorded.setdefault(key,[]).append(row)
+        self.dirty=False
+        self.title(f'Weekly Attendance | Saturday {self.week_start} to Friday {self.week_end}')
+        self.geometry('1320x730');self.minsize(1050,600)
+        body=ttk.Frame(self,padding=14);body.pack(fill='both',expand=True)
+        ttk.Label(body,text='Weekly attendance by work project',style='DialogTitle.TLabel').pack(anchor='w')
+        ttk.Label(body,text=f'Saturday {self.week_start} through Friday {self.week_end}. One company roster; split-site shifts appear in both project tabs. Drafts do not enter payroll until finalized.',
+                  style='Muted.TLabel',wraplength=1220).pack(anchor='w',pady=(2,8))
+        ttk.Label(body,text='Click an empty cell for present (08:00-17:00). Click a marked cell to edit time; double-click to mark absent. Right-click opens the editor. Existing attendance is read-only here.',
+                  style='Muted.TLabel',wraplength=1220).pack(anchor='w',pady=(0,8))
+        self.tabs=ttk.Notebook(body);self.tabs.pack(fill='both',expand=True)
+        self.trees={}
+        for project in self.projects:
+            self._add_tab(project['id'],project['name'])
+        self._add_tab(None,'All Projects - Review')
+        buttons=ttk.Frame(body);buttons.pack(fill='x',pady=(10,0))
+        ttk.Button(buttons,text='Save Weekly Draft',command=self.save_draft).pack(side='left')
+        ttk.Button(buttons,text='Review and Finalize Week',style='Primary.TButton',command=self.finalize).pack(side='left',padx=8)
+        ttk.Button(buttons,text='Close',command=self.close).pack(side='right')
+        self.transient(parent);self.grab_set();self.protocol('WM_DELETE_WINDOW',self.close)
+        self.render()
+
+    def _add_tab(self,project_id,title):
+        frame=ttk.Frame(self.tabs,padding=7);self.tabs.add(frame,text=title)
+        columns=('employee','no',*self.dates)
+        tree=ttk.Treeview(frame,columns=columns,show='headings',selectmode='browse')
+        tree.heading('employee',text='Employee');tree.column('employee',width=180,stretch=False)
+        tree.heading('no',text='MONCON No.');tree.column('no',width=105,stretch=False)
+        for work_date in self.dates:
+            label=datetime.strptime(work_date,'%Y-%m-%d').strftime('%a %d %b')
+            tree.heading(work_date,text=label);tree.column(work_date,width=130,minwidth=110,stretch=True)
+        yscroll=ttk.Scrollbar(frame,orient='vertical',command=tree.yview)
+        xscroll=ttk.Scrollbar(frame,orient='horizontal',command=tree.xview)
+        tree.configure(yscrollcommand=yscroll.set,xscrollcommand=xscroll.set)
+        tree.grid(row=0,column=0,sticky='nsew');yscroll.grid(row=0,column=1,sticky='ns')
+        xscroll.grid(row=1,column=0,sticky='ew');frame.rowconfigure(0,weight=1);frame.columnconfigure(0,weight=1)
+        tree.tag_configure('split',background='#EAF4FF')
+        for employee in self.employees:
+            tree.insert('','end',iid=str(employee['id']),values=(employee['name'],employee['employee_no'],*(['']*7)))
+        if project_id is not None:
+            tree.bind('<ButtonRelease-1>',lambda event,pid=project_id:self._queue_click(event,pid))
+            tree.bind('<Double-1>',lambda event,pid=project_id:self._double_click(event,pid))
+            tree.bind('<Button-3>',lambda event,pid=project_id:self.cell_click(event,pid,edit=True))
+        self.trees[project_id]=tree
+
+    def _cell_text(self,eid,work_date,pid):
+        key=(eid,work_date,pid)
+        recorded=self.recorded.get(key,[])
+        if recorded:
+            return (('Committed ' if any(r['payroll_batch_id'] for r in recorded) else 'Recorded ')
+                    + ', '.join(r['clock_in'][11:16]+'-'+r['clock_out'][11:16] for r in recorded))
+        if key in self.finalized_absences:return 'Absent (final)'
+        cell=self.cells.get(key)
+        if not cell:return '-'
+        if cell['state']=='Absent':return 'Absent'
+        return 'Draft '+', '.join(a+'-'+b for a,b in cell['segments'])
+
+    def render(self):
+        for pid,tree in self.trees.items():
+            for employee in self.employees:
+                eid=employee['id']
+                if pid is None:
+                    days=[]
+                    for day in self.dates:
+                        worked=[]
+                        for project in self.projects:
+                            value=self._cell_text(eid,day,project['id'])
+                            if value!='-':worked.append(project['name']+': '+value.replace('Draft ','').replace('Recorded ',''))
+                        days.append(' / '.join(worked) if worked else '-')
+                else:days=[self._cell_text(eid,day,pid) for day in self.dates]
+                split=any(sum(1 for project in self.projects
+                              if self._cell_text(eid,day,project['id']).startswith(('Draft','Recorded','Committed')))>1
+                          for day in self.dates)
+                tree.item(str(eid),values=(employee['name'],employee['employee_no'],*days),
+                          tags=('split',) if split else ())
+
+    def cell_click(self,event,pid,absent=False,edit=False):
+        tree=self.trees[pid]
+        row=tree.identify_row(event.y);column=tree.identify_column(event.x)
+        if not row or not column:return
+        index=int(column[1:])-3
+        if not 0<=index<7:return
+        eid=int(row);day=self.dates[index];key=(eid,day,pid)
+        if key in self.recorded or key in self.finalized_absences:
+            messagebox.showinfo(APP_TITLE,'Recorded attendance is read-only in the grid. Use Edit Attendance / Pay or reopen committed payroll to correct it.',parent=self)
+            return
+        if absent:
+            self.cells[key]={'state':'Absent','segments':[]};self.dirty=True;self.render();return
+        if edit or key in self.cells or any(k[0]==eid and k[1]==day and k[2]!=pid and
+                                            value['state']=='Present' for k,value in self.cells.items()) or \
+                any(k[0]==eid and k[1]==day and k[2]!=pid for k in self.recorded):
+            self.edit_cell(key);return
+        self.cells[key]={'state':'Present','segments':[['08:00','17:00']]}
+        self.dirty=True;self.render()
+
+    def _queue_click(self,event,pid):
+        if self._suppress_release:
+            self._suppress_release=False
+            return
+        if self._pending_click:
+            self.after_cancel(self._pending_click)
+        self._pending_click=self.after(250,lambda:self._deliver_click(event,pid))
+
+    def _deliver_click(self,event,pid):
+        self._pending_click=None
+        self.cell_click(event,pid)
+
+    def _double_click(self,event,pid):
+        self._suppress_release=True
+        if self._pending_click:
+            self.after_cancel(self._pending_click)
+            self._pending_click=None
+        self.cell_click(event,pid,absent=True)
+
+    def edit_cell(self,key):
+        eid,day,pid=key
+        person=next(e for e in self.employees if e['id']==eid)
+        current=self.cells.get(key,{'state':'Present','segments':[['08:00','17:00']]})
+        times='; '.join(a+'-'+b for a,b in current['segments'])
+        values=dialog(self,f"{person['name']} | {day}",[
+            ('state','Attendance',['Present','Absent','Clear cell']),
+            ('segments','Time segments (HH:MM-HH:MM; separate with semicolons)'),
+        ],{'state':current['state'],'segments':times},required_keys=('state',))
+        if not values:return
+        if values['state']=='Clear cell':self.cells.pop(key,None)
+        elif values['state']=='Absent':self.cells[key]={'state':'Absent','segments':[]}
+        else:
+            segments=[]
+            for part in values['segments'].split(';'):
+                part=part.strip()
+                if not part:continue
+                match=re.fullmatch(r'(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})',part)
+                if not match:
+                    messagebox.showerror(APP_TITLE,'Enter work times like 08:00-12:00; 13:00-17:00.',parent=self)
+                    return
+                segments.append(list(match.groups()))
+            candidate=dict(self.cells);candidate[key]={'state':'Present','segments':segments}
+            try:self.db._validated_weekly_cells(self.week_start,candidate)
+            except ValueError as exc:messagebox.showerror(APP_TITLE,str(exc),parent=self);return
+            self.cells[key]=candidate[key]
+        self.dirty=True;self.render()
+
+    def save_draft(self):
+        try:
+            count=self.db.save_weekly_attendance_draft(self.week_start,self.cells)
+        except (ValueError,sqlite3.Error) as exc:
+            messagebox.showerror(APP_TITLE,str(exc),parent=self);return False
+        self.dirty=False
+        messagebox.showinfo(APP_TITLE,f'{count} weekly draft cell(s) saved. No payroll or expense was posted.',parent=self)
+        return True
+
+    def finalize(self):
+        if not self.save_draft():return
+        segments=[(eid,pid) for (eid,_day,pid),cell in self.cells.items() if cell['state']=='Present']
+        if not self.cells:
+            messagebox.showerror(APP_TITLE,'Mark at least one attendance cell first.',parent=self);return
+        missing=sum((eid,day,pid) not in self.cells and (eid,day,pid) not in self.recorded
+                    and (eid,day,pid) not in self.finalized_absences
+                    for eid in [e['id'] for e in self.employees] for day in self.dates for pid in [p['id'] for p in self.projects])
+        if not messagebox.askyesno('Review weekly attendance',
+            f'{len(segments)} present and {sum(c["state"]=="Absent" for c in self.cells.values())} absent cell(s) '
+            f'across {len({pid for _eid,_day,pid in self.cells})} project(s). '
+            f'{missing} project-grid cells are unmarked; blank means not entered, not absent. '
+            'Finalizing records attendance and closes affected days for weekly payroll. Continue?',parent=self):return
+        heads={}
+        for pid in sorted({pid for _eid,_day,pid in self.cells}):
+            project=next(p for p in self.projects if p['id']==pid)
+            head=self.app.authorize_for_project(pid,'Finalize weekly attendance',
+                                                f"{project['name']} | {self.week_start} to {self.week_end}")
+            if not head:return
+            heads[pid]=head['id']
+        try:
+            count=self.db.finalize_weekly_attendance_draft(self.week_start,heads)
+        except (ValueError,sqlite3.Error) as exc:
+            messagebox.showerror(APP_TITLE,str(exc),parent=self);return
+        messagebox.showinfo(APP_TITLE,f'{count} attendance segment(s) recorded and closed. Review Weekly Payroll before committing expenses.',parent=self)
+        self.app.refresh_all();self.destroy()
+
+    def close(self):
+        if self.dirty:
+            choice=messagebox.askyesnocancel('Unsaved weekly attendance','Save this weekly draft before closing?',parent=self)
+            if choice is None:return
+            if choice and not self.save_draft():return
+        self.destroy()
 
 
 class BatchAttendanceDialog(tk.Toplevel):
@@ -15600,7 +16045,8 @@ class PayrollTab(BaseTab):
         ttk.Button(actions,text="Edit Employee",command=self.edit_employee).pack(side="left",padx=5)
         ttk.Button(actions,text="Add Existing to Project",command=self.deploy_existing_employee).pack(side="left")
         ttk.Button(actions,text="Archive Employee",command=self.archive_employee).pack(side="left",padx=5)
-        ttk.Button(actions,text="Batch Attendance",style="Primary.TButton",command=self.batch_attendance).pack(side="left")
+        ttk.Button(actions,text="Weekly Attendance Grid",style="Primary.TButton",command=self.open_weekly_attendance_grid).pack(side="left")
+        ttk.Button(actions,text="Batch Attendance",command=self.batch_attendance).pack(side="left",padx=5)
         ttk.Button(actions,text="Close Daily Attendance",command=self.close_daily_attendance).pack(side="left",padx=5)
         ttk.Button(actions,text="Edit Attendance / Pay",
                    command=self.edit_selected_attendance).pack(side="left")
@@ -16077,6 +16523,11 @@ class PayrollTab(BaseTab):
                 messagebox.showerror(APP_TITLE,str(exc),parent=parent);return False
             messagebox.showinfo(APP_TITLE,f"Goodbye, {employee['name']}!\nPaid hours: {result['hours']}\nOvertime: {result['overtime_hours']}\nGross: {money(result['gross_cents'])}",parent=parent)
         self.pin.set(""); self.app.refresh_all(); return True
+
+    def open_weekly_attendance_grid(self):
+        win=WeeklyAttendanceGridDialog(self,self.db,self.app,self.week_var.get() or date.today())
+        self.wait_window(win)
+        self.refresh_weekly()
 
     def batch_attendance(self):
         employees=self.db.all('SELECT * FROM employees WHERE active=1 ORDER BY name COLLATE NOCASE')
