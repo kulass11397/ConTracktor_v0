@@ -1,0 +1,19 @@
+ConTracktor 1.7.6 - project-aware cash advance attribution
+
+1. Back up the client database and close ConTracktor and all kiosk windows.
+2. Download ConTracktor_v1_Update_1.7.6.exe from the v1.7.6 GitHub release.
+3. Run the updater under the SAME Windows user as the existing installation. Do not uninstall the app or replace its database. The installer makes timestamped application and data backups.
+4. Reopen ConTracktor and go to Payroll > Cash Advances. Under a project ledger filter, advances now appear when that project supplied the cash or absorbed a salary deduction.
+5. Review Cash Funder and Cost Project(s). Cash Funder preserves where the advance money came from. Cost Project(s) is assigned automatically from the employee's committed payroll work sites; the same advance may show more than one project when work was split.
+6. For the supplied 23 September client backup, Project Grace receives PHP 5,583.31 in CA salary deductions while Project Oasis remains the cash funder. The Project Grace payroll is shown at its full construction cost (gross salary), and the Oasis-to-Grace recoverable remains traceable.
+7. For new batch advances, select the project that actually supplies the money. The final cost project is not manually guessed during issuance; it follows committed attendance and payroll automatically.
+8. The Saturday-Friday weekly attendance grid and Edit attendance / pay workflows remain available.
+
+Default app: %LOCALAPPDATA%\Programs\ConTracktor_v1
+Default data: %LOCALAPPDATA%\ConTracktor_v1\Data\contractor_tracker.db
+Data backups: %LOCALAPPDATA%\ConTracktor_v1\Data\Backups
+App backups: %LOCALAPPDATA%\ConTracktor_v1\AppBackups
+
+The installer includes no database or sample records. Financial history, attendance, advances and employee identities are retained. This update changes attribution and presentation from existing posted records; it does not overwrite or duplicate client transactions.
+
+Security: the updater is unsigned. Do not disable Defender or add exclusions if it is flagged. Report the file to Microsoft: https://www.microsoft.com/en-us/wdsi/filesubmission

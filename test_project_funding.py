@@ -5,7 +5,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 
-from app import Database, hash_pin, compute_shift_pay, BulkExpenseDialog
+from app import Database, hash_pin, compute_shift_pay, BulkExpenseDialog, expense_ledger_amounts
 
 
 class ProjectFundingTests(unittest.TestCase):
@@ -150,6 +150,43 @@ class ProjectFundingTests(unittest.TestCase):
         self.db.commit_project_weekly_payrolls(dict(zip(self.projects[:2],self.heads[:2])),'2026-09-14')
         self.assertEqual(self.db.project_cost_budget(self.oasis)[1],300000)
         self.assertEqual(self.db.project_cost_budget(self.grace)[1],200000)
+
+    def test_expense_ledger_reclassifies_salary_deductions_to_work_project(self):
+        self.two_project_week()
+        self.db.commit_project_weekly_payrolls(dict(zip(self.projects[:2],self.heads[:2])),'2026-09-14')
+        costs={pid:0 for pid in self.projects}
+        for source in self.db.all('SELECT * FROM expenses WHERE voided=0 ORDER BY id'):
+            row=dict(source)
+            row['payment_total']=self.db.one("""SELECT COALESCE(SUM(amount_cents),0) n FROM payments
+                WHERE expense_id=? AND accounting_excluded=0""",(row['id'],))['n']
+            row['recovery_total']=self.db.one("""SELECT COALESCE(SUM(t.amount_cents),0) n
+                FROM cash_advances a JOIN cash_advance_transactions t ON t.advance_id=a.id
+                WHERE a.expense_id=? AND a.voided=0 AND t.voided=0 AND t.posted=1
+                  AND t.txn_type IN ('Cash Repayment','Bank Repayment','Repayment')""",(row['id'],))['n']
+            row['salary_recovery_total']=self.db.one("""SELECT COALESCE(SUM(t.amount_cents),0) n
+                FROM cash_advances a JOIN cash_advance_transactions t ON t.advance_id=a.id
+                WHERE a.expense_id=? AND a.voided=0 AND t.voided=0 AND t.posted=1
+                  AND t.txn_type='Salary Deduction'""",(row['id'],))['n']
+            batch=self.db.one("""SELECT deduction_cents FROM payroll_batches
+                WHERE expense_id=? AND status='Committed'""",(row['id'],))
+            row['payroll_deduction_total']=batch['deduction_cents'] if batch else 0
+            costs[row['project_id']]+=expense_ledger_amounts(row)['cost_cents']
+        self.assertEqual(costs[self.oasis],300000)
+        self.assertEqual(costs[self.grace],200000)
+        self.assertEqual(costs[self.oasis],self.db.project_cost_budget(self.oasis)[1])
+        self.assertEqual(costs[self.grace],self.db.project_cost_budget(self.grace)[1])
+
+    def test_expense_ledger_amounts_accepts_sqlite_row(self):
+        row=self.db.one("""SELECT 10000 total_cents, 8000 payment_total,
+            500 recovery_total, 1000 salary_recovery_total,
+            1500 payroll_deduction_total""")
+        self.assertEqual(expense_ledger_amounts(row),{
+            'recovered_cents':1500,
+            'payroll_deduction_cents':1500,
+            'cost_cents':10000,
+            'settled_cents':8000,
+            'outstanding_cents':2000,
+        })
 
     def test_negative_correction_limits_deduction_without_negative_net(self):
         self.two_project_week()

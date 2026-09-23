@@ -111,6 +111,13 @@ class CompanyBatchTests(unittest.TestCase):
         dialog.employee_tree.selection_set(str(self.employee))
         dialog.vars['amount'].set('600');dialog.vars['reason'].set('Weekly')
         dialog.stage_selected()
+        self.assertIn('funder',dialog.staged_tree['columns'])
+        self.assertIn('cost_rule',dialog.staged_tree['columns'])
+        staged_values=dialog.staged_tree.item(str(self.employee),'values')
+        self.assertEqual(staged_values[2],'Grace')
+        self.assertIn('Automatic',staged_values[3])
+        self.assertIn('project site(s) where each employee actually worked',
+                      dialog.instructions_widget.cget('text'))
         with patch.object(app.messagebox,'showinfo'):
             dialog.save_draft()
         row,payload=self.db.load_workflow_draft(dialog.draft_id,'cash_advance_batch')

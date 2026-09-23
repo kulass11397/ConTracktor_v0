@@ -114,6 +114,37 @@ def money(value: int | None) -> str:
     return f"{(value or 0) / 100:,.2f}"
 
 
+def expense_ledger_amounts(row) -> dict:
+    """Return project-attributed cost figures for one expense-ledger row.
+
+    A payroll expense stores only the cash still payable after employee cash-
+    advance deductions.  The deduction is nevertheless labor cost for the
+    project where the employee worked.  Conversely, an advance that was
+    recovered through payroll is no longer a cost of its issuing project.
+    Reclassifying both sides for display keeps the company total unchanged
+    while showing the cost under the correct work project.
+    """
+    def value(key):
+        try:
+            return row[key]
+        except (KeyError, IndexError, TypeError):
+            return 0
+
+    physical_recovery = max(0, int(value("recovery_total") or 0))
+    salary_recovery = max(0, int(value("salary_recovery_total") or 0))
+    payroll_deduction = max(0, int(value("payroll_deduction_total") or 0))
+    recovered = physical_recovery + salary_recovery
+    cost = max(0, int(value("total_cents") or 0) - recovered) + payroll_deduction
+    settled = max(0, int(value("payment_total") or 0) - recovered) + payroll_deduction
+    return {
+        "recovered_cents": recovered,
+        "payroll_deduction_cents": payroll_deduction,
+        "cost_cents": cost,
+        "settled_cents": settled,
+        "outstanding_cents": max(0, cost - settled),
+    }
+
+
 def local_timestamp(value: datetime | None = None) -> str:
     """Return a sortable Philippine-local timestamp for new audit records."""
     return (value or datetime.now()).replace(microsecond=0).isoformat(sep=" ")
@@ -9971,12 +10002,12 @@ class ProjectsTab(BaseTab):
             self.paid_value.config(text=money(paid))
             self.outstanding_value.config(text=money(outstanding))
             self.progress_value.config(text=f"{progress}%")
-            committed = sum(self.db.project_commitment_budget(pid)[1] for pid in project_ids)
+            committed = sum(self.db.project_cost_budget(pid)[1] for pid in project_ids)
             budget_remaining = sum(self.db.project_funding_budget(pid)[2] for pid in project_ids)
             receivable=sum(self.db.interproject_balance(pid)[0] for pid in project_ids)
             payable=sum(self.db.interproject_balance(pid)[1] for pid in project_ids)
             self.expense_reconciliation.config(
-                text=(f"Active expenses {money(committed)} | Own funds used {money(paid)} | Unpaid supplier bills {money(outstanding)} | "
+                text=(f"Construction cost {money(committed)} | Own funds used {money(paid)} | Unpaid supplier bills {money(outstanding)} | "
                       f"Funds after commitments {money(budget_remaining)} | Inter-project recoverable {money(receivable)}; owed {money(payable)}. "
                       'Borrowing and repayments do not create duplicate expenses.')
             )
@@ -13856,6 +13887,13 @@ class ExpensesTab(BaseTab):
                 JOIN cash_advance_transactions cat ON cat.advance_id=ca.id
                 WHERE ca.expense_id=e.id AND ca.voided=0 AND cat.voided=0 AND cat.posted=1
                   AND cat.txn_type IN ('Cash Repayment','Bank Repayment','Repayment')),0) recovery_total,
+            COALESCE((SELECT SUM(cat.amount_cents) FROM cash_advances ca
+                JOIN cash_advance_transactions cat ON cat.advance_id=ca.id
+                WHERE ca.expense_id=e.id AND ca.voided=0 AND cat.voided=0 AND cat.posted=1
+                  AND cat.txn_type='Salary Deduction'),0) salary_recovery_total,
+            COALESCE((SELECT pb.deduction_cents FROM payroll_batches pb
+                WHERE pb.expense_id=e.id AND pb.status='Committed'
+                ORDER BY pb.id DESC LIMIT 1),0) payroll_deduction_total,
             COALESCE((SELECT ca.id FROM cash_advances ca WHERE ca.expense_id=e.id AND ca.voided=0 LIMIT 1),0) cash_advance_id,
             COALESCE((SELECT GROUP_CONCAT(DISTINCT cs.reference) FROM payments px
                 JOIN cash_allocations cs ON cs.id=px.cash_allocation_id WHERE px.expense_id=e.id),
@@ -13894,13 +13932,18 @@ class ExpensesTab(BaseTab):
         self.funding_selector.set_options((label, label) for label in funding)
         self.tree.delete(*self.tree.get_children()); self.current_rows, project_ids = self.filtered_rows()
         total = 0; filtered_payments = 0; filtered_outstanding = 0; verified_total = 0
-        borrowing={}
+        borrowing={};ca_sources={}
         for loan in self.db.interproject_loans():
             borrowing[loan['expense_id']]=borrowing.get(loan['expense_id'],0)+loan['outstanding_cents']
+            if loan['kind']=='CA recovery':
+                ca_sources.setdefault(loan['expense_id'],set()).add(loan['lender'])
         for row in self.current_rows:
-            outstanding = max(0, row["total_cents"] - row["payment_total"])
-            net_total = max(0, row["total_cents"] - row["recovery_total"])
-            net_payments = max(0, row["payment_total"] - row["recovery_total"])
+            amounts=expense_ledger_amounts(row)
+            outstanding=amounts['outstanding_cents']
+            net_total=amounts['cost_cents']
+            net_payments=amounts['settled_cents']
+            recovered=amounts['recovered_cents']
+            payroll_deduction=amounts['payroll_deduction_cents']
             if not row["voided"]:
                 total += net_total
                 filtered_payments += net_payments
@@ -13908,31 +13951,38 @@ class ExpensesTab(BaseTab):
                 if (row["verification_status"] or "Unverified") == "Verified":
                     verified_total += net_total
             advance_status = ("Advance Settled" if net_total == 0 else
-                              "Advance Partial" if row["recovery_total"] else "Advance Outstanding")
+                              "Advance Partial" if recovered else "Advance Outstanding")
             display_status = ((row["workflow_status"] or "VOID") if row["voided"] else
                               f"Paid - {advance_status}" if row["cash_advance_id"] else
-                              "Paid" if outstanding <= 0 and row["total_cents"] > 0 else
-                              "Partially Paid" if row["payment_total"] > 0 else "Unpaid")
-            row_tag = "void" if row["voided"] else "paid" if outstanding <= 0 else "pending-partial" if row["payment_total"] else "unpaid"
+                              "Paid" if outstanding <= 0 and net_total > 0 else
+                              "Partially Paid" if net_payments > 0 else "Unpaid")
+            row_tag = "void" if row["voided"] else "paid" if outstanding <= 0 else "pending-partial" if net_payments else "unpaid"
             methods = [method.strip() for method in row["payment_methods"].split(",") if method.strip()]
+            if payroll_deduction and 'Salary Deduction' not in methods:methods.append('Salary Deduction')
             mop = " / ".join(methods) if methods else "Not Paid"
             payment_dates = (f"{row['latest_payment_date']} ({row['payment_count']}) â–¾"
-                             if row["payment_count"] else "No payments â–¾")
+                             if row["payment_count"] else
+                             "Salary deduction (non-cash) â–¾" if payroll_deduction else "No payments â–¾")
             allocation = row["allocation_references"] or (
                 "Legacy / Unlinked Cash" if any("cash" in method.lower() for method in methods) else "—"
             )
             withdrawal = row["withdrawal_references"] or "—"
+            item=row['item']+(f" | CA salary deductions attributed here: {money(payroll_deduction)}"
+                              if payroll_deduction else '')
+            funding_names=[p['name'] for p in self.db.all("""SELECT DISTINCT pr.name FROM projects pr
+                    JOIN payments p ON COALESCE(p.funding_project_id,?)=pr.id
+                    WHERE p.expense_id=? AND p.accounting_excluded=0""",(row['project_id'],row['id']))]
+            funding_names.extend(sorted(ca_sources.get(row['id'],set())))
+            funding_text=' / '.join(dict.fromkeys(funding_names)) or self.db.one(
+                'SELECT name FROM projects WHERE id=?',(row['funding_project_id'] or row['project_id'],))['name']
             self.tree.insert("", "end", iid=row["id"], values=(row["project"], row["batch_reference"], display_status,
                 row["verification_status"] or "Unverified", row["verification_reference"] or "—",
                 row["name"], mop, row["bank_transfer_references"] or "—", money(row["total_cents"]),
-                money(row["recovery_total"]), money(net_total), money(row["payment_total"]),
-                money(outstanding), payment_dates, allocation, withdrawal, row["item"],
+                money(recovered), money(net_total), money(net_payments),
+                money(outstanding), payment_dates, allocation, withdrawal, item,
                 row["supplier"], row["area"], row["phase"],
                 row["authorized_by"] or "Legacy / not recorded",
-                ' / '.join(p['name'] for p in self.db.all("""SELECT DISTINCT pr.name FROM projects pr
-                    JOIN payments p ON COALESCE(p.funding_project_id,?)=pr.id
-                    WHERE p.expense_id=? AND p.accounting_excluded=0""",(row['project_id'],row['id']))) or
-                self.db.one('SELECT name FROM projects WHERE id=?',(row['funding_project_id'] or row['project_id'],))['name'],
+                funding_text,
                 money(borrowing.get(row['id'],0))), tags=(row_tag,))
         self._display_lender_recoverables(project_ids)
         _withdrawn, _cash_spent, cash = self.db.cash_summary()
@@ -13954,7 +14004,7 @@ class ExpensesTab(BaseTab):
             self.db.one("SELECT contract_value_cents FROM projects WHERE id=?", (pid,))["contract_value_cents"]
             for pid in project_ids
         )
-        committed = sum(self.db.project_commitment_budget(pid)[1] for pid in project_ids)
+        committed = sum(self.db.project_cost_budget(pid)[1] for pid in project_ids)
         budget = sum(self.db.project_cost_budget(pid)[2] for pid in project_ids)
         collectible = contract - deposited
         self.deposit_value.config(text=money(deposited), fg="#2563EB")
@@ -14021,13 +14071,13 @@ class ExpensesTab(BaseTab):
             initialfile=f"expenses_{date.today():%Y%m%d}.pdf", defaultextension=".pdf",
             filetypes=[("PDF document", "*.pdf")])
         if not destination: return
-        total = sum(max(0,row["total_cents"]-row["recovery_total"]) for row in rows if not row["voided"])
+        ledger_amounts={row['id']:expense_ledger_amounts(row) for row in rows}
+        total = sum(ledger_amounts[row['id']]['cost_cents'] for row in rows if not row["voided"])
         _withdrawn, _cash_spent, cash = self.db.cash_summary()
         deposited = sum(self.db.project_budget(pid)[0] for pid in project_ids)
         contract = sum(self.db.one(
             "SELECT contract_value_cents FROM projects WHERE id=?", (pid,)
         )["contract_value_cents"] for pid in project_ids)
-        committed = sum(self.db.project_commitment_budget(pid)[1] for pid in project_ids)
         applied_filters = [
             ("Project", options['scope']),
             ("Status", self.status_selector.display_text()),
@@ -14042,10 +14092,10 @@ class ExpensesTab(BaseTab):
         ]
         financial_summary = [
             f"Filtered expenses {money(total)}",
-            f"Verified expenses {money(sum(max(0,row['total_cents']-row['recovery_total']) for row in rows if not row['voided'] and (row['verification_status'] or 'Unverified') == 'Verified'))}",
-            f"Payments recorded {money(sum(max(0,row['payment_total']-row['recovery_total']) for row in rows if not row['voided']))}",
-            f"Advance recoveries {money(sum(row['recovery_total'] for row in rows if not row['voided']))}",
-            f"Outstanding payments {money(sum(max(0, row['total_cents']-row['payment_total']) for row in rows if not row['voided']))}",
+            f"Verified expenses {money(sum(ledger_amounts[row['id']]['cost_cents'] for row in rows if not row['voided'] and (row['verification_status'] or 'Unverified') == 'Verified'))}",
+            f"Payments / non-cash deductions applied {money(sum(ledger_amounts[row['id']]['settled_cents'] for row in rows if not row['voided']))}",
+            f"Advance recoveries (cash, bank and salary deduction) {money(sum(ledger_amounts[row['id']]['recovered_cents'] for row in rows if not row['voided']))}",
+            f"Outstanding payments {money(sum(ledger_amounts[row['id']]['outstanding_cents'] for row in rows if not row['voided']))}",
             f"Cash on-hand {money(cash)}",
             f"Deposited {money(deposited)}",
             f"Cost budget remaining {money(sum(self.db.project_cost_budget(pid)[2] for pid in project_ids))}",
@@ -14061,23 +14111,26 @@ class ExpensesTab(BaseTab):
             "date": row["expense_date"],
             "verification": row["verification_status"] or "Unverified",
             "verification_ref": row["verification_reference"] or "-",
-            "expense": f"{row['name']} / {row['item']}",
-            "mop": " / ".join(
-                method.strip() for method in row["payment_methods"].split(",") if method.strip()
-            ) or "Not Paid",
+            "expense": (f"{row['name']} / {row['item']}"+
+                        (f" / CA salary deductions attributed here: {money(ledger_amounts[row['id']]['payroll_deduction_cents'])}"
+                         if ledger_amounts[row['id']]['payroll_deduction_cents'] else '')),
+            "mop": " / ".join([
+                *[method.strip() for method in row["payment_methods"].split(",") if method.strip()],
+                *(['Salary Deduction'] if ledger_amounts[row['id']]['payroll_deduction_cents'] else []),
+            ]) or "Not Paid",
             "bank_ref": row["bank_transfer_references"] or "-",
             "supplier": row["supplier"],
             "area": row["area"].title(),
             "total": money(row["total_cents"]),
-            "recovered": money(row["recovery_total"]),
-            "net": money(max(0,row["total_cents"]-row["recovery_total"])),
-            "paid": money(row["payment_total"]),
-            "outstanding": money(max(0, row["total_cents"] - row["payment_total"])),
+            "recovered": money(ledger_amounts[row['id']]['recovered_cents']),
+            "net": money(ledger_amounts[row['id']]['cost_cents']),
+            "paid": money(ledger_amounts[row['id']]['settled_cents']),
+            "outstanding": money(ledger_amounts[row['id']]['outstanding_cents']),
             "status": ("VOID" if row["voided"] else
-                       ("Paid - Advance Settled" if row["recovery_total"]>=row["total_cents"] else
-                        "Paid - Advance Partial" if row["recovery_total"] else "Paid - Advance Outstanding") if row["cash_advance_id"] else
-                       "Paid" if row["payment_total"] >= row["total_cents"] and row["total_cents"] > 0 else
-                       "Partially Paid" if row["payment_total"] > 0 else "Unpaid"),
+                       ("Paid - Advance Settled" if ledger_amounts[row['id']]['cost_cents']==0 else
+                        "Paid - Advance Partial" if ledger_amounts[row['id']]['recovered_cents'] else "Paid - Advance Outstanding") if row["cash_advance_id"] else
+                       "Paid" if ledger_amounts[row['id']]['outstanding_cents']==0 and ledger_amounts[row['id']]['cost_cents']>0 else
+                       "Partially Paid" if ledger_amounts[row['id']]['settled_cents']>0 else "Unpaid"),
             "allocation": row["allocation_references"] or "Legacy / Unlinked",
             "withdrawal": row["withdrawal_references"] or "—",
             "authorized": row["authorized_by"] or "Legacy / not recorded",
@@ -15252,8 +15305,11 @@ class CashAdvanceBatchDialog(tk.Toplevel):
             row=0, column=0, sticky="w")
         self.instructions_widget = ttk.Label(
             body,
-            text="All active MONCON employees are available. Choose the funding project and cash source; deductions follow each employee's earnings across work sites.",
+            text=("All active MONCON employees are available. The cash funding project supplies the money "
+                  "and temporarily holds the employee receivable. When salary is deducted, the cost is "
+                  "automatically attributed to the project site(s) where each employee actually worked."),
             style="Muted.TLabel",
+            wraplength=1080,
         )
         self.instructions_widget.grid(row=1, column=0, sticky="w", pady=(2, 10))
 
@@ -15295,10 +15351,14 @@ class CashAdvanceBatchDialog(tk.Toplevel):
             shared, textvariable=self.vars["bank"], values=list(banks), state="readonly")
         self.bank_widget.grid(row=1, column=3, sticky="ew")
         self.widgets["bank"] = self.bank_widget
-        ttk.Label(shared, text="Funding project * (expense accounting only)").grid(row=2,column=0,columnspan=2,sticky="w",pady=(6,0))
+        ttk.Label(shared, text="Cash funding project * (supplies money / holds receivable)").grid(row=2,column=0,columnspan=2,sticky="w",pady=(6,0))
         self.widgets['funding_project'] = ttk.Combobox(
             shared,textvariable=self.vars['funding_project'],values=list(self.funding_projects),state='readonly')
         self.widgets['funding_project'].grid(row=3,column=0,columnspan=2,sticky='ew',padx=(0,8))
+        ttk.Label(shared,
+            text=("Cost project rule: automatic by payroll work site. If an employee works on another "
+                  "project, the system creates the linked inter-project recoverable/payable trail."),
+            style="Muted.TLabel",wraplength=1040).grid(row=4,column=0,columnspan=4,sticky='w',pady=(7,0))
 
         self.entry_area = ttk.Panedwindow(body, orient="horizontal")
         self.entry_area.grid(row=3, column=0, sticky="nsew", pady=(10, 8))
@@ -15361,6 +15421,7 @@ class CashAdvanceBatchDialog(tk.Toplevel):
         self.total_label = ttk.Label(staged_bar, text="Entries: 0 | Batch total: 0.00", style="Section.TLabel")
         self.total_label.pack(side="right")
         columns = (("employee", "Employee", 190), ("number", "Employee No.", 110),
+                   ("funder", "Cash Funder", 150), ("cost_rule", "Cost Project", 185),
                    ("date", "Effective Date", 105),
                    ("amount", "Amount", 100), ("plan", "Repayment", 125),
                    ("cap", "Weekly Limit", 100), ("reason", "Reason", 260))
@@ -15385,6 +15446,7 @@ class CashAdvanceBatchDialog(tk.Toplevel):
         self.vars["method"].trace_add("write", self.update_source_state)
         self.vars["repayment_plan"].trace_add("write", self.update_plan_state)
         self.vars["date"].trace_add("write", lambda *_args: self.refresh_staged())
+        self.vars["funding_project"].trace_add("write", lambda *_args: self.refresh_staged())
         self.staged_focus = False
         self.render_employees(); self.update_source_state(); self.update_plan_state()
         if allocations: self.vars["allocation"].set(next(iter(allocations)))
@@ -15578,13 +15640,16 @@ class CashAdvanceBatchDialog(tk.Toplevel):
     def refresh_staged(self):
         self.staged_tree.delete(*self.staged_tree.get_children())
         total = 0
+        funding_label=self.vars['funding_project'].get()
+        funding_name=funding_label.rsplit(' [#',1)[0] if funding_label else 'Select cash funder'
         for key, row in self.staged.items():
             total += row["amount_cents"]
             self.staged_tree.insert("", "end", iid=key, values=(
-                row["employee"], row["employee_no"], self.vars["date"].get(), money(row["amount_cents"]),
+                row["employee"], row["employee_no"], funding_name,
+                "Automatic from payroll work site(s)", self.vars["date"].get(), money(row["amount_cents"]),
                 row["repayment_plan"], money(row["weekly_cap_cents"]) if row["weekly_cap_cents"] else "No limit",
                 row["reason"]))
-        self.total_label.config(text=f"Entries: {len(self.staged)} | Batch total: {money(total)}")
+        self.total_label.config(text=f"Cash funder: {funding_name} | Entries: {len(self.staged)} | Batch total: {money(total)}")
 
     def save(self):
         if not self.staged:
@@ -15597,7 +15662,7 @@ class CashAdvanceBatchDialog(tk.Toplevel):
             valid_date(self.vars["date"].get(), True)
             if self.vars['funding_project'].get() not in self.funding_projects:
                 flash_required_widgets(self,[self.widgets['funding_project']])
-                raise ValueError('Select an active funding project for the advance expenses.')
+                raise ValueError('Select the project supplying the cash and holding the employee receivable.')
         except ValueError as exc:
             flash_required_widgets(self, [self.widgets["date"]])
             messagebox.showerror(APP_TITLE, str(exc), parent=self); return
@@ -16124,7 +16189,10 @@ class PayrollTab(BaseTab):
         pane=ttk.Panedwindow(advance_page,orient="vertical"); pane.pack(fill="both",expand=True)
         advances_frame=ttk.Frame(pane); transactions_frame=ttk.Frame(pane); pane.add(advances_frame,weight=1); pane.add(transactions_frame,weight=1)
         ttk.Label(advances_frame,text="Employee advances",style="Section.TLabel").pack(anchor="w")
-        self.advances=make_tree(advances_frame,[("date","Date",90),("batch","Batch Ref.",145),("reference","Advance Ref.",135),("employee","Employee",150),("project","Issuing Project",145),("original","Original",90),("recovered","Recovered",90),("net","Net Amount",90),("mop","Funding Source",110),("plan","Repayment Plan",120),("status","Recovery Status",120),("reason","Reason",180)])
+        ttk.Label(advances_frame,
+                  text="Project filters include advances funded by that project and advances recovered through its payroll. Cost Project(s) follows the employees' actual work sites.",
+                  style="Muted.TLabel").pack(anchor="w",pady=(0,3))
+        self.advances=make_tree(advances_frame,[("date","Date",90),("batch","Batch Ref.",145),("reference","Advance Ref.",135),("employee","Employee",150),("project","Cash Funder",145),("cost_projects","Cost Project(s)",170),("original","Original",90),("recovered","Recovered",90),("net","Net Amount",90),("mop","Funding Source",110),("plan","Repayment Plan",120),("status","Recovery Status",120),("reason","Reason",180)])
         ttk.Label(transactions_frame,text="Every advance and recovery transaction",style="Section.TLabel").pack(anchor="w",pady=(5,0))
         self.advance_transactions=make_tree(transactions_frame,[("date","Date",90),("employee","Employee",140),("type","Transaction",125),("amount","Amount",90),("mop","MOP",100),("reference","Reference",115),("head","Authorized by",115),("balance","Balance after",95)])
         self.employees.bind("<Double-1>",self.open_employee_profile)
@@ -16681,7 +16749,7 @@ class PayrollTab(BaseTab):
                 if allocation["allocation_type"]=="Direct Procurement" and not messagebox.askyesno(APP_TITLE,
                     f"Use Direct Procurement {allocation['reference']} for an employee cash advance?\n\n"
                     "This remains fully traceable, but petty cash is normally the clearer source.",parent=self):return
-            _dep,_committed,remaining=self.db.project_commitment_budget(self.project_id)
+            _dep,_committed,remaining=self.db.project_cost_budget(self.project_id)
             if amount>remaining: raise ValueError(f"Advance exceeds the project's uncommitted budget of {money(remaining)}.")
             weekly_cap=0
             if data["repayment_plan"]=="Salary Deduction" and data["weekly_cap"]:
@@ -16763,10 +16831,10 @@ class PayrollTab(BaseTab):
                 ):
                     self.after(0, lambda payload=data: self.grant_cash_advance_batch(payload))
                     return
-            _deposited, _committed, remaining = self.db.project_commitment_budget(funding_project_id)
+            _contract, _committed, remaining = self.db.project_cost_budget(funding_project_id)
             if total > remaining:
                 raise ValueError(
-                    f"Batch exceeds the project's uncommitted budget of {money(remaining)}.")
+                    f"Batch exceeds the cash funder's remaining cost budget of {money(remaining)}.")
             source_name = data["bank"] if is_bank else allocation["reference"]
             funding_name = self.db.one('SELECT name FROM projects WHERE id=?',(funding_project_id,))['name']
             employee_preview = ", ".join(row["employee"] for row in data["entries"][:5])
@@ -16774,13 +16842,13 @@ class PayrollTab(BaseTab):
             if is_bank:
                 head = self.app.authorize_for_project(funding_project_id,
                     "Grant batch employee cash advances",
-                    f"{len(data['entries'])} employees; {money(total)} via {source_name}; funding {funding_name}; "
-                    f"effective {advance_date}. {employee_preview}")
+                    f"{len(data['entries'])} employees; {money(total)} via {source_name}; cash funder {funding_name}; "
+                    f"cost project(s) will follow payroll work sites; effective {advance_date}. {employee_preview}")
             else:
                 head = self.app.authorize_registered_head(
                     "Release batch employee cash advances",
-                    f"{len(data['entries'])} employees; {money(total)} from {source_name}; funding {funding_name}; "
-                    f"effective {advance_date}. {employee_preview}",
+                    f"{len(data['entries'])} employees; {money(total)} from {source_name}; cash funder {funding_name}; "
+                    f"cost project(s) will follow payroll work sites; effective {advance_date}. {employee_preview}",
                     allocation["receiver_registry_id"] or None)
             if not head:
                 self.after(0, lambda payload=data: self.grant_cash_advance_batch(payload))
@@ -16869,12 +16937,15 @@ class PayrollTab(BaseTab):
                        VALUES(?,'CASH_ADVANCE_BATCH_GRANTED',?,?)""",
                     (funding_project_id,
                      f"{batch_ref}: {len(data['entries'])} advances totaling {money(total)} "
-                     f"from {source_name}; authorized by {head['name']}", recorded_at),
+                     f"from {source_name}; cash funder {funding_name}; cost follows payroll work sites; "
+                     f"authorized by {head['name']}", recorded_at),
                 )
             self.db.commit_workflow_draft(data.get("draft_id"))
             messagebox.showinfo(
                 APP_TITLE,
                 f"Cash-advance batch {batch_ref} committed.\n\n"
+                f"Cash funder: {funding_name}\n"
+                f"Cost allocation: automatic from payroll work site(s)\n"
                 f"Employees: {len(data['entries'])}\nTotal: {money(total)}")
             self.app.refresh_all(); self.lists.select(5)
         except (ValueError, sqlite3.Error) as exc:
@@ -17064,8 +17135,17 @@ class PayrollTab(BaseTab):
         scope=self.ledger_project_id
         attendance_project_filter=" AND COALESCE(a.project_id,e.project_id)=?" if scope else ""
         batch_project_filter=" AND b.project_id=?" if scope else ""
-        advance_project_filter=" AND a.project_id=?" if scope else ""
+        advance_project_filter=""" AND (a.project_id=? OR EXISTS(
+            SELECT 1 FROM cash_advance_transactions attributed_txn
+            JOIN payroll_batches attributed_batch
+              ON attributed_batch.id=attributed_txn.payroll_batch_id
+            WHERE attributed_txn.advance_id=a.id
+              AND attributed_txn.txn_type='Salary Deduction'
+              AND attributed_txn.posted=1 AND attributed_txn.voided=0
+              AND attributed_batch.status='Committed'
+              AND attributed_batch.project_id=?))""" if scope else ""
         employee_params=(scope,) if scope else ()
+        advance_params=(scope,scope) if scope else ()
         if scope:
             employees=self.db.all("""SELECT e.*,p.name project_name,
                 assignment.position deployment_position,
@@ -17140,20 +17220,29 @@ class PayrollTab(BaseTab):
             WHERE 1=1{batch_project_filter} GROUP BY b.id ORDER BY b.created_at DESC,b.id DESC""",employee_params)
         for b in batches:self.batches.insert("","end",iid=b["id"],values=(b["batch_ref"],b['work_project_name'],b["period_start"],b["period_end"],b["attendance_count"],money(b["gross_cents"]),money(b["deduction_cents"]),money(b["adjustment_cents"]),money(b["net_cents"]),b["status"],b["replacement_ref"] or "—",b["head"],b["created_at"]))
         advances=self.db.all(f"""SELECT a.*,e.name employee,p.name issuing_project,COALESCE(b.batch_ref,'Individual') batch_ref,
-            COALESCE((SELECT SUM(t.amount_cents) FROM cash_advance_transactions t WHERE t.advance_id=a.id AND t.posted=1 AND t.voided=0 AND t.txn_type<>'Advance'),0) recovered
+            COALESCE((SELECT SUM(t.amount_cents) FROM cash_advance_transactions t WHERE t.advance_id=a.id AND t.posted=1 AND t.voided=0 AND t.txn_type<>'Advance'),0) recovered,
+            COALESCE((SELECT GROUP_CONCAT(DISTINCT work.name)
+                      FROM cash_advance_transactions salary_txn
+                      JOIN payroll_batches salary_batch ON salary_batch.id=salary_txn.payroll_batch_id
+                      JOIN projects work ON work.id=salary_batch.project_id
+                      WHERE salary_txn.advance_id=a.id
+                        AND salary_txn.txn_type='Salary Deduction'
+                        AND salary_txn.posted=1 AND salary_txn.voided=0
+                        AND salary_batch.status='Committed'),'') cost_projects
             FROM cash_advances a JOIN employees e ON e.id=a.employee_id
             JOIN projects p ON p.id=a.project_id
             LEFT JOIN cash_advance_batches b ON b.id=a.batch_id
-            WHERE a.voided=0{advance_project_filter} ORDER BY a.advance_date DESC,a.id DESC""",employee_params)
+            WHERE a.voided=0{advance_project_filter} ORDER BY a.advance_date DESC,a.id DESC""",advance_params)
         advanced=recovered_total=0
         for a in advances:
             net=max(0,a["original_cents"]-a["recovered"]); status="Settled" if net==0 else "Partially Recovered" if a["recovered"] else "Outstanding"; advanced+=a["original_cents"];recovered_total+=a["recovered"]
             self.advances.insert("","end",iid=a["id"],values=(a["advance_date"],a["batch_ref"],
                 a["system_reference"] or f"CA-LEGACY-{a['id']:06d}",a["employee"],
-                a['issuing_project'],
+                a['issuing_project'],(a["cost_projects"].replace(","," / ")
+                    if a["cost_projects"] else "Pending payroll attribution"),
                 money(a["original_cents"]),money(a["recovered"]),money(net),a["method"],
                 a["repayment_plan"],status,a["reason"]))
-        txns=self.db.all(f"""SELECT t.*,a.original_cents,e.name employee,COALESCE(h.name,'Legacy / not recorded') head FROM cash_advance_transactions t JOIN cash_advances a ON a.id=t.advance_id JOIN employees e ON e.id=a.employee_id LEFT JOIN project_heads h ON h.id=t.authorized_by_head_id WHERE a.voided=0 AND t.voided=0{advance_project_filter} ORDER BY t.txn_date,t.id""",employee_params);balances={}
+        txns=self.db.all(f"""SELECT t.*,a.original_cents,e.name employee,COALESCE(h.name,'Legacy / not recorded') head FROM cash_advance_transactions t JOIN cash_advances a ON a.id=t.advance_id JOIN employees e ON e.id=a.employee_id LEFT JOIN project_heads h ON h.id=t.authorized_by_head_id WHERE a.voided=0 AND t.voided=0{advance_project_filter} ORDER BY t.txn_date,t.id""",advance_params);balances={}
         for t in txns:
             balances.setdefault(t["advance_id"],0);balances[t["advance_id"]]+=t["amount_cents"] if t["txn_type"]=="Advance" else (-t["amount_cents"] if t["posted"] else 0)
             self.advance_transactions.insert("","end",iid=t["id"],values=(t["txn_date"],t["employee"],t["txn_type"]+(" (Pending)" if not t["posted"] else ""),money(t["amount_cents"]),t["method"],t["reference"],t["head"],money(max(0,balances[t["advance_id"]]))))
