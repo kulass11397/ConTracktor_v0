@@ -4452,6 +4452,77 @@ class Database:
                 result.append(row)
         return result
 
+    def payroll_ca_attributions(self, project_ids=None):
+        """Return posted CA deductions as project-cost detail rows.
+
+        The cash advance remains owned by its original funding project.  Its
+        posted salary deduction is attributed to the committed payroll project
+        where the employee earned the salary.  These rows are an audit detail
+        of payroll cost, not additional expenses.
+        """
+        project_ids = list(project_ids or [])
+        project_clause = ""
+        params = []
+        if project_ids:
+            project_clause = f" AND pb.project_id IN ({','.join('?' for _ in project_ids)})"
+            params.extend(project_ids)
+        return self.all(f"""SELECT t.id transaction_id,t.txn_date,t.amount_cents,
+            t.reference transaction_reference,t.notes transaction_notes,
+            ca.id advance_id,ca.system_reference advance_reference,
+            ca.expense_id original_expense_id,ca.original_cents,
+            employee.id employee_id,employee.employee_no,employee.name employee,
+            funder.id funding_project_id,funder.name cash_funder,
+            work.id cost_project_id,work.name cost_project,
+            pb.id payroll_batch_id,pb.batch_ref,pb.period_start,pb.period_end,
+            pb.expense_id payroll_expense_id,
+            payroll_expense.verification_status,
+            COALESCE((SELECT verification_batch.reference
+                FROM expense_verification_items verification_item
+                JOIN expense_verification_batches verification_batch
+                  ON verification_batch.id=verification_item.batch_id
+                WHERE verification_item.expense_id=payroll_expense.id
+                ORDER BY verification_batch.id DESC LIMIT 1),'') verification_reference,
+            payroll_expense.area,payroll_expense.supplier,
+            COALESCE(phase.name,'') phase,
+            COALESCE(head.name,'System payroll') authorized_by,
+            COALESCE(share.id,0) share_id,
+            COALESCE(loan.id,0) loan_id,COALESCE(loan.reference,'') loan_reference,
+            COALESCE(loan.amount_cents,0) loan_amount_cents,
+            MAX(0,COALESCE(loan.amount_cents,0)-COALESCE((
+                SELECT SUM(repayment.amount_cents) FROM project_funding_repayments repayment
+                WHERE repayment.loan_id=loan.id AND repayment.voided=0),0)) project_debt_cents,
+            COALESCE((SELECT GROUP_CONCAT(DISTINCT allocation.reference)
+                FROM payments advance_payment
+                JOIN cash_allocations allocation ON allocation.id=advance_payment.cash_allocation_id
+                WHERE advance_payment.expense_id=ca.expense_id
+                  AND advance_payment.accounting_excluded=0),'') allocation_references,
+            COALESCE((SELECT GROUP_CONCAT(DISTINCT COALESCE(NULLIF(withdrawal.system_reference,''),
+                    'WD-' || PRINTF('%04d',withdrawal.id)))
+                FROM payments advance_payment
+                JOIN cash_allocation_sources source
+                  ON source.allocation_id=advance_payment.cash_allocation_id
+                JOIN remittances withdrawal ON withdrawal.id=source.withdrawal_id
+                WHERE advance_payment.expense_id=ca.expense_id
+                  AND advance_payment.accounting_excluded=0),'') withdrawal_references
+            FROM cash_advance_transactions t
+            JOIN cash_advances ca ON ca.id=t.advance_id
+            JOIN employees employee ON employee.id=ca.employee_id
+            JOIN projects funder ON funder.id=ca.project_id
+            JOIN payroll_batches pb ON pb.id=t.payroll_batch_id
+            JOIN projects work ON work.id=pb.project_id
+            JOIN expenses payroll_expense ON payroll_expense.id=pb.expense_id
+            LEFT JOIN phases phase ON phase.id=payroll_expense.phase_id
+            LEFT JOIN project_heads head ON head.id=t.authorized_by_head_id
+            LEFT JOIN payroll_week_ca_shares share
+              ON share.schedule_id=t.id AND share.advance_id=t.advance_id
+             AND share.payroll_batch_id=t.payroll_batch_id
+            LEFT JOIN project_funding_loans loan
+              ON loan.kind='CA recovery' AND loan.ca_share_id=share.id
+            WHERE t.txn_type='Salary Deduction' AND t.posted=1 AND t.voided=0
+              AND ca.voided=0 AND pb.status='Committed' AND payroll_expense.voided=0
+              {project_clause}
+            ORDER BY t.txn_date DESC,pb.id DESC,employee.name COLLATE NOCASE,t.id""",tuple(params))
+
     def interproject_balance(self, project_id):
         rows = self.interproject_loans(project_id)
         return (sum(r['outstanding_cents'] for r in rows if r['lender_project_id']==project_id),
@@ -12155,10 +12226,12 @@ class ExpensesTab(BaseTab):
         self.tree.tag_configure("pending", background="#FFF7ED", foreground="#9A3412")
         self.tree.tag_configure("pending-partial", background="#FFF7ED", foreground="#9A3412")
         self.tree.tag_configure("void", background="#F3F4F6", foreground="#6B7280")
+        self.tree.tag_configure("ca-detail", background="#EFF6FF", foreground="#1E3A8A")
         self.tree.bind("<ButtonRelease-1>", self._ledger_click, add="+")
         self.tree.bind("<Double-1>", self._ledger_double_click, add="+")
         self.tree.full_ledger_callback = self._ledger_size_changed
         self.current_rows = []
+        self.ca_attribution_rows = {}
         self._build_cash_allocation_tab()
 
     def _build_cash_allocation_tab(self):
@@ -12775,6 +12848,10 @@ class ExpensesTab(BaseTab):
         if not (event.state & 0x0004):
             self.tree.selection_set(item)
         self.tree.focus(item)
+        if item.startswith("ca-detail-"):
+            if self._clicked_column(event) == "date":
+                self.after_idle(lambda row_id=item: self.show_ca_attribution(row_id))
+            return
         if self._clicked_column(event) == "date":
             self.after_idle(lambda expense_id=int(item): self.show_payment_history(expense_id))
 
@@ -12783,6 +12860,8 @@ class ExpensesTab(BaseTab):
         if not item or self._clicked_column(event) == "date":
             return
         self.tree.selection_set(item); self.tree.focus(item)
+        if item.startswith("ca-detail-"):
+            self.after_idle(lambda row_id=item: self.show_ca_attribution(row_id));return
         self.after_idle(lambda expense_id=int(item): self.show_expense_details(expense_id))
 
     def _ledger_size_changed(self):
@@ -12812,13 +12891,69 @@ class ExpensesTab(BaseTab):
             self.loan_tree.selection_set(str(loan_id));self.loan_tree.see(str(loan_id))
             self.refresh_project_repayments()
 
+    def show_ca_attribution(self,row_id):
+        row=self.ca_attribution_rows.get(str(row_id))
+        if not row:return
+        loan=(f"{row['loan_reference']} — {money(row['project_debt_cents'])} outstanding"
+              if row['loan_reference'] else "Not required; cash funder and cost project are the same")
+        messagebox.showinfo(APP_TITLE,
+            "Cash-advance salary deduction attributed to payroll\n\n"
+            f"Employee: {row['employee']} [{row['employee_no']}]\n"
+            f"Advance: {row['advance_reference'] or 'Legacy advance #'+str(row['advance_id'])}\n"
+            f"Posted deduction: {money(row['amount_cents'])}\n"
+            f"Cash funder: {row['cash_funder']}\n"
+            f"Cost project: {row['cost_project']}\n"
+            f"Payroll: {row['batch_ref']} ({row['period_start']} to {row['period_end']})\n"
+            f"CA transaction: #{row['transaction_id']} dated {row['txn_date']}\n"
+            f"Inter-project recovery: {loan}\n\n"
+            "This amount is already included in the payroll row's gross project cost. "
+            "The blue ledger line is audit detail and is excluded from duplicate totals.",parent=self)
+
     def selected_id(self,tree):
         selected=tree.selection()
-        if tree is self.tree and selected and int(selected[0])<0:
-            self.show_project_loan(-int(selected[0]))
-            messagebox.showinfo(APP_TITLE,'This is a linked recoverable funding record, not a second supplier expense. Manage its repayment here; edit the original expense in the borrower project.',parent=self)
-            return None
+        if tree is self.tree and selected:
+            row_id=str(selected[0])
+            if row_id.startswith('ca-detail-'):
+                self.show_ca_attribution(row_id);return None
+            if int(row_id)<0:
+                self.show_project_loan(-int(row_id))
+                messagebox.showinfo(APP_TITLE,'This is a linked recoverable funding record, not a second supplier expense. Manage its repayment here; edit the original expense in the borrower project.',parent=self)
+                return None
         return super().selected_id(tree)
+
+    def _display_ca_attributions(self,project_ids):
+        """Show every posted CA payroll share without adding a second expense."""
+        self.ca_attribution_rows={}
+        if 'Paid' not in self.status_selector.selected():return 0,0
+        if 'Other' not in self.mop_selector.selected():return 0,0
+        if len(self.funding_selector.selected())!=len(self.funding_selector.options):return 0,0
+        count=total=0
+        for source in self.db.payroll_ca_attributions(project_ids):
+            row=dict(source)
+            verification=row['verification_status'] or 'Unverified'
+            if verification not in self.verification_selector.selected():continue
+            if self.date_from_filter.get() and row['txn_date']<self.date_from_filter.get():continue
+            if self.date_to_filter.get() and row['txn_date']>self.date_to_filter.get():continue
+            if len(self.area_selector.selected())!=len(self.area_selector.options) and row['area'] not in self.area_selector.selected():continue
+            if len(self.supplier_selector.selected())!=len(self.supplier_selector.options) and row['supplier'] not in self.supplier_selector.selected():continue
+            searchable=(f"{row['transaction_id']} {row['advance_reference']} {row['employee']} "
+                        f"{row['employee_no']} {row['cash_funder']} {row['cost_project']} "
+                        f"{row['batch_ref']} {row['loan_reference']} {row['amount_cents']} "
+                        f"{money(row['amount_cents'])}").casefold().replace(',','')
+            if any(term not in searchable for term in self.filter_var.get().casefold().replace(',','').split()):continue
+            row_id=f"ca-detail-{row['transaction_id']}"
+            self.ca_attribution_rows[row_id]=row
+            reference=row['advance_reference'] or f"CA-LEGACY-{row['advance_id']:06d}"
+            self.tree.insert('','end',iid=row_id,values=(row['cost_project'],row['batch_ref'],
+                'Paid — CA detail',verification,row['verification_reference'] or 'Linked to payroll',
+                f"↳ CA deduction — {row['employee']}",'Salary Deduction','—','Detail only','—',
+                money(row['amount_cents']),'Included in payroll','0.00',row['txn_date'],
+                row['allocation_references'] or '—',row['withdrawal_references'] or '—',
+                f"{reference}; transaction #{row['transaction_id']}; already included in payroll gross cost",
+                row['employee'],row['area'],row['phase'],row['authorized_by'],row['cash_funder'],
+                money(row['project_debt_cents'])),tags=('ca-detail',))
+            count+=1;total+=row['amount_cents']
+        return count,total
 
     def _display_lender_recoverables(self,project_ids):
         # Virtual ledger rows cannot enter SQL expense/payment totals or be voided independently.
@@ -12899,7 +13034,10 @@ class ExpensesTab(BaseTab):
         self.loan_repayments=make_tree(self.funding_page,[('date','Date',105),('amount','Amount',100),('ref','Reference',180),('notes','Notes',260),('status','Status',100)])
 
     def pay_selected_weekly_payrolls(self):
-        ids=[int(i) for i in self.tree.selection()]
+        selected=[str(i) for i in self.tree.selection()]
+        if any(i.startswith('ca-detail-') for i in selected):
+            messagebox.showinfo(APP_TITLE,'CA deduction detail rows are already included in their payroll. Select the original payroll expense instead.',parent=self);return
+        ids=[int(i) for i in selected]
         if any(eid<0 for eid in ids):
             messagebox.showinfo(APP_TITLE,'Select the original payroll expenses, not recoverable funding mirror rows.',parent=self);return
         if not ids:
@@ -13187,7 +13325,10 @@ class ExpensesTab(BaseTab):
             messagebox.showerror(APP_TITLE, str(exc), parent=self)
 
     def verify_selected(self):
-        expense_ids = [int(value) for value in self.tree.selection() if int(value)>0]
+        selected=[str(value) for value in self.tree.selection()]
+        if any(value.startswith('ca-detail-') for value in selected):
+            messagebox.showinfo(APP_TITLE,'CA deduction detail rows inherit verification from their payroll. Select the original payroll expense instead.',parent=self);return
+        expense_ids = [int(value) for value in selected if int(value)>0]
         if not expense_ids:
             messagebox.showinfo(APP_TITLE, "Select one or more expenses to verify.", parent=self)
             return
@@ -13984,6 +14125,7 @@ class ExpensesTab(BaseTab):
                 row["authorized_by"] or "Legacy / not recorded",
                 funding_text,
                 money(borrowing.get(row['id'],0))), tags=(row_tag,))
+        ca_detail_count,ca_detail_total=self._display_ca_attributions(project_ids)
         self._display_lender_recoverables(project_ids)
         _withdrawn, _cash_spent, cash = self.db.cash_summary()
         self.total_value.config(text=money(total))
@@ -14022,7 +14164,8 @@ class ExpensesTab(BaseTab):
         self.reconciliation_label.config(
             text=(f"Cost budget remaining {money(budget)} | Available project funds {money(sum(self.db.project_budget(pid)[2] for pid in project_ids))} | "
                   f"Recoverable {money(sum(self.db.interproject_balance(pid)[0] for pid in project_ids))}; owed {money(sum(self.db.interproject_balance(pid)[1] for pid in project_ids))}. "
-                  f"{filter_note} Cash on-hand is shared; supplier payments and project repayments are separate.")
+                  f"{filter_note} CA detail lines: {ca_detail_count} posted deduction(s), {money(ca_detail_total)}, already included in payroll cost and excluded from duplicate totals. "
+                  "Cash on-hand is shared; supplier payments and project repayments are separate.")
         )
         self._refresh_head_cash_breakdown()
         self._refresh_cash_tab()

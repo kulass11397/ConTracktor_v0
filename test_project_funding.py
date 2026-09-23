@@ -176,6 +176,25 @@ class ProjectFundingTests(unittest.TestCase):
         self.assertEqual(costs[self.oasis],self.db.project_cost_budget(self.oasis)[1])
         self.assertEqual(costs[self.grace],self.db.project_cost_budget(self.grace)[1])
 
+    def test_payroll_ca_attributions_follow_each_work_project_without_duplicating_cost(self):
+        self.two_project_week()
+        self.db.commit_project_weekly_payrolls(dict(zip(self.projects[:2],self.heads[:2])),'2026-09-14')
+
+        oasis_rows=self.db.payroll_ca_attributions([self.oasis])
+        grace_rows=self.db.payroll_ca_attributions([self.grace])
+
+        self.assertEqual(sum(row['amount_cents'] for row in oasis_rows),60000)
+        self.assertEqual(sum(row['amount_cents'] for row in grace_rows),40000)
+        self.assertTrue(all(row['cost_project']=='Grace' for row in grace_rows))
+        self.assertTrue(all(row['cash_funder']=='Oasis' for row in grace_rows))
+        self.assertTrue(all(row['batch_ref'] for row in grace_rows))
+        self.assertTrue(all(row['transaction_id'] for row in grace_rows))
+
+        # The attribution rows are read-only detail.  They do not add a second
+        # expense to the project's already-correct gross payroll cost.
+        self.assertEqual(self.db.project_cost_budget(self.oasis)[1],300000)
+        self.assertEqual(self.db.project_cost_budget(self.grace)[1],200000)
+
     def test_expense_ledger_amounts_accepts_sqlite_row(self):
         row=self.db.one("""SELECT 10000 total_cents, 8000 payment_total,
             500 recovery_total, 1000 salary_recovery_total,

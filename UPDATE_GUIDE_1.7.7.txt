@@ -1,0 +1,19 @@
+ConTrackTor 1.7.7 - visible Project Grace CA audit trail
+
+1. Close ConTrackTor and every kiosk window before installing.
+2. Make a fresh database backup from the client computer.
+3. Download ConTracktor_v1_Update_1.7.7.exe from the v1.7.7 GitHub release.
+4. Run the updater under the SAME Windows user as the existing installation. Do not uninstall ConTrackTor and do not replace its database.
+5. The updater creates timestamped application and database safety backups before replacing application files.
+6. Reopen ConTrackTor. Go to Expenses, choose PROJECT GRACE, retain Paid / All Verification / All MOP / All Funding Sources, and choose All Dates if necessary.
+7. The payroll row remains PHP 20,300.00 gross project cost. Fourteen blue CA detail rows total PHP 5,583.31 and identify every employee deduction. These rows do not add to the totals a second time.
+8. Double-click a blue detail row to see its employee, original CA reference, Oasis cash-funding source, Grace payroll batch, and linked recovery record.
+
+The update reads the current live database. Records entered after the supplied backup are retained and eligible for the same automatic attribution. The installer contains no database and does not overwrite, import, or delete client transactions.
+
+Default app: %LOCALAPPDATA%\Programs\ConTracktor_v1
+Default data: %LOCALAPPDATA%\ConTracktor_v1\Data\contractor_tracker.db
+Data backups: %LOCALAPPDATA%\ConTracktor_v1\Data\Backups
+App backups: %LOCALAPPDATA%\ConTracktor_v1\AppBackups
+
+Security: this updater is unsigned. Do not disable Defender or add exclusions if it is flagged. Report the file to Microsoft instead: https://www.microsoft.com/en-us/wdsi/filesubmission
