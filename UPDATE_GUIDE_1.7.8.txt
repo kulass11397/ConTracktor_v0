@@ -1,0 +1,21 @@
+ConTrackTor 1.7.8 - Project Grace reconciliation and source-tracked repayments
+
+1. Close ConTrackTor and every kiosk window before installing.
+2. Make a fresh database backup from the client computer.
+3. Download ConTracktor_v1_Update_1.7.8.exe from the v1.7.8 GitHub release.
+4. Run the updater under the SAME Windows user as the existing installation. Do not uninstall ConTrackTor and do not replace its database.
+5. The updater creates timestamped application and database safety backups before replacing application files.
+6. On first start, the audited Grace correction runs once and creates its own timestamped database backup before changing reviewed rows.
+7. Confirm Project Grace has cash receipt CR-20260721-0001 for PHP 135,700 dated 2026-07-21. If that reference was already used by a newer record, the system safely chooses the next sequence.
+8. To settle the reviewed funding, open Expenses > Inter-project Funding, filter Project Grace, select the outstanding Oasis-to-Grace entries, choose Repay selected, and select the PHP 135,700 physical cash receipt as the source.
+9. Review the total before authorizing. The reviewed principal is PHP 125,804 and the receipt balance after full settlement is PHP 9,896.
+10. Weekly attendance projected totals appear inside the weekly grid. In Batch Cash Advances, the Stage Selected Employees action appears above the amount/reason fields.
+
+The update reads the current live database. Records entered after the supplied backup are retained and eligible for the same automatic attribution. The installer contains no database and does not overwrite, import, or delete client transactions.
+
+Default app: %LOCALAPPDATA%\Programs\ConTracktor_v1
+Default data: %LOCALAPPDATA%\ConTracktor_v1\Data\contractor_tracker.db
+Data backups: %LOCALAPPDATA%\ConTracktor_v1\Data\Backups
+App backups: %LOCALAPPDATA%\ConTracktor_v1\AppBackups
+
+Security: this updater is unsigned. Do not disable Defender or add exclusions if it is flagged. Report the file to Microsoft instead: https://www.microsoft.com/en-us/wdsi/filesubmission
