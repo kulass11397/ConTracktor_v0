@@ -1,0 +1,23 @@
+ConTrackTor 1.7.9 - Client reports, allocation visibility, and attendance corrections
+
+1. Close ConTrackTor and every kiosk window before installing.
+2. Make a fresh database backup from the client computer.
+3. Download ConTracktor_v1_Update_1.7.9.exe from the v1.7.9 GitHub release.
+4. Run the updater under the SAME Windows user as the existing installation. Do not uninstall ConTrackTor and do not replace its database.
+5. The updater creates timestamped application and database safety backups before replacing application files.
+6. To create a client report, open Expenses > Reports > Client summary + billing. Choose the date range, report title/address, whether staged payroll is included, management fee percentage, and reimbursement method.
+7. Use Outstanding inter-project funding when the selected expense rows are linked to still-unpaid project borrowings. Use Manual amount only for a reviewed billing amount, or None when no reimbursement should be billed. Generating the PDF does not post accounting entries.
+8. Open Expenses > Petty Cash & Direct Procurement. The top row now has separate dropdowns for active PC, active DP, and Project Grace receipts/deposits.
+9. On first start, the exact reviewed duplicate BD-20260923-0001 is marked void because no bank deposit occurred. CR-20260721-0001 remains active and keeps its inter-project repayment links. The voided BD remains visible in Remittances audit history.
+10. To correct a work site, open Payroll > Weekly Payroll, double-click the employee, select the attendance row, and choose Edit Selected Attendance. Select the correct Work site and review the correction.
+11. To remove a duplicate staged/reopened log, use Delete Duplicate Log and enter the required reason.
+12. If the log belongs to a committed payroll, reopen that payroll first. This restores its attendance to Weekly Payroll before editing or deletion.
+
+The update reads the current live database. Records entered after the supplied backup are retained. The guarded duplicate correction runs only when the exact Grace BD/CR references, dates, types, and PHP 135,700 amounts match. The installer contains no database.
+
+Default app: %LOCALAPPDATA%\Programs\ConTracktor_v1
+Default data: %LOCALAPPDATA%\ConTracktor_v1\Data\contractor_tracker.db
+Data backups: %LOCALAPPDATA%\ConTracktor_v1\Data\Backups
+App backups: %LOCALAPPDATA%\ConTracktor_v1\AppBackups
+
+Security: this updater is unsigned. Do not disable Defender or add exclusions if it is flagged. Report the file to Microsoft instead: https://www.microsoft.com/en-us/wdsi/filesubmission

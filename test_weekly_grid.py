@@ -49,7 +49,9 @@ class WeeklyGridTests(unittest.TestCase):
         bill=build_expense_billing_context(self.db,rows,context,'15','Client','Biller')
         self.assertEqual(bill['basis_cents'],12345)
         self.assertEqual(bill['fee_cents'],1852)
-        self.assertEqual(bill['overall_cents'],14197)
+        self.assertEqual(bill['reimbursement_cents'],0)
+        self.assertEqual(bill['amount_due_cents'],1852)
+        self.assertEqual(bill['overall_cents'],1852)
         self.assertEqual(sum(context['weekly']['2026-09-12 to 2026-09-18'].values()),12345)
         self.assertEqual(self.db.conn.total_changes,before)
 

@@ -1397,7 +1397,6 @@ class ContractorTrackerTests(unittest.TestCase):
                     self.result = {
                         "date": "2026-08-12", "method": "Bank Transfer",
                         "bank": bank_name, "allocation": "",
-                        "funding_project_id": project_id,
                         "entries": [
                             {"employee_id": employees[0]["id"], "employee": employees[0]["name"],
                              "amount_cents": 50000, "reason": "Wednesday advance",
@@ -1411,6 +1410,7 @@ class ContractorTrackerTests(unittest.TestCase):
             class FakeApp:
                 def __init__(self, selected_project_id):
                     self.project_id = selected_project_id
+                def authorize(self, *_args): return head
                 def authorize_for_project(self, *_args): return head
                 def refresh_all(self): pass
 
@@ -1615,6 +1615,79 @@ class ContractorTrackerTests(unittest.TestCase):
             self.assertEqual(db.salary_deduction_plan(employee_id, 60_000, "2026-08-09"), [])
             eligible = db.salary_deduction_plan(employee_id, 60_000, "2026-08-14")
             self.assertEqual(sum(item["amount_cents"] for item in eligible), 60_000)
+            db.close()
+
+    def test_weekly_grid_preview_shows_gross_ca_deduction_and_blank_zero_pay(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "weekly-grid-preview.db")
+            project_id = db.create_project({
+                "name": "Grid Preview", "client": "", "contract_value": "100000",
+                "start_date": "", "target_date": "", "notes": "",
+            })
+            salt, digest = hash_pin("1234")
+            employee_id = db.execute(
+                """INSERT INTO employees(project_id,employee_no,pin_salt,pin_hash,name,
+                   position,class,pay_basis,rate_cents,standard_hours)
+                   VALUES(?,?,?,?,?,'Worker','Labor','Daily',60000,'8')""",
+                (project_id, "MONCON-GRID", salt, digest, "Grid Worker"),
+            ).lastrowid
+            advance_id = db.execute(
+                """INSERT INTO cash_advances(project_id,employee_id,original_cents,
+                   advance_date,repayment_plan) VALUES(?,?,?,?,?)""",
+                (project_id, employee_id, 20_000, "2026-09-19", "Salary Deduction"),
+            ).lastrowid
+            db.execute(
+                """INSERT INTO cash_advance_transactions(advance_id,txn_type,
+                   amount_cents,txn_date,method,posted) VALUES(?,?,?,?,?,0)""",
+                (advance_id, "Salary Deduction", 20_000, "2026-09-19", "Salary Deduction"),
+            )
+            preview = db.preview_weekly_attendance_payroll("2026-09-19", {
+                (employee_id, "2026-09-19", project_id): {
+                    "state": "Present", "segments": [["08:00", "17:00"]],
+                },
+                (employee_id, "2026-09-20", project_id): {
+                    "state": "Absent", "segments": [],
+                },
+            })
+            self.assertEqual(preview["gross_cents"], 60_000)
+            self.assertEqual(preview["deduction_cents"], 20_000)
+            self.assertEqual(preview["net_cents"], 40_000)
+            self.assertEqual(preview["employee_count"], 1)
+            empty = db.preview_weekly_attendance_payroll("2026-09-19", {})
+            self.assertEqual(empty["gross_cents"], 0)
+            self.assertEqual(empty["deduction_cents"], 0)
+            self.assertEqual(empty["net_cents"], 0)
+            db.close()
+
+    def test_cash_receipt_and_client_paid_direct_do_not_create_fake_bank_or_cash_spend(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "direct-client-payment.db")
+            project_id = db.create_project({
+                "name": "Client Funded", "client": "Client", "contract_value": "100000",
+                "start_date": "", "target_date": "", "notes": "",
+            })
+            db.execute(
+                """INSERT INTO remittances(project_id,type,amount_cents,txn_date,purpose,
+                   cash_received,system_reference) VALUES(?,'Deposit',13570000,'2026-09-25',
+                   'Physical cash payment',1,'CR-20260925-TEST')""", (project_id,),
+            )
+            expense_id = db.execute(
+                """INSERT INTO expenses(project_id,name,item,total_cents,expense_date,status)
+                   VALUES(?,'Client materials','Direct purchase',3025600,'2026-09-16','Unpaid')""",
+                (project_id,),
+            ).lastrowid
+            payment_id = db.record_project_payment(
+                expense_id, 3025600, "2026-09-16", "Client Paid Direct", None,
+                funding_project_id=project_id,
+            )
+            payment = db.one("SELECT * FROM payments WHERE id=?", (payment_id,))
+            self.assertIsNone(payment["bank_account_id"])
+            self.assertIsNone(payment["cash_allocation_id"])
+            self.assertEqual(db.project_budget(project_id), (13570000, 0, 13570000))
+            self.assertEqual(db.cash_summary(project_id), (13570000, 0, 13570000))
+            self.assertIsNone(db.one(
+                "SELECT id FROM project_funding_loans WHERE payment_id=?", (payment_id,),
+            ))
             db.close()
 
     def test_v120_repair_removes_future_advance_from_older_payroll(self):
@@ -2059,6 +2132,115 @@ class ContractorTrackerTests(unittest.TestCase):
             self.assertNotIn(b"DAILY ATTENDANCE DETAILS", summary_payload)
             self.assertNotIn(b"2026-08-10", summary_payload)
             self.assertTrue(summary_payload.rstrip().endswith(b"%%EOF"))
+
+    def test_cash_overviews_and_attendance_site_correction_delete_are_live(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "overview-attendance.db")
+            oasis = db.create_project({
+                "name": "Project Oasis", "client": "Client", "contract_value": "100000",
+                "start_date": "2026-09-01", "target_date": "", "address": "Oasis", "notes": "",
+                "heads": [{"name": "Oasis Head", "position": "Manager", "pin": "0000"}],
+            })
+            grace = db.create_project({
+                "name": "Project Grace", "client": "Grace", "contract_value": "100000",
+                "start_date": "2026-09-01", "target_date": "", "address": "Grace", "notes": "",
+                "heads": [{"name": "Grace Head", "position": "Manager", "pin": "0000"}],
+            })
+            oasis_head = db.one("SELECT id FROM project_heads WHERE project_id=?", (oasis,))["id"]
+            grace_head = db.one("SELECT id FROM project_heads WHERE project_id=?", (grace,))["id"]
+            bank = db.execute("""INSERT INTO bank_accounts(bank_name,account_name,account_number)
+                VALUES('PBCom','Grace','1234')""").lastrowid
+            db.execute("""INSERT INTO remittances(project_id,type,amount_cents,txn_date,
+                system_reference,cash_received) VALUES(?,'Deposit',13570000,'2026-07-21','CR-TEST',1)""",
+                (grace,))
+            db.execute("""INSERT INTO remittances(project_id,type,amount_cents,txn_date,
+                system_reference,bank_account_id,cash_received)
+                VALUES(?,'Deposit',13570000,'2026-09-23','BD-TEST',?,0)""", (grace, bank))
+            withdrawal = db.execute("""INSERT INTO remittances(project_id,type,amount_cents,
+                txn_date,system_reference) VALUES(?,'Withdrawal',200000,'2026-09-20','WD-TEST')""",
+                (oasis,)).lastrowid
+            for reference, allocation_type in (("PC-TEST", "Petty Cash"),
+                                                ("DP-TEST", "Direct Procurement")):
+                allocation = db.execute("""INSERT INTO cash_allocations(reference,withdrawal_id,
+                    project_id,allocation_type,amount_cents,allocation_date,issuer_head_id,
+                    receiver_head_id) VALUES(?,?,?,?,100000,'2026-09-20',?,?)""",
+                    (reference, withdrawal, oasis, allocation_type, oasis_head, oasis_head)).lastrowid
+                db.execute("INSERT INTO cash_allocation_sources VALUES(?,?,100000)",
+                           (allocation, withdrawal))
+            self.assertEqual([r["reference"] for r in db.active_allocation_overview("Petty Cash")],
+                             ["PC-TEST"])
+            self.assertEqual([r["reference"] for r in db.active_allocation_overview("Direct Procurement")],
+                             ["DP-TEST"])
+            self.assertEqual({r["receipt_type"] for r in db.project_receipt_overview()},
+                             {"Physical Cash Receipt", "Bank Deposit"})
+
+            salt, digest = hash_pin("1111")
+            employee = db.execute("""INSERT INTO employees(project_id,employee_no,pin_salt,
+                pin_hash,name,position,class,pay_basis,rate_cents,daily_rate_cents,standard_hours)
+                VALUES(?,?,?,?,?,'Worker','Labor','Daily',80000,80000,'8')""",
+                (oasis, "MONCON-TEST", salt, digest, "Shared Worker")).lastrowid
+            attendance = db.execute("""INSERT INTO attendance(employee_id,project_id,clock_in,
+                clock_out,hours,lunch_hours,regular_hours,overtime_hours,regular_pay_cents,
+                overtime_pay_cents,gross_cents,pay_rate_cents,source)
+                VALUES(?,?,'2026-09-21T08:00:00','2026-09-21T17:00:00','8.00','1.00',
+                '8.00','0.00',80000,0,80000,80000,'Weekly Grid')""",
+                (employee, oasis)).lastrowid
+            db.close_attendance_day(oasis, "2026-09-21", oasis_head)
+            changed = db.revise_attendance(
+                attendance, app_module.datetime.fromisoformat("2026-09-21T08:00:00"),
+                app_module.datetime.fromisoformat("2026-09-21T17:00:00"),
+                "Wrong work site", grace_head, new_project_id=grace,
+            )
+            self.assertTrue(changed["project_changed"])
+            moved = db.one("SELECT project_id,closure_batch_id FROM attendance WHERE id=?",
+                           (attendance,))
+            self.assertEqual(moved["project_id"], grace)
+            self.assertEqual(db.one("SELECT project_id FROM attendance_closure_batches WHERE id=?",
+                                    (moved["closure_batch_id"],))["project_id"], grace)
+            revision = db.one("SELECT old_project_id,new_project_id FROM attendance_revisions")
+            self.assertEqual((revision["old_project_id"], revision["new_project_id"]),
+                             (oasis, grace))
+            deleted = db.delete_attendance_log(attendance, "Duplicate weekly-grid log", grace_head)
+            self.assertEqual(deleted["gross_cents"], 80000)
+            self.assertIsNone(db.one("SELECT id FROM attendance WHERE id=?", (attendance,)))
+            self.assertEqual(db.one("""SELECT COUNT(*) n FROM audit_log
+                WHERE action='ATTENDANCE_LOG_DELETED'""")["n"], 1)
+            db.close()
+
+    def test_exact_grace_duplicate_bank_deposit_is_audit_voided_once(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/"grace-duplicate.db"
+            db=Database(path)
+            grace=db.create_project({
+                "name":"Project Grace","client":"Grace","contract_value":"100000",
+                "start_date":"2026-07-01","target_date":"","address":"","notes":"",
+                "heads":[{"name":"Grace Head","position":"Manager","pin":"0000"}],
+            })
+            bank=db.execute("""INSERT INTO bank_accounts(bank_name,account_name,account_number)
+                VALUES('PBCom','Grace','1234')""").lastrowid
+            db.execute("""INSERT INTO remittances(project_id,type,amount_cents,txn_date,
+                system_reference,bank_account_id,cash_received)
+                VALUES(?,'Deposit',13570000,'2026-09-23','BD-20260923-0001',?,0)""",
+                (grace,bank))
+            db.execute("""INSERT INTO remittances(project_id,type,amount_cents,txn_date,
+                system_reference,cash_received)
+                VALUES(?,'Deposit',13570000,'2026-07-21','CR-20260721-0001',1)""",
+                (grace,))
+            db.close()
+            db=Database(path)
+            records=db.all("""SELECT system_reference,voided FROM remittances
+                WHERE system_reference IN ('BD-20260923-0001','CR-20260721-0001')
+                ORDER BY system_reference""")
+            self.assertEqual([(r['system_reference'],r['voided']) for r in records],
+                [('BD-20260923-0001',1),('CR-20260721-0001',0)])
+            self.assertEqual(db.project_budget(grace)[0],13570000)
+            self.assertEqual(db.one("""SELECT COUNT(*) n FROM audit_log
+                WHERE action='DUPLICATE_GRACE_BANK_DEPOSIT_VOIDED'""")["n"],1)
+            db.close()
+            db=Database(path)
+            self.assertEqual(db.one("""SELECT COUNT(*) n FROM audit_log
+                WHERE action='DUPLICATE_GRACE_BANK_DEPOSIT_VOIDED'""")["n"],1)
+            db.close()
 
 
 if __name__ == "__main__":

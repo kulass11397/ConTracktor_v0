@@ -1,7 +1,8 @@
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from app import build_expense_client_summary,write_expense_ledger_pdf
+from app import (build_expense_billing_context,build_expense_client_summary,
+                 build_uncommitted_payroll_context,write_expense_ledger_pdf)
 import test_project_funding as fixtures
 
 
@@ -123,6 +124,56 @@ class ExpenseSummaryTests(unittest.TestCase):
         with self.assertRaises(ValueError):self.context(date_from='2026-09-18',date_to='2026-09-15')
         with self.assertRaises(ValueError):self.context(metadata=dict(signatures=', '.join(str(i) for i in range(10))))
         with self.assertRaises(ValueError):write_expense_ledger_pdf(Path(self.folder.name)/'invalid.pdf',[],[],[],include_details=False)
+
+    def test_uncommitted_attendance_is_included_once_and_committed_payroll_is_not_duplicated(self):
+        self.attendance(self.oasis,100000,'2026-09-14')
+        staged=build_uncommitted_payroll_context(
+            self.db,[self.oasis],'2026-09-14','2026-09-20')
+        self.assertEqual(staged['gross_cents'],100000)
+        self.assertEqual(staged['attendance_entries'],1)
+        self.assertEqual(staged['employees'][0]['employee_name'],'Worker')
+        self.assertEqual(staged['daily'][0]['work_date'],'2026-09-14')
+        before=self.context([],date_from='2026-09-14',date_to='2026-09-20')
+        self.assertEqual(before['construction_cents'],100000)
+        self.assertIn('Uncommitted attendance included: 1',before['counts'])
+        self.commit(self.oasis)
+        after=self.context(date_from='2026-09-14',date_to='2026-09-20')
+        self.assertEqual(after['staged_payroll']['attendance_entries'],0)
+        self.assertEqual(dict(after['metrics'])['Labor - gross committed payroll / recorded labor'],100000)
+        self.assertEqual(after['construction_cents'],100000)
+
+    def test_billing_uses_only_outstanding_linked_project_funding(self):
+        expense_id=self.expense(self.grace,200000)
+        self.db.record_project_payment(expense_id,150000,'2026-09-14','Cash',
+            self.heads[0],self.oasis,self.allocation)
+        rows=[row for row in self.rows() if row['id']==expense_id]
+        context=build_expense_client_summary(
+            self.db,rows,[self.grace],metadata={'include_staged_payroll':'No'})
+        billing=build_expense_billing_context(
+            self.db,rows,context,'15','Grace Manabat','Kent Miguel Fajardo',
+            'Outstanding inter-project funding','')
+        self.assertEqual(billing['reimbursement_cents'],150000)
+        self.assertEqual(billing['fee_cents'],30000)
+        self.assertEqual(billing['amount_due_cents'],180000)
+        self.assertEqual(len(billing['reimbursement']),1)
+
+    def test_combined_billing_pdf_contains_one_amount_due_page(self):
+        self.expense(self.oasis,100000)
+        rows=self.rows()
+        context=self.context(rows,metadata=dict(
+            title='Manabat Residences - Two Storey Building',
+            address='Alapan 1A, Imus City, Cavite',include_staged_payroll='No'))
+        context['billing']=build_expense_billing_context(
+            self.db,rows,context,'15','Grace Manabat','Kent Miguel Fajardo',
+            'Manual amount','2000')
+        path=Path(self.folder.name)/'combined-billing.pdf'
+        write_expense_ledger_pdf(path,[],[],[],client_summary=context,include_details=False)
+        payload=path.read_bytes()
+        self.assertIn(b'BILLING STATEMENT - REIMBURSEMENT AND MANAGEMENT FEE',payload)
+        self.assertIn(b'CONSTRUCTION EXPENSE REIMBURSEMENT SUBTOTAL',payload)
+        self.assertIn(b'TOTAL AMOUNT DUE',payload)
+        self.assertNotIn(b'CONSTRUCTION EXPENSES BILLING',payload)
+        self.assertNotIn(b'MANAGEMENT FEE BILLING',payload)
 
 
 if __name__=='__main__':unittest.main()

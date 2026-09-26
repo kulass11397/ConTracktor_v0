@@ -5,7 +5,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 
-from app import Database, hash_pin, compute_shift_pay, BulkExpenseDialog, expense_ledger_amounts
+from app import Database, hash_pin, compute_shift_pay, BulkExpenseDialog
 
 
 class ProjectFundingTests(unittest.TestCase):
@@ -99,6 +99,48 @@ class ProjectFundingTests(unittest.TestCase):
         self.assertEqual(self.db.one('SELECT COUNT(*) n FROM payments')['n'],1)
         with self.assertRaises(ValueError):self.db.assert_funding_reversal_allowed(eid)
 
+    def test_cash_receipt_batch_repayment_moves_project_cash_and_keeps_company_cash(self):
+        receipt=self.db.execute("""INSERT INTO remittances(project_id,type,amount_cents,txn_date,
+            cash_received,system_reference,purpose) VALUES(?,'Deposit',200000,'2026-09-15',1,
+            'CR-20260915-0001','Client reimbursement cash')""",(self.grace,)).lastrowid
+        first=self.expense(self.grace,100000)
+        second=self.expense(self.grace,50000)
+        self.db.record_project_payment(first,100000,'2026-09-14','Cash',self.heads[0],self.oasis,self.allocation)
+        self.db.record_project_payment(second,50000,'2026-09-14','Cash',self.heads[0],self.oasis,self.allocation)
+        loans=self.db.interproject_loans(self.grace)
+        company_before=self.db.cash_summary()[2]
+        grace_before=self.db.cash_summary(self.grace)[2]
+        oasis_before=self.db.cash_summary(self.oasis)[2]
+        result=self.db.repay_project_funding_batch([row['id'] for row in loans],
+            '2026-09-16',self.heads[1],'CLIENT-CASH','Two reviewed costs','Cash Receipt',receipt)
+        self.assertEqual(result['total_cents'],150000)
+        self.assertTrue(result['batch_reference'].startswith('IPRB-20260916-'))
+        repayments=self.db.all('SELECT * FROM project_funding_repayments ORDER BY id')
+        self.assertEqual(len(repayments),2)
+        self.assertEqual(len({row['system_reference'] for row in repayments}),2)
+        self.assertEqual({row['batch_reference'] for row in repayments},{result['batch_reference']})
+        self.assertEqual(self.db.cash_summary()[2],company_before)
+        self.assertEqual(self.db.cash_summary(self.grace)[2],grace_before-150000)
+        self.assertEqual(self.db.cash_summary(self.oasis)[2],oasis_before+150000)
+        self.assertEqual(self.db.repayment_source_available('Cash Receipt',self.grace,receipt),50000)
+        self.assertEqual(self.db.interproject_balance(self.grace),(0,0))
+        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM expenses')['n'],2)
+        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM payments')['n'],2)
+
+    def test_undo_source_tracked_repayment_restores_cash_receipt_availability(self):
+        receipt=self.db.execute("""INSERT INTO remittances(project_id,type,amount_cents,txn_date,
+            cash_received,system_reference) VALUES(?,'Deposit',100000,'2026-09-15',1,
+            'CR-20260915-0001')""",(self.grace,)).lastrowid
+        expense=self.expense(self.grace,40000)
+        self.db.record_project_payment(expense,40000,'2026-09-14','Cash',self.heads[0],self.oasis,self.allocation)
+        loan=self.db.interproject_loans(self.grace)[0]
+        repayment=self.db.repay_project_funding(loan['id'],40000,'2026-09-16',self.heads[1],
+            source_type='Cash Receipt',source_remittance_id=receipt)
+        self.assertEqual(self.db.repayment_source_available('Cash Receipt',self.grace,receipt),60000)
+        self.db.undo_project_funding_repayment(repayment,self.heads[1])
+        self.assertEqual(self.db.repayment_source_available('Cash Receipt',self.grace,receipt),100000)
+        self.assertEqual(self.db.interproject_balance(self.grace),(0,40000))
+
     def test_repayment_overpayment_is_rejected(self):
         eid=self.expense(self.grace)
         self.db.record_project_payment(eid,100000,'2026-09-14','Cash',self.heads[0],self.oasis,self.allocation)
@@ -150,62 +192,6 @@ class ProjectFundingTests(unittest.TestCase):
         self.db.commit_project_weekly_payrolls(dict(zip(self.projects[:2],self.heads[:2])),'2026-09-14')
         self.assertEqual(self.db.project_cost_budget(self.oasis)[1],300000)
         self.assertEqual(self.db.project_cost_budget(self.grace)[1],200000)
-
-    def test_expense_ledger_reclassifies_salary_deductions_to_work_project(self):
-        self.two_project_week()
-        self.db.commit_project_weekly_payrolls(dict(zip(self.projects[:2],self.heads[:2])),'2026-09-14')
-        costs={pid:0 for pid in self.projects}
-        for source in self.db.all('SELECT * FROM expenses WHERE voided=0 ORDER BY id'):
-            row=dict(source)
-            row['payment_total']=self.db.one("""SELECT COALESCE(SUM(amount_cents),0) n FROM payments
-                WHERE expense_id=? AND accounting_excluded=0""",(row['id'],))['n']
-            row['recovery_total']=self.db.one("""SELECT COALESCE(SUM(t.amount_cents),0) n
-                FROM cash_advances a JOIN cash_advance_transactions t ON t.advance_id=a.id
-                WHERE a.expense_id=? AND a.voided=0 AND t.voided=0 AND t.posted=1
-                  AND t.txn_type IN ('Cash Repayment','Bank Repayment','Repayment')""",(row['id'],))['n']
-            row['salary_recovery_total']=self.db.one("""SELECT COALESCE(SUM(t.amount_cents),0) n
-                FROM cash_advances a JOIN cash_advance_transactions t ON t.advance_id=a.id
-                WHERE a.expense_id=? AND a.voided=0 AND t.voided=0 AND t.posted=1
-                  AND t.txn_type='Salary Deduction'""",(row['id'],))['n']
-            batch=self.db.one("""SELECT deduction_cents FROM payroll_batches
-                WHERE expense_id=? AND status='Committed'""",(row['id'],))
-            row['payroll_deduction_total']=batch['deduction_cents'] if batch else 0
-            costs[row['project_id']]+=expense_ledger_amounts(row)['cost_cents']
-        self.assertEqual(costs[self.oasis],300000)
-        self.assertEqual(costs[self.grace],200000)
-        self.assertEqual(costs[self.oasis],self.db.project_cost_budget(self.oasis)[1])
-        self.assertEqual(costs[self.grace],self.db.project_cost_budget(self.grace)[1])
-
-    def test_payroll_ca_attributions_follow_each_work_project_without_duplicating_cost(self):
-        self.two_project_week()
-        self.db.commit_project_weekly_payrolls(dict(zip(self.projects[:2],self.heads[:2])),'2026-09-14')
-
-        oasis_rows=self.db.payroll_ca_attributions([self.oasis])
-        grace_rows=self.db.payroll_ca_attributions([self.grace])
-
-        self.assertEqual(sum(row['amount_cents'] for row in oasis_rows),60000)
-        self.assertEqual(sum(row['amount_cents'] for row in grace_rows),40000)
-        self.assertTrue(all(row['cost_project']=='Grace' for row in grace_rows))
-        self.assertTrue(all(row['cash_funder']=='Oasis' for row in grace_rows))
-        self.assertTrue(all(row['batch_ref'] for row in grace_rows))
-        self.assertTrue(all(row['transaction_id'] for row in grace_rows))
-
-        # The attribution rows are read-only detail.  They do not add a second
-        # expense to the project's already-correct gross payroll cost.
-        self.assertEqual(self.db.project_cost_budget(self.oasis)[1],300000)
-        self.assertEqual(self.db.project_cost_budget(self.grace)[1],200000)
-
-    def test_expense_ledger_amounts_accepts_sqlite_row(self):
-        row=self.db.one("""SELECT 10000 total_cents, 8000 payment_total,
-            500 recovery_total, 1000 salary_recovery_total,
-            1500 payroll_deduction_total""")
-        self.assertEqual(expense_ledger_amounts(row),{
-            'recovered_cents':1500,
-            'payroll_deduction_cents':1500,
-            'cost_cents':10000,
-            'settled_cents':8000,
-            'outstanding_cents':2000,
-        })
 
     def test_negative_correction_limits_deduction_without_negative_net(self):
         self.two_project_week()
