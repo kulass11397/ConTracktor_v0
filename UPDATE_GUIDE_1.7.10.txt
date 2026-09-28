@@ -1,0 +1,29 @@
+ConTrackTor 1.7.10 - Attendance-log deletion correction
+
+INSTALLATION
+1. Close ConTrackTor and all kiosk windows.
+2. Make a fresh database backup from the client computer.
+3. Download ConTracktor_v1_Update_1.7.10.exe from the v1.7.10 GitHub release.
+4. Run the updater under the same Windows user as the existing installation.
+5. Do not uninstall ConTrackTor and do not replace or move its database.
+6. The updater creates timestamped application and database safety backups before replacing application files.
+
+DELETE AN INCORRECT ATTENDANCE LOG
+1. Open Payroll > Weekly Payroll and choose the required Saturday-Friday week.
+2. Double-click the employee to open Weekly Attendance Details.
+3. Select the incorrect attendance row.
+4. Click Delete Selected Log.
+5. Enter the correction reason.
+6. Review the employee, site, time range, gross-pay effect, and reason in the confirmation window.
+7. Click Confirm to delete, or Cancel to return without changing the log.
+
+If the row belongs to a committed payroll, reopen that payroll first. Reopening reverses its expense and linked payments safely and returns the attendance to the editable weekly ledger.
+
+The update reads the current live database. New records entered after earlier backups are retained. The installer contains no database.
+
+Default app: %LOCALAPPDATA%\Programs\ConTrackTor_v1
+Default data: %LOCALAPPDATA%\ConTrackTor_v1\Data\contractor_tracker.db
+Data backups: %LOCALAPPDATA%\ConTrackTor_v1\Data\Backups
+App backups: %LOCALAPPDATA%\ConTrackTor_v1\AppBackups
+
+Security: this updater is unsigned. Do not disable Defender or add exclusions if it is flagged. Submit the exact file to Microsoft for review instead.

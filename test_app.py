@@ -2200,11 +2200,37 @@ class ContractorTrackerTests(unittest.TestCase):
             revision = db.one("SELECT old_project_id,new_project_id FROM attendance_revisions")
             self.assertEqual((revision["old_project_id"], revision["new_project_id"]),
                              (oasis, grace))
-            deleted = db.delete_attendance_log(attendance, "Duplicate weekly-grid log", grace_head)
+            deleted = db.delete_attendance_log(attendance, "Incorrect attendance input", grace_head)
             self.assertEqual(deleted["gross_cents"], 80000)
             self.assertIsNone(db.one("SELECT id FROM attendance WHERE id=?", (attendance,)))
             self.assertEqual(db.one("""SELECT COUNT(*) n FROM audit_log
                 WHERE action='ATTENDANCE_LOG_DELETED'""")["n"], 1)
+            self.assertIn("Incorrect attendance input",db.one("""SELECT details FROM audit_log
+                WHERE action='ATTENDANCE_LOG_DELETED'""")["details"])
+            db.close()
+
+    def test_open_uncommitted_attendance_log_can_be_deleted_with_audit_history(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db=Database(Path(folder)/"delete-open-attendance.db")
+            project=db.create_project({
+                "name":"Correction Site","client":"Client","contract_value":"100000",
+                "start_date":"2026-09-01","target_date":"","address":"","notes":"",
+                "heads":[{"name":"Site Head","position":"Manager","pin":"0000"}],
+            })
+            head=db.one("SELECT id FROM project_heads WHERE project_id=?",(project,))["id"]
+            salt,digest=hash_pin("1111")
+            employee=db.execute("""INSERT INTO employees(project_id,employee_no,pin_salt,
+                pin_hash,name,rate_cents,daily_rate_cents)
+                VALUES(?,'MONCON-OPEN',?,?,'Open Log Worker',80000,80000)""",
+                (project,salt,digest)).lastrowid
+            attendance=db.execute("""INSERT INTO attendance(employee_id,project_id,clock_in,
+                source) VALUES(?,?,'2026-09-27T08:00:00','Kiosk')""",
+                (employee,project)).lastrowid
+            deleted=db.delete_attendance_log(attendance,"Accidental clock in",head)
+            self.assertEqual(deleted["gross_cents"],0)
+            self.assertIsNone(db.one("SELECT id FROM attendance WHERE id=?",(attendance,)))
+            audit=db.one("SELECT details FROM audit_log WHERE action='ATTENDANCE_LOG_DELETED'")
+            self.assertIn("Accidental clock in",audit["details"])
             db.close()
 
     def test_exact_grace_duplicate_bank_deposit_is_audit_voided_once(self):

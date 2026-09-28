@@ -7314,7 +7314,7 @@ class Database:
 
     def delete_attendance_log(self, attendance_id: int, reason: str,
                               authorized_by_head_id: int) -> dict:
-        """Remove an uncommitted duplicate while retaining a permanent audit entry."""
+        """Remove an uncommitted attendance log while retaining a permanent audit entry."""
         row = self.one(
             """SELECT a.*,e.name,e.employee_no,e.project_id current_project_id,
                       COALESCE(p.name,'') work_project_name
@@ -7323,8 +7323,8 @@ class Database:
                WHERE a.id=?""",
             (attendance_id,),
         )
-        if not row or not row["clock_out"]:
-            raise ValueError("Only completed attendance can be deleted.")
+        if not row:
+            raise ValueError("The selected attendance log no longer exists.")
         if row["payroll_batch_id"] or row["committed_expense_id"]:
             raise ValueError("Reopen the committed payroll before deleting this attendance log.")
         work_date = row["clock_in"][:10]
@@ -17097,10 +17097,10 @@ class WeeklyEmployeeDetailsDialog(tk.Toplevel):
             ("payroll","Payroll Batch",145),("revisions","Corrections",80)])
         self.tree.bind("<Double-1>",self.edit_selected)
         footer=ttk.Frame(body); footer.pack(fill="x",pady=(8,0))
-        ttk.Label(footer,text="Double-click to edit time, work site, rate, or pay. Delete is for duplicate uncommitted logs.",style="Muted.TLabel").pack(side="left")
+        ttk.Label(footer,text="Double-click to edit, or delete any incorrect uncommitted log. Reopen committed payroll first.",style="Muted.TLabel").pack(side="left")
         ttk.Button(footer,text="Close",command=self.destroy).pack(side="right")
         ttk.Button(footer,text="Edit Selected Attendance",style="Primary.TButton",command=self.edit_selected).pack(side="right",padx=8)
-        ttk.Button(footer,text="Delete Duplicate Log",command=self.delete_selected).pack(side="right")
+        ttk.Button(footer,text="Delete Selected Log",command=self.delete_selected).pack(side="right")
         self.refresh(); self.transient(parent); self.grab_set()
     def refresh(self):
         self.tree.delete(*self.tree.get_children())
@@ -17129,7 +17129,8 @@ class WeeklyEmployeeDetailsDialog(tk.Toplevel):
         if self.parent_tab.edit_attendance_id(int(selected[0])):self.refresh()
     def delete_selected(self):
         selected=self.tree.selection()
-        if not selected:return
+        if not selected:
+            messagebox.showinfo(APP_TITLE,"Select an attendance log to delete.",parent=self);return
         if self.parent_tab.delete_attendance_id(int(selected[0])):self.refresh()
 
 
@@ -17648,20 +17649,22 @@ class PayrollTab(BaseTab):
             messagebox.showinfo(APP_TITLE,
                 "This attendance is already part of a committed payroll. Reopen that payroll first; "
                 "then delete the returned staged log.",parent=self);return False
-        data=dialog(self,"Delete Duplicate Attendance Log",[("reason","Required deletion reason")],
-                    {"reason":"Duplicate attendance log"},required_keys=("reason",))
+        data=dialog(self,"Delete Attendance Log",[("reason","Required correction reason")],
+                    {"reason":"Incorrect attendance input"},required_keys=("reason",))
         if not data:return False
         project_id=attendance["project_id"] or attendance["current_project_id"]
+        end_time=attendance["clock_out"] or "OPEN / not clocked out"
         summary=(f"Delete attendance #{attendance_id} for {attendance['name']} "
-                 f"at {attendance['work_project_name']}, {attendance['clock_in']} to "
-                 f"{attendance['clock_out']}. Reason: {data['reason']}")
-        head=self.app.authorize_for_project(project_id,"Delete duplicate attendance",summary)
+                 f"[{attendance['employee_no']}] at {attendance['work_project_name']}, "
+                 f"{attendance['clock_in']} to {end_time}; remove {money(attendance['gross_cents'])} "
+                 f"from the current weekly payroll calculation. Reason: {data['reason']}")
+        head=self.app.authorize_for_project(project_id,"Delete attendance log",summary)
         if not head:return False
         try:
             self.db.delete_attendance_log(attendance_id,data["reason"],head["id"])
             messagebox.showinfo(APP_TITLE,
-                "The duplicate attendance log was deleted. Weekly payroll totals and the weekly grid "
-                "now use the remaining live attendance records.",parent=self)
+                "The attendance log was deleted. Weekly payroll totals and the weekly grid were "
+                "recalculated from the remaining attendance records.",parent=self)
             self.app.refresh_all();return True
         except (ValueError,sqlite3.Error) as exc:
             messagebox.showerror(APP_TITLE,str(exc),parent=self);return False
