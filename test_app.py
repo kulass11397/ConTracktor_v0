@@ -1320,6 +1320,41 @@ class ContractorTrackerTests(unittest.TestCase):
             self.assertNotIn("supplier", EXPENSE_IMPORT_REQUIRED_FIELDS)
             self.assertGreater(rows[0]["source_row"], 0)
 
+    def test_expense_import_form_explicitly_supports_multiple_projects(self):
+        with tempfile.TemporaryDirectory() as folder:
+            form_path = Path(folder) / "multi-project-expense-import.csv"
+            write_expense_import_form(form_path, "DRF-20260930-120000")
+            text = form_path.read_text(encoding="utf-8-sig")
+            self.assertIn("Each row may use a different expense project", text)
+            self.assertIn("separate auditable expense batch for each expense project", text)
+            self.assertNotIn("Use one project per form", text)
+
+    def test_expense_import_review_stages_rows_from_multiple_projects(self):
+        required_values = {
+            "item": "Cement", "dimensions": "N/A", "qty": "1", "unit_price": "100.00",
+            "phase": "Foundation", "area": "MATERIALS", "status": "Unpaid",
+            "payment_method": "Cash", "expense_date": "2026-09-30",
+        }
+        rows = [
+            {**required_values, "project": "PROJECT GRACE [#2]", "source_row": 7},
+            {**required_values, "project": "PROJECT OASIS [#1]", "source_row": 8},
+        ]
+
+        def build_item(source, staged):
+            project_id = 2 if "GRACE" in source["project"] else 1
+            return {
+                "project_id": project_id,
+                "project_name": source["project"].split(" [#", 1)[0],
+                "item": source["item"], "total_cents": 10000,
+            }
+
+        reviews, staged = app_module.BulkExpenseDialog._review_import_rows(
+            rows, {"draft_reference": "DRF-MULTI"}, "multi-project.xlsx", build_item,
+        )
+        self.assertEqual([item["project_id"] for item in staged], [2, 1])
+        self.assertEqual([item["import_source_row"] for item in staged], [7, 8])
+        self.assertTrue(all(review["item"] and not review["error"] for review in reviews))
+
     def test_excel_expense_form_contains_dropdowns_and_google_sheets_reference_lists(self):
         with tempfile.TemporaryDirectory() as folder:
             form_path = Path(folder) / "expense-import.xlsx"
@@ -1335,6 +1370,8 @@ class ContractorTrackerTests(unittest.TestCase):
                 workbook = archive.read("xl/workbook.xml").decode("utf-8")
                 references = archive.read("xl/worksheets/sheet2.xml").decode("utf-8")
             self.assertIn("dataValidations", sheet)
+            self.assertIn("Expense project and funding source may differ on every row", sheet)
+            self.assertNotIn("use one project per workbook", sheet)
             self.assertIn("CashAllocationOptions", sheet)
             self.assertNotIn("SupplierOptions", workbook)
             self.assertNotIn('sqref="D7:D506"', sheet)

@@ -1713,8 +1713,10 @@ def write_expense_import_form(path, draft_reference):
         writer.writerow(["Declared Batch Total (required)", ""])
         writer.writerow([
             "Instructions",
-            "Fill every * field. Use one project per form. Do not change header names. "
-            "The complete form is rejected if any row is invalid or the declared total does not reconcile.",
+            "Fill every * field. Each row may use a different expense project and funding source. "
+            "Do not change header names. The complete form is rejected if any row is invalid or "
+            "the declared total does not reconcile. On commitment, the system creates a separate "
+            "auditable expense batch for each expense project.",
         ])
         writer.writerow([])
         writer.writerow([label for _key, label in EXPENSE_IMPORT_HEADERS])
@@ -1744,7 +1746,7 @@ def write_expense_import_xlsx(path, draft_reference, reference_lists):
         + '<c r="B3" s="5"/></row>',
         '<row r="4" ht="34">' + _xlsx_inline_cell(
             "A4",
-            "Fill every * field and use one project per workbook. The complete form is rejected when any row is invalid or the declared total does not match.",
+            "Fill every * field. Expense project and funding source may differ on every row. The complete form is rejected when any row is invalid or the declared total does not match; commitment creates a separate auditable batch for each expense project.",
             4,
         ) + '</row>',
         '<row r="6" ht="32">' + ''.join(
@@ -13083,12 +13085,39 @@ class BulkExpenseDialog(tk.Toplevel):
                 APP_TITLE,
                 "The dropdown-enabled form was created. Open it in Excel or upload it to Google Sheets. "
                 "After completing it, download it as Microsoft Excel (.xlsx) and import that file here.\n\n"
+                "You may select a different expense project and funding source on every row. "
+                "When committed, rows are separated into auditable batches for their respective expense projects.\n\n"
                 "Supplier is optional free text. Other dropdowns are a snapshot of current local records; "
                 "generate a fresh form whenever projects, banks, petty cash, or direct-procurement references change.",
                 parent=self,
             )
         except OSError as exc:
             messagebox.showerror(APP_TITLE, f"The import form could not be saved:\n{exc}", parent=self)
+
+    @staticmethod
+    def _review_import_rows(rows, metadata, source_file, item_builder):
+        """Validate every row while preserving independent project selections."""
+        reviews, staged = [], []
+        required = EXPENSE_IMPORT_REQUIRED_FIELDS
+        for source in rows:
+            missing = [dict(EXPENSE_IMPORT_HEADERS)[key].rstrip("*") for key in required
+                       if not source.get(key, "").strip()]
+            if missing:
+                reviews.append({
+                    "source": source, "item": None,
+                    "error": "Missing required field(s): " + ", ".join(missing),
+                })
+                continue
+            try:
+                item = item_builder(source, staged)
+                item["import_draft_reference"] = metadata.get("draft_reference", "")
+                item["import_source_file"] = source_file
+                item["import_source_row"] = source.get("source_row", "")
+                staged.append(item)
+                reviews.append({"source": source, "item": item, "error": ""})
+            except ValueError as exc:
+                reviews.append({"source": source, "item": None, "error": str(exc)})
+        return reviews, staged
 
     def import_filled_form(self):
         if self.items:
@@ -13106,33 +13135,9 @@ class BulkExpenseDialog(tk.Toplevel):
             return
         try:
             metadata, rows = read_expense_import_form(path)
-            reviews, staged = [], []
-            project_ids = set()
-            required = EXPENSE_IMPORT_REQUIRED_FIELDS
-            for source in rows:
-                missing = [dict(EXPENSE_IMPORT_HEADERS)[key].rstrip("*") for key in required
-                           if not source.get(key, "").strip()]
-                if missing:
-                    reviews.append({
-                        "source": source, "item": None,
-                        "error": "Missing required field(s): " + ", ".join(missing),
-                    })
-                    continue
-                try:
-                    item = self._build_item(source, staged)
-                    item["import_draft_reference"] = metadata.get("draft_reference", "")
-                    item["import_source_file"] = Path(path).name
-                    item["import_source_row"] = source.get("source_row", "")
-                    staged.append(item); project_ids.add(item["project_id"])
-                    reviews.append({"source": source, "item": item, "error": ""})
-                except ValueError as exc:
-                    reviews.append({"source": source, "item": None, "error": str(exc)})
-            if len(project_ids) > 1:
-                reviews = [
-                    {**review, "item": None,
-                     "error": "Use one project per import form so it produces one auditable batch reference."}
-                    for review in reviews
-                ]
+            reviews, staged = self._review_import_rows(
+                rows, metadata, Path(path).name, self._build_item,
+            )
             review_window = ExpenseImportReviewDialog(self, path, metadata, reviews)
             self.wait_window(review_window)
             if not review_window.result:
