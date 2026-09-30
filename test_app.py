@@ -1666,10 +1666,20 @@ class ContractorTrackerTests(unittest.TestCase):
                 "name": "Client Funded", "client": "Client", "contract_value": "100000",
                 "start_date": "", "target_date": "", "notes": "",
             })
-            db.execute(
+            receipt_id = db.execute(
                 """INSERT INTO remittances(project_id,type,amount_cents,txn_date,purpose,
                    cash_received,system_reference) VALUES(?,'Deposit',13570000,'2026-09-25',
                    'Physical cash payment',1,'CR-20260925-TEST')""", (project_id,),
+            ).lastrowid
+            salt, digest = hash_pin("0000")
+            head_id = db.execute(
+                """INSERT INTO project_heads(project_id,name,position,pin_salt,pin_hash)
+                   VALUES(?,?,?,?,?)""",
+                (project_id, "Receipt Test Head", "Project Head", salt, digest),
+            ).lastrowid
+            db.place_cash_receipt(
+                receipt_id, "Project Cash Pool", 13570000, "2026-09-25", head_id,
+                notes="Test receipt placed into allocable project cash",
             )
             expense_id = db.execute(
                 """INSERT INTO expenses(project_id,name,item,total_cents,expense_date,status)

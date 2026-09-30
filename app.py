@@ -37,6 +37,7 @@ APP_TITLE = "Contractor Project Tracker"
 APP_DIR = Path(__file__).resolve().parent
 ALL_PROJECTS_LABEL = "All Projects"
 SHARED_CASH_LABEL = "Shared Cash Pool"
+CLIENT_FUNDED_LABEL = "Client Funded (Paid Directly by Client)"
 
 
 def resolve_db_path(candidate: Path | str | None = None) -> Path:
@@ -1690,7 +1691,7 @@ EXPENSE_IMPORT_HEADERS = (
     ("expense_date", "Expense Date*"),
     ("notes", "Notes"),
     ("source_reference", "Source Reference"),
-    ('funding_project','Funding Project (blank = expense project)'),
+    ('funding_project','Funding Source (project or Client Funded)'),
 )
 
 EXPENSE_IMPORT_REQUIRED_FIELDS = (
@@ -1721,6 +1722,7 @@ def write_expense_import_form(path, draft_reference):
             "Example: PROJECT OASIS", "Example item", "N/A", "", "1",
             "0.00", "Example phase", "MATERIALS", "Unpaid", "0.00", "Cash", "", "",
             date.today().isoformat(), "Delete this example row before import", "",
+            "Example: PROJECT OASIS",
         ])
 
 
@@ -1761,7 +1763,7 @@ def write_expense_import_xlsx(path, draft_reference, reference_lists):
         rows.append(f'<row r="{row_number}">' + ''.join(cells) + '</row>')
 
     list_order = [
-        ("projects", "Projects"), ("phases", "Phases"),
+        ("projects", "Projects"), ("funders", "Funding Sources"), ("phases", "Phases"),
         ("categories", "Categories"), ("statuses", "Payment States"),
         ("methods", "Payment Methods"), ("banks", "Banks"),
         ("allocations", "Cash Allocations"),
@@ -1784,11 +1786,11 @@ def write_expense_import_xlsx(path, draft_reference, reference_lists):
         reference_rows.append(f'<row r="{row_number}">' + ''.join(cells) + '</row>')
 
     validation_map = [
-        ("A7:A506", 0), ("G7:G506", 1), ("H7:H506", 2),
-        ("I7:I506", 3), ("K7:K506", 4), ("L7:L506", 5), ("M7:M506", 6), ('Q7:Q506',0),
+        ("A7:A506", 0), ("G7:G506", 2), ("H7:H506", 3),
+        ("I7:I506", 4), ("K7:K506", 5), ("L7:L506", 6), ("M7:M506", 7), ('Q7:Q506',1),
     ]
     range_names = (
-        "ProjectOptions", "PhaseOptions", "CategoryOptions",
+        "ProjectOptions", "FundingSourceOptions", "PhaseOptions", "CategoryOptions",
         "PaymentStateOptions", "PaymentMethodOptions", "BankOptions", "CashAllocationOptions",
     )
     validations = []
@@ -2154,6 +2156,7 @@ class Database:
         self.wd_reference_repair_status = ("skipped", "")
         self.grace_week1_repair_status = ("skipped", "")
         self.grace_duplicate_deposit_repair_status = ("skipped", "")
+        self.live_cash_boundary_status = ("skipped", "")
         self.migration_backup = self._backup_before_shared_cash_migration()
         self.v120_migration_backup = self._backup_before_v120_migration()
         self.wd_reference_migration_backup = self._backup_before_wd_reference_repair()
@@ -2161,6 +2164,7 @@ class Database:
         self.updated_wd_repair_backup = self._backup_before_updated_wd_repair()
         self.grace_week1_repair_backup = self._backup_before_grace_week1_repair()
         self.grace_duplicate_deposit_repair_backup = self._backup_before_grace_duplicate_deposit_repair()
+        self.cash_receipt_workflow_backup = self._backup_before_cash_receipt_workflow()
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
@@ -2244,6 +2248,33 @@ class Database:
         finally:
             source.close()
         return target
+
+    def _backup_before_cash_receipt_workflow(self):
+        """Back up an existing database before receipt placement becomes explicit."""
+        path = Path(self.path)
+        if not path.exists() or not path.stat().st_size:
+            return None
+        source = target = None
+        try:
+            source = sqlite3.connect(path)
+            if source.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cash_receipt_placements'"
+            ).fetchone():
+                return None
+            backup_path = path.with_name(
+                path.stem + '_before_cash_receipt_workflow_' +
+                datetime.now().strftime('%Y%m%d_%H%M%S_%f') + '.db'
+            )
+            target = sqlite3.connect(backup_path)
+            source.backup(target)
+            return backup_path
+        except (OSError, sqlite3.Error):
+            return None
+        finally:
+            if target:
+                target.close()
+            if source:
+                source.close()
 
     def _backup_before_updated_wd_repair(self):
         path=Path(self.path)
@@ -2911,6 +2942,23 @@ class Database:
         self._ensure_column("payments", "accounting_excluded", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("payments", "funding_project_id", "INTEGER REFERENCES projects(id)")
         self._ensure_column("expenses", "funding_project_id", "INTEGER REFERENCES projects(id)")
+        self._ensure_column(
+            "expenses", "funding_source_type", "TEXT NOT NULL DEFAULT 'Project'"
+        )
+        self._ensure_column(
+            "payments", "funding_source_type", "TEXT NOT NULL DEFAULT 'Project'"
+        )
+        self.conn.execute(
+            """UPDATE payments SET funding_source_type='Client Funded'
+               WHERE LOWER(TRIM(COALESCE(method,''))) LIKE '%client paid%'"""
+        )
+        self.conn.execute(
+            """UPDATE expenses SET funding_source_type='Client Funded'
+               WHERE EXISTS (SELECT 1 FROM payments pay
+                             WHERE pay.expense_id=expenses.id
+                               AND pay.accounting_excluded=0
+                               AND LOWER(TRIM(COALESCE(pay.method,''))) LIKE '%client paid%')"""
+        )
         self.conn.executescript("""
         CREATE TABLE IF NOT EXISTS payroll_week_plans (
             id INTEGER PRIMARY KEY, employee_id INTEGER NOT NULL REFERENCES employees(id),
@@ -2946,6 +2994,28 @@ class Database:
             authorized_by_head_id INTEGER REFERENCES project_heads(id),
             voided INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS cash_receipt_placements (
+            id INTEGER PRIMARY KEY,
+            receipt_id INTEGER NOT NULL REFERENCES remittances(id),
+            project_id INTEGER NOT NULL REFERENCES projects(id),
+            placement_type TEXT NOT NULL CHECK(
+                placement_type IN ('Project Cash Pool','Bank Deposit')
+            ),
+            amount_cents INTEGER NOT NULL CHECK(amount_cents>0),
+            placement_date TEXT NOT NULL,
+            bank_account_id INTEGER REFERENCES bank_accounts(id),
+            system_reference TEXT NOT NULL UNIQUE,
+            authorized_by_head_id INTEGER REFERENCES project_heads(id),
+            notes TEXT NOT NULL DEFAULT '',
+            voided INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CHECK((placement_type='Bank Deposit' AND bank_account_id IS NOT NULL)
+               OR (placement_type='Project Cash Pool' AND bank_account_id IS NULL))
+        );
+        CREATE INDEX IF NOT EXISTS idx_cash_receipt_placement_receipt
+            ON cash_receipt_placements(receipt_id,voided,placement_date);
+        CREATE INDEX IF NOT EXISTS idx_cash_receipt_placement_bank
+            ON cash_receipt_placements(bank_account_id,voided,placement_date);
         """)
         self._ensure_column("expenses", "default_cash_allocation_id", "INTEGER")
         self._ensure_column("expenses", "expense_batch_id", "INTEGER")
@@ -3220,6 +3290,8 @@ class Database:
             self._migrate_verified_wd_allocation_references()
         self._migrate_grace_week1_records()
         self._migrate_grace_duplicate_bank_deposit()
+        self._migrate_cash_receipt_placements()
+        self._migrate_live_cash_boundary()
         # Preserve the employee and daily details of every existing committed
         # payroll before any future reopen operation detaches its live attendance.
         for payroll in self.conn.execute(
@@ -3231,10 +3303,170 @@ class Database:
             self._capture_payroll_batch_snapshot(payroll["id"])
         self.conn.execute(
             """INSERT INTO app_metadata(key,value,updated_at) VALUES('schema_version','1.2.0',?)
-               ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at""",
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at
+               WHERE app_metadata.value<>excluded.value""",
             (local_timestamp(),),
         )
         self.conn.commit()
+
+    def _migrate_cash_receipt_placements(self):
+        """Preserve legacy receipt availability, then require explicit placement.
+
+        Before this workflow existed every physical receipt became allocable as
+        soon as it was recorded.  Existing receipts therefore receive a single
+        full Project Cash Pool placement.  The marker prevents future receipts
+        from being backfilled; those start in Awaiting Placement instead.
+        """
+        marker = "cash_receipt_placement_workflow_20260929"
+        if self.one("SELECT 1 FROM app_metadata WHERE key=?", (marker,)):
+            return
+        receipts = self.all(
+            """SELECT id,project_id,amount_cents,txn_date,system_reference
+               FROM remittances WHERE type='Deposit' AND cash_received=1 AND voided=0
+               ORDER BY txn_date,id"""
+        )
+        stamp = local_timestamp()
+        with self.conn:
+            for receipt in receipts:
+                if self.one(
+                    "SELECT 1 FROM cash_receipt_placements WHERE receipt_id=?",
+                    (receipt["id"],),
+                ):
+                    continue
+                reference = f"CRP-LEGACY-{receipt['id']:06d}"
+                self.conn.execute(
+                    """INSERT INTO cash_receipt_placements(
+                       receipt_id,project_id,placement_type,amount_cents,
+                       placement_date,system_reference,notes,created_at)
+                       VALUES(?,?,'Project Cash Pool',?,?,?,?,?)""",
+                    (receipt["id"], receipt["project_id"], receipt["amount_cents"],
+                     receipt["txn_date"], reference,
+                     f"Legacy availability preserved from {receipt['system_reference'] or 'cash receipt'}",
+                     stamp),
+                )
+            self.conn.execute(
+                "INSERT INTO app_metadata(key,value,updated_at) VALUES(?,?,?)",
+                (marker, f"{len(receipts)} existing physical receipts preserved in project cash pools", stamp),
+            )
+
+    def _migrate_live_cash_boundary(self):
+        """Freeze the reviewed legacy cash position at the source-ledger cutoff.
+
+        Historical Google Sheets rows remain part of project expense reporting, but
+        they predate the PC/DP/WD source ledger.  Replaying those rows forever makes
+        current allocable cash depend on legacy records that never carried source
+        references.  This guarded migration stores a reconciled opening balance and
+        lets current cash activity begin at the established 24 August boundary.
+        """
+        marker = "live_cash_boundary_20260929"
+        marked = self.one("SELECT value FROM app_metadata WHERE key=?", (marker,))
+        if marked:
+            self.live_cash_boundary_status = ("already_applied", marked["value"])
+            return
+        cutoff_row = self.one(
+            "SELECT value FROM app_metadata WHERE key='cash_allocation_wd_cutoff'"
+        )
+        if not cutoff_row or cutoff_row["value"] != "2026-08-24":
+            return
+        receipt = self.one(
+            """SELECT r.*,p.name project FROM remittances r
+               JOIN projects p ON p.id=r.project_id
+               WHERE r.system_reference='CR-20260721-0001'
+                 AND r.type='Deposit' AND r.cash_received=1
+                 AND r.amount_cents=13570000 AND r.voided=0"""
+        )
+        if not receipt:
+            return
+        imported = self.one(
+            """SELECT COUNT(*) rows,COALESCE(SUM(pay.amount_cents),0) total
+               FROM payments pay JOIN expenses e ON e.id=pay.expense_id
+               WHERE e.voided=0 AND pay.accounting_excluded=0
+                 AND pay.reference LIKE 'GSHEET-EXP-%'
+                 AND LOWER(TRIM(pay.method))='cash'
+                 AND pay.cash_allocation_id IS NULL AND pay.bank_account_id IS NULL
+                 AND pay.payment_date<'2026-08-24'"""
+        )
+        # The reviewed backup contains exactly this immutable legacy import set.
+        # A mismatch blocks the correction instead of guessing against another file.
+        if imported["rows"] != 737 or imported["total"] != 256514300:
+            self.live_cash_boundary_status = (
+                "blocked",
+                "Legacy cash-import fingerprint changed; opening cash was not adjusted.",
+            )
+            return
+        cutoff = cutoff_row["value"]
+        withdrawn = self.one(
+            """SELECT COALESCE(SUM(amount_cents),0) total FROM remittances
+               WHERE type='Withdrawal' AND voided=0 AND txn_date<?""", (cutoff,)
+        )["total"]
+        paid = self.one(
+            """SELECT COALESCE(SUM(pay.amount_cents),0) total
+               FROM payments pay JOIN expenses e ON e.id=pay.expense_id
+               WHERE e.voided=0 AND pay.accounting_excluded=0
+                 AND pay.payment_date<?
+                 AND LOWER(TRIM(pay.method)) NOT LIKE '%bank%'
+                 AND LOWER(TRIM(pay.method)) NOT LIKE '%salary deduction%'
+                 AND LOWER(TRIM(pay.method)) NOT LIKE '%client paid%'""", (cutoff,)
+        )["total"]
+        recovered = self.one(
+            """SELECT COALESCE(SUM(t.amount_cents),0) total
+               FROM cash_advance_transactions t JOIN cash_advances a ON a.id=t.advance_id
+               WHERE t.posted=1 AND t.voided=0 AND a.voided=0 AND t.txn_date<?
+                 AND t.txn_type IN ('Cash Repayment','Repayment')
+                 AND LOWER(TRIM(t.method)) NOT LIKE '%bank%'""", (cutoff,)
+        )["total"]
+        redeposited = self.one(
+            """SELECT COALESCE(SUM(amount_cents),0) total FROM cash_redeposits
+               WHERE voided=0 AND deposit_date<?""", (cutoff,)
+        )["total"]
+        calculated_opening = withdrawn - paid + recovered - redeposited
+        # The reviewed live-source position is 35,550.00 in eligible WD cash
+        # before the 135,700.00 Grace receipt.  The legacy global calculation
+        # understated that position by the historical 40,000.00 unlinked payroll
+        # import.  Preserve the expense, but bridge it out of today's cash source.
+        reconciliation_adjustment = 4000000
+        opening = calculated_opening + reconciliation_adjustment
+        if calculated_opening != 11914800 or opening != 15914800:
+            self.live_cash_boundary_status = (
+                "blocked",
+                "Legacy opening-cash totals changed; the reviewed correction was not applied.",
+            )
+            return
+        stamp = local_timestamp()
+        payload = json.dumps({
+            "applied_at": stamp,
+            "cutoff_date": cutoff,
+            "calculated_opening_cents": calculated_opening,
+            "reconciliation_adjustment_cents": reconciliation_adjustment,
+            "opening_cash_cents": opening,
+            "basis": "Reviewed legacy cash opening; historical expenses remain reportable but no longer replay into live allocable cash.",
+        }, separators=(",", ":"))
+        classification = json.dumps({
+            "reference": "CR-20260721-0001",
+            "reimbursement_cents": 12580400,
+            "management_fee_cents": 981900,
+            "client_credit_cents": 7700,
+        }, separators=(",", ":"))
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO app_metadata(key,value,updated_at) VALUES(?,?,?)",
+                (marker, payload, stamp),
+            )
+            self.conn.execute(
+                """INSERT INTO app_metadata(key,value,updated_at) VALUES(?,?,?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at""",
+                ("cash_receipt_classification_CR-20260721-0001", classification, stamp),
+            )
+            self.conn.execute(
+                """INSERT INTO audit_log(project_id,action,details,created_at)
+                   VALUES(?,'LIVE_CASH_OPENING_RECONCILED',?,?)""",
+                (receipt["project_id"],
+                 "Live cash begins 2026-08-24 with opening 159,148.00, including a reviewed 40,000.00 source-ledger bridge. Historical imported expenses remain unchanged.",
+                 stamp),
+            )
+        self.live_cash_boundary_status = (
+            "applied", "Live allocable cash now uses the reviewed 24 August opening boundary."
+        )
 
     def _migrate_grace_week1_records(self):
         """Apply the reviewed Grace week-one correction once, without duplicates.
@@ -4754,6 +4986,12 @@ class Database:
             """SELECT COALESCE(SUM(amount_cents),0) total FROM cash_redeposits
                WHERE bank_account_id=? AND voided=0""", (bank_account_id,)
         )["total"]
+        receipt_deposits = self.one(
+            """SELECT COALESCE(SUM(amount_cents),0) total
+               FROM cash_receipt_placements
+               WHERE bank_account_id=? AND placement_type='Bank Deposit' AND voided=0""",
+            (bank_account_id,),
+        )["total"]
         direct_payments = self.one(
             """SELECT COALESCE(SUM(pay.amount_cents),0) total
                FROM payments pay JOIN expenses e ON e.id=pay.expense_id
@@ -4776,7 +5014,8 @@ class Database:
             """SELECT COALESCE(SUM(amount_cents),0) total FROM bank_account_transfers
                WHERE from_bank_account_id=? AND voided=0""", (bank_account_id,)
         )["total"]
-        return remitted + redeposited - direct_payments + recoveries + inbound - outbound
+        return (remitted + redeposited + receipt_deposits - direct_payments
+                + recoveries + inbound - outbound)
 
     def create_bank_account_transfer(self, *, from_bank_account_id: int,
                                      to_bank_account_id: int, amount_cents: int,
@@ -5032,6 +5271,7 @@ class Database:
         if not expense or expense['voided']:
             raise ValueError('Select an active expense.')
         client_paid='client paid' in (method or '').strip().lower()
+        funding_source_type = "Client Funded" if client_paid else "Project"
         if client_paid:
             # This settles the supplier for project-cost reporting without
             # claiming that Montarra cash, a bank account, or another project
@@ -5053,9 +5293,16 @@ class Database:
             system_ref=self._next_system_reference('BT','payments','system_reference',payment_date) if 'bank' in method.lower() else ''
             payment_id=self.conn.execute("""INSERT INTO payments(expense_id,amount_cents,payment_date,
                 method,reference,notes,authorized_by_head_id,funding_project_id,cash_allocation_id,
-                bank_account_id,system_reference,transaction_time) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                bank_account_id,system_reference,transaction_time,funding_source_type)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (expense_id,amount_cents,payment_date,method,reference,notes,authorized_by_head_id,
-                 funding_project_id,cash_allocation_id,bank_account_id,system_ref,local_timestamp())).lastrowid
+                 funding_project_id,cash_allocation_id,bank_account_id,system_ref,local_timestamp(),
+                 funding_source_type)).lastrowid
+            if client_paid:
+                self.conn.execute(
+                    "UPDATE expenses SET funding_source_type='Client Funded' WHERE id=?",
+                    (expense_id,),
+                )
             if cash_allocation_id:
                 self.register_allocation_payment(cash_allocation_id,payment_id,expense_id,amount_cents,payment_date,authorized_by_head_id)
             self._sync_project_funding_loan(payment_id)
@@ -5100,13 +5347,11 @@ class Database:
     def project_funding_repayment_sources(self, borrower_project_id):
         """Return traceable internal-transfer sources with current availability."""
         options={}
-        for row in self.all("""SELECT r.*,COALESCE((SELECT SUM(pr.amount_cents)
-                FROM project_funding_repayments pr
-                WHERE pr.source_remittance_id=r.id AND pr.voided=0),0) used_cents
+        for row in self.all("""SELECT r.*
             FROM remittances r WHERE r.project_id=? AND r.type='Deposit'
               AND r.cash_received=1 AND r.voided=0 ORDER BY r.txn_date,r.id""",
             (borrower_project_id,)):
-            available=max(0,row['amount_cents']-row['used_cents'])
+            available = self.withdrawal_available(row['id'], borrower_project_id)
             if available:
                 reference=row['system_reference'] or f"Cash receipt #{row['id']}"
                 label=f"{reference} | Physical cash receipt | Available {money(available)}"
@@ -5132,14 +5377,12 @@ class Database:
     def repayment_source_available(self, source_type, borrower_project_id,
                                    source_remittance_id=None, bank_account_id=None):
         if source_type=='Cash Receipt':
-            row=self.one("""SELECT r.amount_cents-COALESCE((SELECT SUM(pr.amount_cents)
-                    FROM project_funding_repayments pr
-                    WHERE pr.source_remittance_id=r.id AND pr.voided=0),0) available
+            row=self.one("""SELECT r.id
                 FROM remittances r WHERE r.id=? AND r.project_id=? AND r.type='Deposit'
                   AND r.cash_received=1 AND r.voided=0""",
                 (source_remittance_id,borrower_project_id))
             if not row:raise ValueError('The selected physical-cash receipt is no longer available.')
-            return max(0,row['available'])
+            return self.withdrawal_available(row['id'], borrower_project_id)
         if source_type=='Unallocated Cash on Hand':
             return max(0,self.cash_summary(borrower_project_id)[2])
         if source_type=='Bank Account':
@@ -5285,44 +5528,291 @@ class Database:
             (project_id,project_id,project_id,project_id))
         return row['total'] if row else 0
 
+    def _live_cash_boundary(self):
+        row = self.one(
+            "SELECT value FROM app_metadata WHERE key='live_cash_boundary_20260929'"
+        )
+        if not row:
+            return None
+        try:
+            payload = json.loads(row["value"])
+            return {
+                "cutoff_date": valid_date(payload["cutoff_date"], True),
+                "opening_cash_cents": int(payload["opening_cash_cents"]),
+                "reconciliation_adjustment_cents": int(
+                    payload.get("reconciliation_adjustment_cents", 0)
+                ),
+            }
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+
     def cash_summary(self, project_id: int | None = None) -> tuple[int, int, int]:
+        boundary = self._live_cash_boundary() if project_id is None else None
         clause = " AND project_id=?" if project_id else ""
         payment_clause = " AND COALESCE(pay.funding_project_id,e.project_id)=?" if project_id else ""
         params = (project_id,) if project_id else ()
+        withdrawal_date_clause = " AND txn_date>=?" if boundary else ""
+        withdrawal_params = params + ((boundary["cutoff_date"],) if boundary else ())
         withdrawn = self.one(
             f"""SELECT COALESCE(SUM(amount_cents),0) total FROM remittances
-                 WHERE type='Withdrawal' AND voided=0{clause}""", params
+                 WHERE type='Withdrawal' AND voided=0{clause}{withdrawal_date_clause}""",
+            withdrawal_params,
         )["total"]
-        cash_received = self.one(
-            f"""SELECT COALESCE(SUM(amount_cents),0) total FROM remittances
-                 WHERE type='Deposit' AND cash_received=1 AND voided=0{clause}""", params
-        )["total"]
+        # A physical receipt becomes operational/allocable cash only after an
+        # authorized Project Cash Pool placement.  Pending receipts remain
+        # visible in physical custody but cannot silently fund an expense.
+        cash_received = self.cash_receipt_pool_total(project_id)
+        payment_date_clause = " AND pay.payment_date>=?" if boundary else ""
+        payment_params = params + ((boundary["cutoff_date"],) if boundary else ())
         paid = self.one(
             f"""SELECT COALESCE(SUM(pay.amount_cents),0) total
                  FROM payments pay JOIN expenses e ON e.id=pay.expense_id
                  WHERE e.voided=0 AND pay.accounting_excluded=0
                    AND LOWER(TRIM(pay.method)) NOT LIKE '%bank%'
                    AND LOWER(TRIM(pay.method)) NOT LIKE '%salary deduction%'
-                   AND LOWER(TRIM(pay.method)) NOT LIKE '%client paid%'{payment_clause}""", params
+                   AND LOWER(TRIM(pay.method)) NOT LIKE '%client paid%'
+                   {payment_clause}{payment_date_clause}""", payment_params
         )["total"]
         recovery_clause = " AND a.project_id=?" if project_id else ""
+        recovery_date_clause = " AND t.txn_date>=?" if boundary else ""
+        recovery_params = params + ((boundary["cutoff_date"],) if boundary else ())
         cash_recovered = self.one(
             f"""SELECT COALESCE(SUM(t.amount_cents),0) total
                  FROM cash_advance_transactions t JOIN cash_advances a ON a.id=t.advance_id
                  WHERE t.posted=1 AND t.voided=0 AND a.voided=0
                    AND t.txn_type IN ('Cash Repayment','Repayment')
-                   AND LOWER(TRIM(t.method)) NOT LIKE '%bank%'{recovery_clause}""", params
+                   AND LOWER(TRIM(t.method)) NOT LIKE '%bank%'
+                   {recovery_clause}{recovery_date_clause}""", recovery_params
         )["total"]
+        redeposit_date_clause = " AND deposit_date>=?" if boundary else ""
+        redeposit_params = (boundary["cutoff_date"],) if boundary else ()
         redeposited = self.one(
-            "SELECT COALESCE(SUM(amount_cents),0) total FROM cash_redeposits WHERE voided=0"
+            f"""SELECT COALESCE(SUM(amount_cents),0) total FROM cash_redeposits
+                WHERE voided=0{redeposit_date_clause}""", redeposit_params
         )["total"]
         # A physical-cash inter-project repayment transfers project ownership,
         # not company cash.  Project-filtered summaries show the out/in legs;
         # the all-project total remains unchanged.
-        net_cash_introduced = (withdrawn + cash_received - redeposited
+        opening = boundary["opening_cash_cents"] if boundary else 0
+        net_cash_introduced = (opening + withdrawn + cash_received - redeposited
                                + self._project_cash_repayment_adjustment(project_id))
         return (net_cash_introduced, paid - cash_recovered,
                 net_cash_introduced - paid + cash_recovered)
+
+    def financial_control_position(self):
+        """Return one reconciled physical-cash view without changing ownership."""
+        boundary = self._live_cash_boundary() or {
+            "cutoff_date": "Legacy / not set", "opening_cash_cents": 0,
+            "reconciliation_adjustment_cents": 0,
+        }
+        rows = self.cash_allocation_rows(None)
+        petty = direct = 0
+        for row in rows:
+            remaining = max(0, row["amount_cents"] - row["spent_cents"] - row["returned_cents"])
+            if row["allocation_type"] == "Petty Cash":
+                petty += remaining
+            else:
+                direct += remaining
+        surrendered = self.surrendered_awaiting_deposit()
+        operational_cash = self.cash_summary()[2]
+        pending_receipts = self.cash_receipt_pending_total()
+        physical = operational_cash + pending_receipts
+        cutoff = self.one(
+            "SELECT value FROM app_metadata WHERE key='cash_allocation_wd_cutoff'"
+        )
+        eligible_withdrawals = self.all(
+            """SELECT id FROM remittances WHERE type='Withdrawal' AND voided=0
+               AND txn_date>=? ORDER BY txn_date,id""",
+            (cutoff["value"] if cutoff else "0001-01-01",),
+        )
+        eligible_wd = sum(self.withdrawal_available(row["id"]) for row in eligible_withdrawals)
+        receipt_cash = self.cash_receipt_pool_total()
+        receipt_banked = self.one(
+            """SELECT COALESCE(SUM(amount_cents),0) total FROM cash_receipt_placements
+               WHERE placement_type='Bank Deposit' AND voided=0"""
+        )["total"]
+        return {
+            "physical_cents": physical,
+            "allocable_cents": max(0, operational_cash - petty - direct - surrendered),
+            "petty_cents": petty,
+            "direct_cents": direct,
+            "surrendered_cents": surrendered,
+            "eligible_wd_cents": eligible_wd,
+            "physical_receipt_cents": receipt_cash,
+            "pending_receipt_cents": pending_receipts,
+            "banked_receipt_cents": receipt_banked,
+            **boundary,
+        }
+
+    def financial_control_receipts(self, project_id=None):
+        where = ["r.type='Deposit'", "r.cash_received=1", "r.voided=0"]
+        params = []
+        if project_id:
+            where.append("r.project_id=?")
+            params.append(project_id)
+        rows = self.all(f"""SELECT r.*,p.name project,
+            COALESCE((SELECT SUM(pr.amount_cents) FROM project_funding_repayments pr
+                      WHERE pr.source_remittance_id=r.id AND pr.voided=0),0) repayment_cents
+            FROM remittances r JOIN projects p ON p.id=r.project_id
+            WHERE {' AND '.join(where)} ORDER BY r.txn_date DESC,r.id DESC""", tuple(params))
+        result = []
+        for source in rows:
+            row = dict(source)
+            classification = self.one(
+                "SELECT value FROM app_metadata WHERE key=?",
+                (f"cash_receipt_classification_{row['system_reference']}",),
+            )
+            details = {}
+            if classification:
+                try:
+                    details = json.loads(classification["value"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    details = {}
+            row["reimbursement_cents"] = int(
+                details.get("reimbursement_cents", row["repayment_cents"])
+            )
+            row["management_fee_cents"] = int(details.get("management_fee_cents", 0))
+            row["client_credit_cents"] = int(details.get("client_credit_cents", 0))
+            classified = (row["reimbursement_cents"] + row["management_fee_cents"]
+                          + row["client_credit_cents"])
+            row["unclassified_cents"] = max(0, row["amount_cents"] - classified)
+            row["unapplied_cents"] = max(0, row["amount_cents"] - row["repayment_cents"])
+            result.append(row)
+        return result
+
+    def financial_control_projects(self, project_id=None):
+        projects = self.all(
+            "SELECT id,name FROM projects WHERE (? IS NULL OR id=?) ORDER BY name COLLATE NOCASE",
+            (project_id, project_id),
+        )
+        result = []
+        for project in projects:
+            pid = project["id"]
+            total = self.one(
+                "SELECT COALESCE(SUM(total_cents),0) total FROM expenses WHERE project_id=? AND voided=0",
+                (pid,),
+            )["total"]
+            client_paid = self.one(
+                """SELECT COALESCE(SUM(pay.amount_cents),0) total
+                   FROM payments pay JOIN expenses e ON e.id=pay.expense_id
+                   WHERE e.project_id=? AND e.voided=0 AND pay.accounting_excluded=0
+                     AND LOWER(TRIM(pay.method)) LIKE '%client paid%'""", (pid,)
+            )["total"]
+            own_paid = self.one(
+                """SELECT COALESCE(SUM(pay.amount_cents),0) total
+                   FROM payments pay JOIN expenses e ON e.id=pay.expense_id
+                   WHERE e.project_id=? AND e.voided=0 AND pay.accounting_excluded=0
+                     AND LOWER(TRIM(pay.method)) NOT LIKE '%client paid%'
+                     AND COALESCE(pay.funding_project_id,e.project_id)=e.project_id""", (pid,)
+            )["total"]
+            loans = [row for row in self.interproject_loans(pid)
+                     if row["borrower_project_id"] == pid]
+            other_funded = sum(row["amount_cents"] for row in loans
+                               if row["kind"] == "Expense funding")
+            ca_funded = sum(row["amount_cents"] for row in loans
+                            if row["kind"] == "CA recovery")
+            settled = min(total, client_paid + own_paid + other_funded + ca_funded)
+            received = self.one(
+                """SELECT COALESCE(SUM(amount_cents),0) total FROM remittances
+                   WHERE project_id=? AND type='Deposit' AND cash_received=1 AND voided=0""",
+                (pid,),
+            )["total"]
+            result.append({
+                "project_id": pid, "project": project["name"], "total_cents": total,
+                "client_paid_cents": client_paid, "own_paid_cents": own_paid,
+                "other_funded_cents": other_funded, "ca_funded_cents": ca_funded,
+                "outstanding_cents": max(0, total - settled),
+                "cash_received_cents": received,
+            })
+        return result
+
+    def dashboard_financial_summary(self, project_ids):
+        """Return project-cost, client-funding, and internal-settlement totals.
+
+        Supplier payment and inter-project repayment are different events.  A
+        client receipt is counted once, while repayments only reassign its cash
+        ownership from the borrowing project to the funding project.
+        """
+        ids = list(dict.fromkeys(int(value) for value in project_ids if value))
+        if not ids:
+            return {key: 0 for key in (
+                "contract_cents", "accounted_cost_cents", "client_received_cents",
+                "client_funds_accounted_cents", "client_paid_expenses_cents",
+                "own_funded_cents", "other_project_funded_cents",
+                "reimbursed_to_funders_cents", "receipt_reimbursed_cents",
+                "retained_receipt_cents", "management_fee_cents",
+                "client_credit_cents", "supplier_outstanding_cents",
+                "outstanding_to_funders_cents",
+            )}
+        placeholders = ",".join("?" for _ in ids)
+        contract = self.one(
+            f"SELECT COALESCE(SUM(contract_value_cents),0) total FROM projects WHERE id IN ({placeholders})",
+            tuple(ids),
+        )["total"]
+        accounted_cost = sum(self.project_cost_budget(project_id)[1] for project_id in ids)
+        client_received = self.one(
+            f"""SELECT COALESCE(SUM(amount_cents),0) total FROM remittances
+                WHERE project_id IN ({placeholders}) AND type='Deposit' AND voided=0""",
+            tuple(ids),
+        )["total"]
+        supplier_outstanding = self.one(
+            f"""SELECT COALESCE(SUM(MAX(e.total_cents-COALESCE((
+                    SELECT SUM(pay.amount_cents) FROM payments pay
+                    WHERE pay.expense_id=e.id AND pay.accounting_excluded=0),0),0)),0) total
+                FROM expenses e WHERE e.project_id IN ({placeholders}) AND e.voided=0""",
+            tuple(ids),
+        )["total"]
+        payment_totals = self.one(
+            f"""SELECT
+                  COALESCE(SUM(CASE WHEN LOWER(TRIM(COALESCE(pay.method,''))) LIKE '%client paid%'
+                                    THEN pay.amount_cents ELSE 0 END),0) client_paid,
+                  COALESCE(SUM(CASE WHEN LOWER(TRIM(COALESCE(pay.method,''))) NOT LIKE '%client paid%'
+                                     AND COALESCE(pay.funding_project_id,e.project_id)=e.project_id
+                                    THEN pay.amount_cents ELSE 0 END),0) own_paid
+                FROM payments pay JOIN expenses e ON e.id=pay.expense_id
+                WHERE e.project_id IN ({placeholders}) AND e.voided=0
+                  AND pay.accounting_excluded=0""",
+            tuple(ids),
+        )
+        loans = [
+            row for row in self.interproject_loans()
+            if row["borrower_project_id"] in ids
+        ]
+        other_funded = sum(row["amount_cents"] for row in loans)
+        reimbursed = sum(row["repaid_cents"] for row in loans)
+        outstanding_to_funders = sum(row["outstanding_cents"] for row in loans)
+        receipt_reimbursed = self.one(
+            f"""SELECT COALESCE(SUM(repay.amount_cents),0) total
+                FROM project_funding_repayments repay
+                JOIN project_funding_loans loan ON loan.id=repay.loan_id
+                JOIN remittances receipt ON receipt.id=repay.source_remittance_id
+                WHERE repay.voided=0 AND receipt.voided=0
+                  AND receipt.type='Deposit' AND receipt.cash_received=1
+                  AND loan.borrower_project_id IN ({placeholders})""",
+            tuple(ids),
+        )["total"]
+        classifications = []
+        for project_id in ids:
+            classifications.extend(self.financial_control_receipts(project_id))
+        management_fee = sum(row["management_fee_cents"] for row in classifications)
+        client_credit = sum(row["client_credit_cents"] for row in classifications)
+        retained = max(0, client_received - receipt_reimbursed)
+        return {
+            "contract_cents": contract,
+            "accounted_cost_cents": accounted_cost,
+            "client_received_cents": client_received,
+            "client_funds_accounted_cents": client_received,
+            "client_paid_expenses_cents": payment_totals["client_paid"],
+            "own_funded_cents": payment_totals["own_paid"],
+            "other_project_funded_cents": other_funded,
+            "reimbursed_to_funders_cents": reimbursed,
+            "receipt_reimbursed_cents": receipt_reimbursed,
+            "retained_receipt_cents": retained,
+            "management_fee_cents": management_fee,
+            "client_credit_cents": client_credit,
+            "supplier_outstanding_cents": supplier_outstanding,
+            "outstanding_to_funders_cents": outstanding_to_funders,
+        }
 
     def allocation_returned(self, allocation_id: int) -> int:
         row = self.one(
@@ -5353,28 +5843,55 @@ class Database:
         return max(0, row["amount_cents"] - self.allocation_spent(allocation_id)
                    - self.allocation_returned(allocation_id))
 
-    def withdrawal_available(self, withdrawal_id: int) -> int:
-        withdrawal = self.one(
-            """SELECT amount_cents FROM remittances
-               WHERE id=? AND type='Withdrawal' AND voided=0""", (withdrawal_id,)
+    def withdrawal_available(self, withdrawal_id: int, project_id: int | None = None) -> int:
+        source = self.one(
+            """SELECT id,type,cash_received,amount_cents FROM remittances
+               WHERE id=? AND voided=0""", (withdrawal_id,)
         )
-        if not withdrawal:
+        if not source:
             return 0
+        if source["type"] == "Withdrawal":
+            source_total = source["amount_cents"]
+        elif source["type"] == "Deposit" and source["cash_received"]:
+            pool_total = self.cash_receipt_placement_totals(source["id"])["pool_cents"]
+            if project_id is None:
+                source_total = pool_total
+            else:
+                receipt_project = self.one(
+                    "SELECT project_id FROM remittances WHERE id=?", (source["id"],)
+                )["project_id"]
+                ownership_transfer = self.one(
+                    """SELECT COALESCE(SUM(CASE
+                           WHEN l.lender_project_id=? THEN pr.amount_cents
+                           WHEN l.borrower_project_id=? THEN -pr.amount_cents ELSE 0 END),0) total
+                       FROM project_funding_repayments pr
+                       JOIN project_funding_loans l ON l.id=pr.loan_id
+                       WHERE pr.source_remittance_id=? AND pr.voided=0""",
+                    (project_id, project_id, source["id"]),
+                )["total"]
+                source_total = (pool_total if receipt_project == project_id else 0) + ownership_transfer
+                source_total = max(0, source_total)
+        else:
+            return 0
+        project_filter = (
+            " AND a.project_id=?" if source["type"] == "Deposit" and project_id else ""
+        )
+        params = (withdrawal_id, project_id) if project_filter else (withdrawal_id,)
         allocated = self.one(
-            """SELECT COALESCE(SUM(s.amount_cents),0) total
+            f"""SELECT COALESCE(SUM(s.amount_cents),0) total
                FROM cash_allocation_sources s JOIN cash_allocations a ON a.id=s.allocation_id
-               WHERE s.withdrawal_id=? AND a.voided=0""", (withdrawal_id,)
+               WHERE s.withdrawal_id=? AND a.voided=0{project_filter}""", params
         )["total"]
         released = self.one(
-            """SELECT COALESCE(SUM(s.amount_cents),0) total
+            f"""SELECT COALESCE(SUM(s.amount_cents),0) total
                FROM cash_pool_return_sources s
                JOIN cash_allocation_transactions t ON t.id=s.transaction_id
                JOIN cash_allocations a ON a.id=t.allocation_id
                WHERE s.withdrawal_id=? AND a.voided=0 AND t.voided=0
-                 AND t.txn_type='Returned to Shared Pool'""",
-            (withdrawal_id,),
+                 AND t.txn_type='Returned to Shared Pool'{project_filter}""",
+            params,
         )["total"]
-        return max(0, withdrawal["amount_cents"] - allocated + released)
+        return max(0, source_total - allocated + released)
 
     def fifo_withdrawal_sources(self, amount_cents: int, allocation_date: str | None = None):
         """Reserve cash from valid unallocated withdrawals in traceable date order."""
@@ -5419,30 +5936,130 @@ class Database:
             (allocation_date,cutoff['value'] if cutoff else '0001-01-01'))
         return [dict(r,available_cents=self.withdrawal_available(r['id'])) for r in rows if self.withdrawal_available(r['id'])>0]
 
-    def validate_manual_withdrawal_sources(self, amount_cents, allocation_date, selected):
-        options={r['id']:r for r in self.manual_withdrawal_options(allocation_date)}
-        if not selected:raise ValueError('Select withdrawal references and enter the amount taken from each.')
-        seen=set();result=[]
-        for wid,amount in selected:
-            if wid in seen:raise ValueError('Select each withdrawal only once.')
-            seen.add(wid)
-            if not isinstance(amount,int) or amount<=0:raise ValueError('Every selected withdrawal amount must be positive.')
-            row=options.get(wid)
-            if not row:raise ValueError('A selected withdrawal is voided, unavailable, after the allocation date, or before the reviewed boundary.')
-            if amount>row['available_cents']:
-                raise ValueError(f"{row['system_reference']} has only {money(row['available_cents'])} available.")
-            result.append((wid,amount,row['system_reference']))
-        if sum(r[1] for r in result)!=amount_cents:
-            raise ValueError('The selected withdrawal contributions must exactly equal the PC/DP allocation amount.')
+    def manual_cash_source_options(self, allocation_date, project_id=None,
+                                   expand_project_accounts=False):
+        """Return traceable withdrawal and placed receipt cash for allocation."""
+        rows = []
+        for source in self.manual_withdrawal_options(allocation_date):
+            source.update(
+                source_kind="Withdrawal", owner_project_id=None,
+                owner_project="Shared Cash Pool", source_key=f"WD:{source['id']}",
+            )
+            rows.append(source)
+        for receipt in self.cash_receipt_register(None, physical_only=True):
+            if receipt["txn_date"] > valid_date(allocation_date, True):
+                continue
+            if project_id is None and expand_project_accounts:
+                for account in self.cash_receipt_project_accounts(receipt["id"]):
+                    if account["available_cents"] <= 0:
+                        continue
+                    account_row = dict(receipt)
+                    original_reference = (
+                        receipt["system_reference"] or f"CR-{receipt['id']:06d}"
+                    )
+                    account_row.update(
+                        source_kind=account["account_type"],
+                        available_cents=account["available_cents"],
+                        original_reference=original_reference,
+                        cash_account_reference=account["account_reference"],
+                        system_reference=(
+                            f"{account['account_reference']} / {original_reference}"
+                        ),
+                        owner_project_id=account["project_id"],
+                        owner_project=account["project"],
+                        source_key=(
+                            f"RCA:{receipt['id']}:{account['project_id']}"
+                        ),
+                    )
+                    rows.append(account_row)
+                continue
+            available = self.withdrawal_available(receipt["id"], project_id)
+            if available <= 0:
+                continue
+            account = next(iter(self.cash_receipt_project_accounts(
+                receipt["id"], project_id
+            )), None) if project_id else None
+            original_reference = receipt["system_reference"] or f"CR-{receipt['id']:06d}"
+            receipt.update(
+                source_kind=(account["account_type"] if account else "Project Cash Receipt"),
+                available_cents=available,
+                original_reference=original_reference,
+                cash_account_reference=(account["account_reference"] if account else ""),
+                system_reference=(
+                    f"{account['account_reference']} / {original_reference}"
+                    if account else original_reference
+                ),
+                owner_project_id=(account["project_id"] if account else project_id),
+                owner_project=(account["project"] if account else receipt["project"]),
+                source_key=(
+                    f"RCA:{receipt['id']}:{account['project_id']}"
+                    if account else f"CR:{receipt['id']}"
+                ),
+            )
+            rows.append(receipt)
+        return sorted(
+            rows,
+            key=lambda item: (
+                item["txn_date"], item["id"], item.get("owner_project_id") or 0
+            ),
+            reverse=True,
+        )
+
+    def validate_manual_cash_sources(self, amount_cents, allocation_date, selected,
+                                     project_id=None):
+        options = {row["id"]: row for row in self.manual_cash_source_options(
+            allocation_date, project_id
+        )}
+        if not selected:
+            raise ValueError(
+                "Select withdrawal or placed project-receipt cash sources and enter each contribution."
+            )
+        seen, result = set(), []
+        for source_id, amount in selected:
+            if source_id in seen:
+                raise ValueError("Select each cash source only once.")
+            seen.add(source_id)
+            if not isinstance(amount, int) or amount <= 0:
+                raise ValueError("Every selected cash-source amount must be positive.")
+            row = options.get(source_id)
+            if not row:
+                raise ValueError(
+                    "A selected cash source is unavailable, after the allocation date, "
+                    "or belongs to a different project cash pool."
+                )
+            if amount > row["available_cents"]:
+                raise ValueError(
+                    f"{row['system_reference']} has only {money(row['available_cents'])} available."
+                )
+            result.append((source_id, amount, row["system_reference"]))
+        if sum(item[1] for item in result) != amount_cents:
+            raise ValueError(
+                "The selected cash-source contributions must exactly equal the PC/DP allocation amount."
+            )
         return result
+
+    def validate_manual_withdrawal_sources(self, amount_cents, allocation_date, selected):
+        return self.validate_manual_cash_sources(
+            amount_cents, allocation_date, selected, project_id=None
+        )
 
     def allocation_source_text(self, allocation_id: int) -> str:
         rows = self.all(
-            """SELECT s.amount_cents,COALESCE(NULLIF(r.system_reference,''),'WD-' || PRINTF('%04d',r.id)) reference
-               FROM cash_allocation_sources s JOIN remittances r ON r.id=s.withdrawal_id
+            """SELECT s.amount_cents,r.id source_id,r.type,a.project_id,
+                      COALESCE(NULLIF(r.system_reference,''),
+                      CASE WHEN r.type='Withdrawal' THEN 'WD-' ELSE 'CR-' END || PRINTF('%04d',r.id)) reference
+               FROM cash_allocation_sources s
+               JOIN cash_allocations a ON a.id=s.allocation_id
+               JOIN remittances r ON r.id=s.withdrawal_id
                WHERE s.allocation_id=? ORDER BY r.txn_date,r.id""", (allocation_id,)
         )
-        return ", ".join(f"{row['reference']} ({money(row['amount_cents'])})" for row in rows)
+        labels = []
+        for row in rows:
+            reference = row["reference"]
+            if row["type"] == "Deposit":
+                reference = f"RCA-{row['source_id']:06d}-P{row['project_id']:03d} / {reference}"
+            labels.append(f"{reference} ({money(row['amount_cents'])})")
+        return ", ".join(labels)
 
     def cash_allocation_rows(self, project_id: int | None = None, active_only: bool = False):
         where, params = ["a.voided=0"], []
@@ -5455,7 +6072,10 @@ class Database:
                        COALESCE(c.name,resp.name,'') holder,
                        COALESCE(iss.name,'') issuer,COALESCE(rec.name,'') receiver,
                        r.amount_cents withdrawal_cents,
-                       (SELECT GROUP_CONCAT(COALESCE(NULLIF(sr.system_reference,''),'WD-' || PRINTF('%04d',sr.id)))
+                       (SELECT GROUP_CONCAT(CASE WHEN sr.type='Deposit' THEN
+                           'RCA-' || PRINTF('%06d',sr.id) || '-P' || PRINTF('%03d',a.project_id) ||
+                           ' / ' || COALESCE(NULLIF(sr.system_reference,''),'CR-' || PRINTF('%04d',sr.id))
+                           ELSE COALESCE(NULLIF(sr.system_reference,''),'WD-' || PRINTF('%04d',sr.id)) END)
                           FROM cash_allocation_sources src JOIN remittances sr ON sr.id=src.withdrawal_id
                           WHERE src.allocation_id=a.id) withdrawal_references,
                        COALESCE((SELECT SUM(p.amount_cents) FROM payments p
@@ -5578,7 +6198,9 @@ class Database:
         allocation_date=valid_date(allocation_date,True)
         if withdrawal_sources is None and withdrawal_id is not None:
             withdrawal_sources=[(withdrawal_id,amount_cents)]
-        sources = self.validate_manual_withdrawal_sources(amount_cents, allocation_date,withdrawal_sources)
+        sources = self.validate_manual_cash_sources(
+            amount_cents, allocation_date, withdrawal_sources, project_id
+        )
         withdrawal_id = sources[0][0]
         if allocation_type == "Petty Cash":
             count = self.one(
@@ -5609,7 +6231,10 @@ class Database:
                  1, local_timestamp(), issuer_registry_id, receiver_registry_id),
             )
             allocation_id = cursor.lastrowid
-            self.conn.execute("UPDATE cash_allocations SET source_selection_mode='Manual' WHERE id=?",(allocation_id,))
+            self.conn.execute(
+                "UPDATE cash_allocations SET source_selection_mode='Manual' WHERE id=?",
+                (allocation_id,),
+            )
             self.conn.executemany(
                 """INSERT INTO cash_allocation_sources(allocation_id,withdrawal_id,amount_cents)
                    VALUES(?,?,?)""",
@@ -6522,34 +7147,260 @@ class Database:
             result.append(item)
         return result
 
-    def project_receipt_overview(self, project_name: str = "Project Grace"):
-        """Show active physical-cash receipts and bank deposits for one project."""
-        project = self.one(
-            """SELECT id,name FROM projects
-               WHERE LOWER(TRIM(name))=LOWER(TRIM(?))
-               ORDER BY CASE WHEN status='Active' THEN 0 ELSE 1 END,id LIMIT 1""",
-            (project_name,),
+    def cash_receipt_placement_totals(self, receipt_id: int) -> dict:
+        row = self.one(
+            """SELECT
+                 COALESCE(SUM(CASE WHEN placement_type='Project Cash Pool'
+                                   THEN amount_cents ELSE 0 END),0) pool_cents,
+                 COALESCE(SUM(CASE WHEN placement_type='Bank Deposit'
+                                   THEN amount_cents ELSE 0 END),0) bank_cents
+               FROM cash_receipt_placements WHERE receipt_id=? AND voided=0""",
+            (receipt_id,),
         )
-        if not project:
-            project = self.one(
-                """SELECT id,name FROM projects WHERE LOWER(name) LIKE LOWER(?)
-                   ORDER BY CASE WHEN status='Active' THEN 0 ELSE 1 END,id LIMIT 1""",
-                (f"%{project_name.replace('Project ', '').strip()}%",),
+        return {"pool_cents": row["pool_cents"], "bank_cents": row["bank_cents"]}
+
+    def cash_receipt_pending(self, receipt_id: int) -> int:
+        receipt = self.one(
+            """SELECT amount_cents FROM remittances
+               WHERE id=? AND type='Deposit' AND cash_received=1 AND voided=0""",
+            (receipt_id,),
+        )
+        if not receipt:
+            return 0
+        totals = self.cash_receipt_placement_totals(receipt_id)
+        return max(0, receipt["amount_cents"] - totals["pool_cents"] - totals["bank_cents"])
+
+    def cash_receipt_pool_total(self, project_id: int | None = None) -> int:
+        clause = " AND cp.project_id=?" if project_id else ""
+        params = (project_id,) if project_id else ()
+        return self.one(
+            f"""SELECT COALESCE(SUM(cp.amount_cents),0) total
+                FROM cash_receipt_placements cp
+                JOIN remittances r ON r.id=cp.receipt_id
+                WHERE cp.placement_type='Project Cash Pool' AND cp.voided=0
+                  AND r.voided=0{clause}""",
+            params,
+        )["total"]
+
+    def cash_receipt_pending_total(self, project_id: int | None = None) -> int:
+        rows = self.cash_receipt_register(project_id, physical_only=True)
+        return sum(row["pending_cents"] for row in rows)
+
+    def place_cash_receipt(self, receipt_id: int, placement_type: str,
+                           amount_cents: int, placement_date: str,
+                           authorized_by_head_id: int, bank_account_id: int | None = None,
+                           notes: str = "") -> dict:
+        """Place part of a physical receipt without creating a duplicate deposit."""
+        if placement_type not in {"Project Cash Pool", "Bank Deposit"}:
+            raise ValueError("Select Project Cash Pool or Bank Deposit.")
+        placement_date = valid_date(placement_date, True)
+        receipt = self.one(
+            """SELECT r.*,p.name project FROM remittances r
+               JOIN projects p ON p.id=r.project_id
+               WHERE r.id=? AND r.type='Deposit' AND r.cash_received=1 AND r.voided=0""",
+            (receipt_id,),
+        )
+        if not receipt:
+            raise ValueError("Select an active physical cash receipt.")
+        if placement_date < receipt["txn_date"]:
+            raise ValueError("Placement date cannot be earlier than the receipt date.")
+        available = self.cash_receipt_pending(receipt_id)
+        if amount_cents <= 0 or amount_cents > available:
+            raise ValueError(
+                f"Enter an amount from 0.01 through the pending balance of {money(available)}."
             )
-        if not project:
-            return []
-        return self.all(
-            """SELECT r.*,p.name project,
-                      CASE WHEN r.cash_received=1 THEN 'Physical Cash Receipt'
-                           ELSE 'Bank Deposit' END receipt_type,
-                      COALESCE(b.bank_name || CASE WHEN b.account_name<>''
-                           THEN ' - ' || b.account_name ELSE '' END,'Cash on hand') destination
-               FROM remittances r JOIN projects p ON p.id=r.project_id
-               LEFT JOIN bank_accounts b ON b.id=r.bank_account_id
-               WHERE r.project_id=? AND r.type='Deposit' AND r.voided=0
-               ORDER BY r.txn_date DESC,r.id DESC""",
-            (project["id"],),
+        head = self.one(
+            "SELECT id,name FROM project_heads WHERE id=? AND project_id=? AND active=1",
+            (authorized_by_head_id, receipt["project_id"]),
         )
+        if not head:
+            raise ValueError("An active project head for the receiving project must authorize placement.")
+        if placement_type == "Bank Deposit":
+            bank = self.one(
+                "SELECT id FROM bank_accounts WHERE id=? AND active=1", (bank_account_id,)
+            )
+            if not bank:
+                raise ValueError("Select an active destination bank account.")
+        else:
+            bank_account_id = None
+        prefix = "CRB" if placement_type == "Bank Deposit" else "CRP"
+        reference = self._next_system_reference(
+            prefix, "cash_receipt_placements", "system_reference", placement_date
+        )
+        stamp = local_timestamp()
+        with self.conn:
+            placement_id = self.conn.execute(
+                """INSERT INTO cash_receipt_placements(
+                   receipt_id,project_id,placement_type,amount_cents,placement_date,
+                   bank_account_id,system_reference,authorized_by_head_id,notes,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (receipt_id, receipt["project_id"], placement_type, amount_cents,
+                 placement_date, bank_account_id, reference, authorized_by_head_id,
+                 notes.strip(), stamp),
+            ).lastrowid
+            self.conn.execute(
+                "INSERT INTO audit_log(project_id,action,details,created_at) VALUES(?,?,?,?)",
+                (receipt["project_id"], "CASH_RECEIPT_PLACED",
+                 f"{receipt['system_reference']} -> {reference}: {money(amount_cents)} to "
+                 f"{placement_type}; authorized by {head['name']}", stamp),
+            )
+        return {"id": placement_id, "reference": reference,
+                "remaining_cents": available - amount_cents,
+                "placement_type": placement_type}
+
+    def cash_receipt_register(self, project_id: int | None = None,
+                              physical_only: bool = False):
+        where = ["r.type='Deposit'", "r.voided=0"]
+        params = []
+        if physical_only:
+            where.append("r.cash_received=1")
+        if project_id:
+            where.append("r.project_id=?")
+            params.append(project_id)
+        classifications = {
+            row["id"]: row for row in self.financial_control_receipts(project_id)
+        }
+        rows = self.all(
+            f"""SELECT r.*,p.name project,
+                       COALESCE(b.bank_name || CASE WHEN b.account_name<>''
+                            THEN ' - ' || b.account_name ELSE '' END,'') bank_name
+                FROM remittances r JOIN projects p ON p.id=r.project_id
+                LEFT JOIN bank_accounts b ON b.id=r.bank_account_id
+                WHERE {' AND '.join(where)}
+                ORDER BY r.txn_date DESC,r.id DESC""",
+            tuple(params),
+        )
+        result = []
+        for source in rows:
+            row = dict(source)
+            if row["cash_received"]:
+                totals = self.cash_receipt_placement_totals(row["id"])
+                pending = max(0, row["amount_cents"] - totals["pool_cents"] - totals["bank_cents"])
+                placed = totals["pool_cents"] + totals["bank_cents"]
+                status = ("Awaiting Placement" if not placed else
+                          "Partially Placed" if pending else "Fully Placed")
+                row.update(totals, pending_cents=pending, placement_status=status,
+                           receipt_type="Physical Cash Receipt")
+            else:
+                row.update(pool_cents=0, bank_cents=row["amount_cents"], pending_cents=0,
+                           placement_status="Deposited to Bank", receipt_type="Bank Deposit")
+            classified = classifications.get(row["id"], {})
+            for key in ("reimbursement_cents", "management_fee_cents",
+                        "client_credit_cents", "unclassified_cents", "unapplied_cents"):
+                row[key] = int(classified.get(key, 0))
+            result.append(row)
+        return result
+
+    def cash_receipt_project_accounts(self, receipt_id: int | None = None,
+                                      project_id: int | None = None):
+        """Return project-owned subaccounts derived from physical receipt cash.
+
+        A repayment changes which project owns part of the cash; it never
+        creates another physical receipt.  These account rows make the two
+        sides visible while continuing to use the original receipt as the
+        immutable cash source.
+        """
+        where = ["r.type='Deposit'", "r.cash_received=1", "r.voided=0"]
+        params = []
+        if receipt_id is not None:
+            where.append("r.id=?")
+            params.append(receipt_id)
+        receipts = self.all(
+            f"""SELECT r.*,p.name receipt_project
+                FROM remittances r JOIN projects p ON p.id=r.project_id
+                WHERE {' AND '.join(where)} ORDER BY r.txn_date,r.id""",
+            tuple(params),
+        )
+        result = []
+        for receipt in receipts:
+            pool_total = self.cash_receipt_placement_totals(receipt["id"])["pool_cents"]
+            transfers = self.all(
+                """SELECT pr.amount_cents,l.lender_project_id,l.borrower_project_id
+                   FROM project_funding_repayments pr
+                   JOIN project_funding_loans l ON l.id=pr.loan_id
+                   WHERE pr.source_remittance_id=? AND pr.voided=0""",
+                (receipt["id"],),
+            )
+            project_ids = {receipt["project_id"]}
+            project_ids.update(row["lender_project_id"] for row in transfers)
+            project_ids.update(row["borrower_project_id"] for row in transfers)
+            names = {
+                row["id"]: row["name"] for row in self.all(
+                    f"SELECT id,name FROM projects WHERE id IN ({','.join('?' for _ in project_ids)})",
+                    tuple(sorted(project_ids)),
+                )
+            }
+            classification = next(
+                (row for row in self.financial_control_receipts(receipt["project_id"])
+                 if row["id"] == receipt["id"]),
+                {},
+            )
+            for owner_id in sorted(project_ids):
+                transferred_in = sum(
+                    row["amount_cents"] for row in transfers
+                    if row["lender_project_id"] == owner_id
+                )
+                transferred_out = sum(
+                    row["amount_cents"] for row in transfers
+                    if row["borrower_project_id"] == owner_id
+                )
+                owned = ((pool_total if owner_id == receipt["project_id"] else 0)
+                         + transferred_in - transferred_out)
+                if owned <= 0 or (project_id is not None and owner_id != project_id):
+                    continue
+                available = self.withdrawal_available(receipt["id"], owner_id)
+                if owner_id == receipt["project_id"]:
+                    account_type = (
+                        "Retained Receipt Cash" if transferred_out else "Project Receipt Cash"
+                    )
+                    breakdown = ""
+                    fee = int(classification.get("management_fee_cents", 0))
+                    credit = int(classification.get("client_credit_cents", 0))
+                    if fee or credit:
+                        breakdown = (
+                            f"Management fee {money(fee)} | Client credit {money(credit)}"
+                        )
+                else:
+                    account_type = "Inter-project Reimbursement Cash"
+                    breakdown = f"Reimbursed from {receipt['receipt_project']}"
+                result.append({
+                    "receipt_id": receipt["id"],
+                    "receipt_reference": receipt["system_reference"] or f"CR-{receipt['id']:06d}",
+                    "receipt_date": receipt["txn_date"],
+                    "receipt_project_id": receipt["project_id"],
+                    "receipt_project": receipt["receipt_project"],
+                    "project_id": owner_id,
+                    "project": names.get(owner_id, f"Project #{owner_id}"),
+                    "account_reference": f"RCA-{receipt['id']:06d}-P{owner_id:03d}",
+                    "account_type": account_type,
+                    "owned_cents": owned,
+                    "available_cents": available,
+                    "allocated_cents": max(0, owned - available),
+                    "transferred_in_cents": transferred_in,
+                    "transferred_out_cents": transferred_out,
+                    "breakdown": breakdown,
+                    "status": "Available" if available else "Fully Allocated",
+                })
+        return result
+
+    def project_receipt_overview(self, project_name: str | None = None):
+        """Compatibility view; new UI uses the all-project receipt register."""
+        project_id = None
+        if project_name:
+            project = self.one(
+                """SELECT id FROM projects WHERE LOWER(TRIM(name))=LOWER(TRIM(?))
+                   ORDER BY CASE WHEN status='Active' THEN 0 ELSE 1 END,id LIMIT 1""",
+                (project_name,),
+            )
+            project_id = project["id"] if project else None
+            if not project:
+                return []
+        rows = self.cash_receipt_register(project_id)
+        for row in rows:
+            row["destination"] = (
+                "Cash on hand" if row["cash_received"] else row["bank_name"] or "Bank Deposit"
+            )
+        return rows
 
     def salary_deduction_plan(self, employee_id: int, available_gross_cents: int,
                               eligible_through: str | None = None):
@@ -10186,7 +11037,7 @@ class FinancialPieChart(ttk.Frame):
         self.title_label = ttk.Label(self, text="Contract funding", style="Section.TLabel")
         self.title_label.pack(anchor="w")
         self.subtitle_label = ttk.Label(
-            self, text="Deposited > payments > outstanding",
+            self, text="Client funds > accounted funds > outstanding to funders",
             style="Muted.TLabel",
         )
         self.subtitle_label.pack(anchor="w", pady=(0, 4))
@@ -10221,7 +11072,7 @@ class FinancialPieChart(ttk.Frame):
         narrow = width < 170
         self.title_label.configure(text="Funding" if narrow else "Contract funding")
         self.subtitle_label.configure(
-            text="" if narrow else "Deposited > payments > outstanding"
+            text="" if narrow else "Client funds > accounted funds > outstanding to funders"
         )
         contract = self.data.get("contract", 0)
         deposited = self.data.get("deposited", 0)
@@ -10295,13 +11146,13 @@ class FinancialPieChart(ttk.Frame):
             return part * 100 / whole if whole else 0
 
         legend_rows = [
-            ("#2563EB", f"Deposited  {self._short_money(deposited)} / {self._short_money(contract)}  "
+            ("#2563EB", f"Client funds  {self._short_money(deposited)} / {self._short_money(contract)}  "
                         f"({percent(deposited, contract):.1f}%)"),
-            (GREEN, f"Payments  {self._short_money(paid)}  "
-                    f"({percent(paid, deposited):.1f}% of deposits)"),
-            ("#93C5FD", f"Funds after payments  {self._short_money(available)}"),
-            (RED, f"Outstanding  {self._short_money(outstanding)}"),
-            ("#D8E8FA", f"Project budget remaining  {self._short_money(free_budget)}"),
+            (GREEN, f"Accounted  {self._short_money(paid)}  "
+                    f"({percent(paid, deposited):.1f}% of client funds)"),
+            ("#93C5FD", f"Unassigned client funds  {self._short_money(available)}"),
+            (RED, f"Outstanding to funders  {self._short_money(outstanding)}"),
+            ("#D8E8FA", f"Unassigned after obligations  {self._short_money(free_budget)}"),
         ]
         if unfunded_outstanding:
             legend_rows[-1] = (
@@ -10309,8 +11160,8 @@ class FinancialPieChart(ttk.Frame):
             )
         if narrow:
             legend_rows = [
-                ("#2563EB", f"Dep. {self._short_money(deposited)} ({percent(deposited, contract):.1f}%)"),
-                (GREEN, f"Paid {self._short_money(paid)} ({percent(paid, deposited):.1f}%)"),
+                ("#2563EB", f"Funds {self._short_money(deposited)} ({percent(deposited, contract):.1f}%)"),
+                (GREEN, f"Acct. {self._short_money(paid)} ({percent(paid, deposited):.1f}%)"),
                 ("#93C5FD", f"Avail. {self._short_money(available)}"),
                 (RED, f"Outst. {self._short_money(outstanding)}"),
                 (("#991B1B" if unfunded_outstanding else "#D8E8FA"),
@@ -10748,9 +11599,17 @@ class ProjectsTab(BaseTab):
         self.add_project_head_button.pack(side="right")
         cards = ttk.Frame(self); cards.pack(fill="x", pady=(18, 14))
         self.contract_card, self.contract_value = metric_card(cards, "Total Contract Value", INK)
-        self.deposit_card, self.deposit_value = metric_card(cards, "Contract Value Deposited", "#2563EB")
-        self.paid_card, self.paid_value = metric_card(cards, "Payments Recorded", GREEN)
-        self.outstanding_card, self.outstanding_value = metric_card(cards, "Outstanding", RED)
+        (self.deposit_card, self.deposit_value, self.deposit_detail_label,
+         self.deposit_detail_value) = metric_card_with_detail(
+            cards, "Client Funds Received", "Client Funds Accounted", "#2563EB"
+        )
+        self.paid_card, self.paid_value = metric_card(
+            cards, "Total Accounted Project Cost", GREEN
+        )
+        (self.outstanding_card, self.outstanding_value, self.outstanding_detail_label,
+         self.outstanding_detail_value) = metric_card_with_detail(
+            cards, "Outstanding to Funders", "Unpaid Supplier Bills", RED
+        )
         self.progress_card, self.progress_value = metric_card(cards, "Overall Progress", ORANGE)
         layout_metric_cards(cards, (
             self.contract_card, self.deposit_card, self.paid_card,
@@ -10766,8 +11625,8 @@ class ProjectsTab(BaseTab):
         ttk.Label(projects, text="Projects", style="Section.TLabel").pack(anchor="w", pady=(0, 5))
         self.tree = make_tree(projects, [
             ("name", "Project", 180), ("status", "Status", 85), ("client", "Client", 145), ("contract", "Contract", 105),
-            ("payments", "Payments", 100), ("outstanding", "Outstanding", 105),
-            ("budget", "Budget Remaining", 115),
+            ("payments", "Client Funds", 100), ("outstanding", "Owed to Funders", 115),
+            ("budget", "Cost Budget Remaining", 125),
         ])
         self.tree.bind("<Double-1>", self.choose)
         self.financial_chart = FinancialPieChart(chart)
@@ -10870,19 +11729,12 @@ class ProjectsTab(BaseTab):
         for row in project_rows:
             if row["id"] not in project_ids:
                 continue
-            _deposited, payments, _payment_balance = self.db.project_budget(row["id"])
-            _committed_deposit, _committed, budget = self.db.project_funding_budget(row["id"])
-            outstanding = self.db.one(
-                """SELECT COALESCE(SUM(MAX(e.total_cents-COALESCE(x.paid,0),0)),0) total
-                   FROM expenses e LEFT JOIN (
-                     SELECT expense_id,SUM(amount_cents) paid FROM payments
-                     WHERE accounting_excluded=0 GROUP BY expense_id
-                   ) x ON x.expense_id=e.id
-                   WHERE e.project_id=? AND e.voided=0""", (row["id"],)
-            )["total"]
+            project_summary = self.db.dashboard_financial_summary([row["id"]])
+            _cost_limit, _committed, budget = self.db.project_cost_budget(row["id"])
             self.tree.insert("", "end", iid=row["id"], values=(
                 row["name"], row["status"], row["client"], money(row["contract_value_cents"]),
-                money(payments), money(outstanding), money(budget),
+                money(project_summary["client_received_cents"]),
+                money(project_summary["outstanding_to_funders_cents"]), money(budget),
             ))
         if project_ids:
             placeholders = ",".join("?" for _ in project_ids)
@@ -10891,34 +11743,32 @@ class ProjectsTab(BaseTab):
                    WHERE phase_id IN (
                      SELECT id FROM phases WHERE project_id IN ({placeholders}))""", tuple(project_ids)
             )
-            paid = sum(self.db.project_budget(project_id)[1] for project_id in project_ids)
             progress = round(tasks["done"] * 100 / tasks["total"]) if tasks["total"] else 0
-            outstanding = self.db.one(
-                f"""SELECT COALESCE(SUM(MAX(e.total_cents-COALESCE(x.paid,0),0)),0) total
-                   FROM expenses e LEFT JOIN (SELECT expense_id,SUM(amount_cents) paid FROM payments
-                   WHERE accounting_excluded=0 GROUP BY expense_id) x
-                   ON x.expense_id=e.id WHERE e.project_id IN ({placeholders}) AND e.voided=0""", tuple(project_ids)
-            )["total"]
-            contract = self.db.one(
-                "SELECT COALESCE(SUM(contract_value_cents),0) total FROM projects WHERE id IN (" +
-                placeholders + ")", tuple(project_ids)
-            )["total"]
-            deposited = sum(self.db.project_budget(project_id)[0] for project_id in project_ids)
-            self.contract_value.config(text=money(contract))
-            self.deposit_value.config(text=money(deposited), fg="#2563EB")
-            self.paid_value.config(text=money(paid))
-            self.outstanding_value.config(text=money(outstanding))
+            summary = self.db.dashboard_financial_summary(project_ids)
+            self.contract_value.config(text=money(summary["contract_cents"]))
+            self.deposit_value.config(text=money(summary["client_received_cents"]), fg="#2563EB")
+            self.deposit_detail_value.config(text=money(summary["client_funds_accounted_cents"]))
+            self.paid_value.config(text=money(summary["accounted_cost_cents"]))
+            self.outstanding_value.config(text=money(summary["outstanding_to_funders_cents"]))
+            self.outstanding_detail_value.config(text=money(summary["supplier_outstanding_cents"]))
             self.progress_value.config(text=f"{progress}%")
-            committed = sum(self.db.project_cost_budget(pid)[1] for pid in project_ids)
-            budget_remaining = sum(self.db.project_funding_budget(pid)[2] for pid in project_ids)
-            receivable=sum(self.db.interproject_balance(pid)[0] for pid in project_ids)
-            payable=sum(self.db.interproject_balance(pid)[1] for pid in project_ids)
             self.expense_reconciliation.config(
-                text=(f"Construction cost {money(committed)} | Own funds used {money(paid)} | Unpaid supplier bills {money(outstanding)} | "
-                      f"Funds after commitments {money(budget_remaining)} | Inter-project recoverable {money(receivable)}; owed {money(payable)}. "
-                      'Borrowing and repayments do not create duplicate expenses.')
+                text=(
+                    f"Client-paid expenses {money(summary['client_paid_expenses_cents'])} | "
+                    f"Funded by other projects {money(summary['other_project_funded_cents'])} | "
+                    f"Reimbursed to funders {money(summary['reimbursed_to_funders_cents'])} | "
+                    f"Retained receipt cash {money(summary['retained_receipt_cents'])} "
+                    f"(management fee {money(summary['management_fee_cents'])}; "
+                    f"client credit {money(summary['client_credit_cents'])}) | "
+                    f"Outstanding to funders {money(summary['outstanding_to_funders_cents'])}. "
+                    "Client-funded expenses do not consume Montarra or project cash."
+                )
             )
-            self.financial_chart.set_data(contract, deposited, paid, outstanding, progress)
+            self.financial_chart.set_data(
+                summary["contract_cents"], summary["client_received_cents"],
+                summary["client_funds_accounted_cents"],
+                summary["outstanding_to_funders_cents"], progress,
+            )
             for event in self.db.all(
                 f"""SELECT ce.*,p.name project FROM calendar_events ce JOIN projects p ON p.id=ce.project_id
                    WHERE ce.project_id IN ({placeholders}) AND ce.completed=0 AND ce.event_date>=?
@@ -10928,7 +11778,8 @@ class ProjectsTab(BaseTab):
                 ))
         else:
             for label in (self.contract_value, self.deposit_value, self.paid_value,
-                          self.outstanding_value, self.progress_value):
+                          self.outstanding_value, self.progress_value,
+                          self.deposit_detail_value, self.outstanding_detail_value):
                 label.config(text="—")
             self.expense_reconciliation.config(text="No project financial records to reconcile.")
             self.financial_chart.set_data()
@@ -11754,6 +12605,8 @@ class BulkExpenseDialog(tk.Toplevel):
         self.import_metadata = {}
         projects = db.all("SELECT id,name FROM projects WHERE status<>'Completed' ORDER BY name")
         self.projects = {f"{row['name']} [#{row['id']}]": row["id"] for row in projects}
+        self.funding_sources = dict(self.projects)
+        self.funding_sources[CLIENT_FUNDED_LABEL] = None
         self.context_project_id = initial_project_id or (projects[0]["id"] if projects else None)
         banks = db.all("SELECT * FROM bank_accounts WHERE active=1 ORDER BY bank_name,account_name")
         self.banks = {
@@ -11797,11 +12650,12 @@ class BulkExpenseDialog(tk.Toplevel):
             cell = ttk.Frame(form); cell.grid(row=row, column=col, sticky="ew", padx=5, pady=4)
             ttk.Label(cell, text=label).pack(anchor="w")
             if key in {'project','funding_project'}:
-                widget = ttk.Combobox(cell, textvariable=self.vars[key], values=list(self.projects), state="readonly")
+                values = list(self.projects) if key == "project" else list(self.funding_sources)
+                widget = ttk.Combobox(cell, textvariable=self.vars[key], values=values, state="readonly")
                 if key=='project':
                     widget.bind("<<ComboboxSelected>>", lambda _e: self.project_changed())
                 else:
-                    widget.bind("<<ComboboxSelected>>", lambda _e: self.refresh_funding_summary())
+                    widget.bind("<<ComboboxSelected>>", lambda _e: self.funding_source_changed())
             elif key in {"phase", "area", "status", "payment_method", "bank", "cash_allocation"}:
                 if key == "status": values = ["Paid", "Partially Paid", "Unpaid"]
                 elif key == "payment_method": values = ["Cash", "Bank Transfer", "Client Paid Direct"]
@@ -11964,6 +12818,12 @@ class BulkExpenseDialog(tk.Toplevel):
             self.budget_label.config(text=f"Deposited {money(deposited)} | Payments {money(paid)} | Available {money(remaining)}")
         self.refresh_funding_summary()
 
+    def funding_source_changed(self):
+        if self.vars["funding_project"].get() == CLIENT_FUNDED_LABEL:
+            self.vars["payment_method"].set("Client Paid Direct")
+        self.update_payment_controls()
+        self.refresh_funding_summary()
+
     def refresh_cash_allocations(self):
         project_id = self.current_project_id()
         self.allocation_options = self.db.active_allocation_options(project_id) if project_id else {}
@@ -11975,6 +12835,11 @@ class BulkExpenseDialog(tk.Toplevel):
     def update_payment_controls(self):
         status = self.vars["status"].get()
         method = self.vars["payment_method"].get()
+        if method == "Client Paid Direct" and self.vars["funding_project"].get() != CLIENT_FUNDED_LABEL:
+            self.vars["funding_project"].set(CLIENT_FUNDED_LABEL)
+        elif self.vars["funding_project"].get() == CLIENT_FUNDED_LABEL and method != "Client Paid Direct":
+            method = "Client Paid Direct"
+            self.vars["payment_method"].set(method)
         partial = status == "Partially Paid"
         self.widgets["initial_payment"].configure(state="normal" if partial else "disabled")
         if not partial: self.vars["initial_payment"].set("")
@@ -11985,7 +12850,13 @@ class BulkExpenseDialog(tk.Toplevel):
 
     def refresh_funding_summary(self):
         funding_pid=self.projects.get(self.vars['funding_project'].get())
-        if funding_pid:
+        if self.vars['funding_project'].get() == CLIENT_FUNDED_LABEL:
+            _limit,_committed,cost_remaining=self.db.project_cost_budget(self.current_project_id())
+            self.budget_label.config(
+                text=("Client funded: no Montarra/project cash will be consumed | "
+                      f"Expense project cost budget remaining {money(cost_remaining)}")
+            )
+        elif funding_pid:
             _deposited,_paid,available=self.db.project_budget(funding_pid)
             staged=sum(i['payment_amount_cents'] for i in self.items
                        if i.get('funding_project_id',i['project_id'])==funding_pid
@@ -12057,17 +12928,22 @@ class BulkExpenseDialog(tk.Toplevel):
 
     def _build_item(self, values, staged_items):
         values = {key: str(value or "").strip() for key, value in values.items()}
-        if not self.db.one("SELECT 1 FROM bank_accounts WHERE active=1 LIMIT 1"):
-            raise ValueError("Enroll a bank account in Remittances before adding expenses.")
         project_label = self._project_label(values.get("project"))
         project_id = self.projects.get(project_label)
         if not project_id:
             raise ValueError("Project does not match an existing project.")
-        funding_label=self._project_label(values.get('funding_project') or project_label)
-        funding_project_id=self.projects.get(funding_label)
-        if not funding_project_id:
-            raise ValueError('Select an active funding project.')
-        _deposited, _paid, remaining = self.db.project_budget(funding_project_id)
+        funding_value = values.get('funding_project') or project_label
+        client_funded = funding_value.casefold() == CLIENT_FUNDED_LABEL.casefold()
+        if client_funded:
+            funding_label = CLIENT_FUNDED_LABEL
+            funding_project_id = project_id
+            remaining = 0
+        else:
+            funding_label=self._project_label(funding_value)
+            funding_project_id=self.projects.get(funding_label)
+            if not funding_project_id:
+                raise ValueError('Select an active funding project or Client Funded.')
+            _deposited, _paid, remaining = self.db.project_budget(funding_project_id)
         quantity = qty_decimal(values.get("qty", ""))
         unit_price = cents(values.get("unit_price", ""))
         if quantity <= 0 or unit_price < 0:
@@ -12111,10 +12987,11 @@ class BulkExpenseDialog(tk.Toplevel):
         payment_method = payment_method_lookup.get(values.get("payment_method", "").casefold())
         if not payment_method:
             raise ValueError("Payment Method must be Cash, Bank Transfer, or Client Paid Direct.")
-        client_paid = "client paid" in payment_method.lower()
+        client_paid = client_funded or "client paid" in payment_method.lower()
         if client_paid:
+            payment_method = "Client Paid Direct"
             funding_project_id = project_id
-            funding_label = project_label
+            funding_label = CLIENT_FUNDED_LABEL
         bank_account_id = None
         cash_allocation_id = None
         if payment_amount > 0 and client_paid:
@@ -12151,7 +13028,7 @@ class BulkExpenseDialog(tk.Toplevel):
                               if x.get("bank_account_id") == bank_account_id)
             if staged_bank + payment_amount > self.db.bank_balance(bank_account_id):
                 raise ValueError("Staged transfers exceed the selected bank balance.")
-        elif payment_amount > 0:
+        elif payment_amount > 0 and not client_paid:
             self.db.validate_cash_allocation_payment(project_id, cash_allocation_id, payment_amount)
             staged_allocation = sum(x["payment_amount_cents"] for x in staged_items
                                     if x.get("cash_allocation_id") == cash_allocation_id)
@@ -12165,6 +13042,7 @@ class BulkExpenseDialog(tk.Toplevel):
             name=values["item"], item=values["item"], project=project_label,
             project_id=project_id, project_name=project_label.split(" [#")[0],
             funding_project_id=funding_project_id, funding_project=funding_label,
+            funding_source_type=("Client Funded" if client_paid else "Project"),
             dimensions=values["dimensions"], supplier=supplier, qty=str(quantity), unit="item",
             unit_price_cents=unit_price, total_cents=total, phase=phase, area=area,
             trade="", status=status, initial_payment=values.get("initial_payment", ""),
@@ -12193,8 +13071,10 @@ class BulkExpenseDialog(tk.Toplevel):
             )]
             allocations = list(self.db.active_allocation_options(None))
             reference_lists = {
-                "projects": list(self.projects), "phases": phases,
-            "categories": categories, "statuses": ["Paid", "Partially Paid", "Unpaid"],
+                "projects": list(self.projects),
+                "funders": list(self.projects) + [CLIENT_FUNDED_LABEL],
+                "phases": phases,
+                "categories": categories, "statuses": ["Paid", "Partially Paid", "Unpaid"],
                 "methods": ["Cash", "Bank Transfer", "Client Paid Direct"], "banks": list(self.banks),
                 "allocations": allocations,
             }
@@ -12298,8 +13178,12 @@ class BulkExpenseDialog(tk.Toplevel):
             "payment_method": item.get("payment_method", "Cash"),
             "expense_date": item.get("expense_date", date.today().isoformat()),
             "notes": item.get("notes", ""),
-            "funding_project": next((label for label,pid in self.projects.items()
-                                     if pid==item.get('funding_project_id',item.get('project_id'))),'') ,
+            "funding_project": (
+                CLIENT_FUNDED_LABEL
+                if item.get("funding_source_type") == "Client Funded"
+                else next((label for label,pid in self.projects.items()
+                           if pid==item.get('funding_project_id',item.get('project_id'))),'')
+            ),
         }
         bank_label = next(
             (label for label, bank_id in self.banks.items()
@@ -12761,31 +13645,41 @@ class ExpenseDetailsDialog(tk.Toplevel):
 
 
 class CashAllocationDialog(tk.Toplevel):
-    """Creates a withdrawal-linked petty-cash or direct-procurement allocation."""
+    """Creates a traceable petty-cash or direct-procurement allocation."""
     def __init__(self, parent, db, initial_project_id=None, initial_withdrawal_id=None):
         super().__init__(parent)
-        self.title("Allocate Withdrawn Cash")
+        self.title("Allocate Available Cash")
         self.geometry(f"{max(850,min(1000,self.winfo_screenwidth()-80))}x{max(650,min(790,self.winfo_screenheight()-80))}"); self.minsize(850,650)
         self.db, self.result = db, None
         self.initial_withdrawal_id = initial_withdrawal_id
         projects = db.all("SELECT id,name FROM projects ORDER BY name")
         self.projects = {f"{row['name']} [#{row['id']}]": row["id"] for row in projects}
-        self.context_project_id = initial_project_id or (projects[0]["id"] if projects else None)
+        self.all_cash_accounts_label = "All Project Cash Accounts"
+        self.cash_owner_options = {self.all_cash_accounts_label: None, **self.projects}
+        self.context_project_id = initial_project_id
         self.vars = {key: tk.StringVar() for key in (
-            "withdrawal", "allocation_type", "issuer", "receiver",
+            "withdrawal", "cash_owner", "allocation_type", "issuer", "receiver",
             "amount", "allocation_date", "supplier", "purpose", "notes",
         )}
+        initial_owner = next(
+            (label for label, project_id in self.projects.items()
+             if project_id == initial_project_id),
+            self.all_cash_accounts_label,
+        )
+        self.vars["cash_owner"].set(initial_owner)
         self.vars["allocation_type"].set("Petty Cash")
         self.vars["allocation_date"].set(date.today().isoformat())
         self.withdrawals, self.heads, self.head_registries = {}, {}, {}
         body = ttk.Frame(self, padding=22); body.pack(fill="both", expand=True)
-        ttk.Label(body, text="Allocate withdrawn cash", style="DialogTitle.TLabel").grid(
+        ttk.Label(body, text="Allocate available cash", style="DialogTitle.TLabel").grid(
             row=0, column=0, columnspan=4, sticky="w")
         ttk.Label(
-            body, text="Cash is shared across projects. Select withdrawal references and specify each contribution; their sum must equal this allocation.",
+            body, text=("Select withdrawal references or cash receipts already placed in this "
+                        "project's cash pool. Their contributions must equal the allocation."),
             style="Muted.TLabel", wraplength=740,
         ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(3, 14))
         specs = [
+            ("cash_owner", "Cash account owner"),
             ("allocation_type", "Allocation type"), ("amount", "Amount"),
             ("allocation_date", "Allocation date"),
             ("issuer", "Issuer / approving head"), ("receiver", "Receiver / responsible head"),
@@ -12800,6 +13694,12 @@ class CashAllocationDialog(tk.Toplevel):
             if key == "allocation_type":
                 widget = ttk.Combobox(body, textvariable=self.vars[key], values=["Petty Cash", "Direct Procurement"], state="readonly")
                 widget.bind("<<ComboboxSelected>>", lambda _e: self.update_type())
+            elif key == "cash_owner":
+                widget = ttk.Combobox(
+                    body, textvariable=self.vars[key],
+                    values=list(self.cash_owner_options), state="readonly",
+                )
+                widget.bind("<<ComboboxSelected>>", lambda _e: self.cash_owner_changed())
             elif key in {"issuer", "receiver"}:
                 widget = ttk.Combobox(body, textvariable=self.vars[key], state="readonly")
             elif key == "supplier":
@@ -12809,8 +13709,8 @@ class CashAllocationDialog(tk.Toplevel):
             widget.grid(row=row, column=col + 1, sticky="ew", pady=6)
             body.columnconfigure(col + 1, weight=1)
             self.widgets[key] = widget
-        source_box=ttk.LabelFrame(body,text='Withdrawal sources — select and enter amounts',padding=8)
-        source_box.grid(row=6,column=0,columnspan=4,sticky='nsew',pady=8);body.rowconfigure(6,weight=1)
+        source_box=ttk.LabelFrame(body,text='Cash sources — select and enter amounts',padding=8)
+        source_box.grid(row=7,column=0,columnspan=4,sticky='nsew',pady=8);body.rowconfigure(7,weight=1)
         source_canvas=tk.Canvas(source_box,bg=WHITE,highlightthickness=0,height=190)
         source_scroll=ttk.Scrollbar(source_box,command=source_canvas.yview);source_canvas.configure(yscrollcommand=source_scroll.set)
         source_scroll.pack(side='right',fill='y');source_canvas.pack(side='left',fill='both',expand=True)
@@ -12818,10 +13718,10 @@ class CashAllocationDialog(tk.Toplevel):
         self.source_frame.bind('<Configure>',lambda _e:source_canvas.configure(scrollregion=source_canvas.bbox('all')))
         source_canvas.bind('<Configure>',lambda e:source_canvas.itemconfigure(source_window,width=e.width))
         self.source_rows=[]
-        self.source_note=ttk.Label(body,style='Section.TLabel');self.source_note.grid(row=7,column=0,columnspan=4,sticky='w')
+        self.source_note=ttk.Label(body,style='Section.TLabel');self.source_note.grid(row=8,column=0,columnspan=4,sticky='w')
         self.balance_note = ttk.Label(body, style="Muted.TLabel", wraplength=900)
-        self.balance_note.grid(row=8, column=0, columnspan=4, sticky="w", pady=(10, 4))
-        buttons = ttk.Frame(body); buttons.grid(row=9, column=0, columnspan=4, sticky="e", pady=(14, 0))
+        self.balance_note.grid(row=9, column=0, columnspan=4, sticky="w", pady=(10, 4))
+        buttons = ttk.Frame(body); buttons.grid(row=10, column=0, columnspan=4, sticky="e", pady=(14, 0))
         ttk.Button(buttons, text="Cancel", style="Secondary.TButton", command=self.destroy).pack(side="right", padx=(8, 0))
         self.continue_button = ttk.Button(
             buttons, text="Review Allocation", style="Primary.TButton", command=self.save
@@ -12835,25 +13735,51 @@ class CashAllocationDialog(tk.Toplevel):
         self.after_idle(lambda: center_toplevel(self))
 
     def project_id(self):
-        return self.context_project_id
+        return self.cash_owner_options.get(self.vars["cash_owner"].get())
+
+    def cash_owner_changed(self):
+        self.context_project_id = self.project_id()
+        self.refresh_context()
+        self.refresh_sources()
 
     def refresh_sources(self):
-        previous={r[0]['id']:(r[1].get(),r[2].get()) for r in self.source_rows}
+        previous={
+            r[0].get('source_key',str(r[0]['id'])):(r[1].get(),r[2].get())
+            for r in self.source_rows
+        }
         for widget in self.source_frame.winfo_children():widget.destroy()
         self.source_rows=[]
-        try:rows=self.db.manual_withdrawal_options(self.vars['allocation_date'].get())
+        project_id = self.project_id()
+        try:rows=self.db.manual_cash_source_options(
+            self.vars['allocation_date'].get(), project_id,
+            expand_project_accounts=(project_id is None),
+        )
         except ValueError:
             ttk.Label(self.source_frame,text='Enter a valid allocation date to load available withdrawals.').pack(anchor='w');return
         for wd in rows:
             line=ttk.Frame(self.source_frame,padding=(3,4));line.pack(fill='x')
-            old=previous.get(wd['id'],(wd['id']==self.initial_withdrawal_id,''))
+            source_key=wd.get('source_key',str(wd['id']))
+            old=previous.get(source_key,(wd['id']==self.initial_withdrawal_id,''))
             selected=tk.BooleanVar(value=old[0]);amount=tk.StringVar(value=old[1])
-            ttk.Checkbutton(line,text=f"{wd['system_reference']} | {wd['txn_date']} | {money(wd['available_cents'])} available",variable=selected,command=self.refresh_source_total).pack(side='left',fill='x',expand=True)
+            owner_text=(
+                f" | Owner: {wd['owner_project']}"
+                if wd.get('owner_project_id') else ""
+            )
+            ttk.Checkbutton(
+                line,
+                text=(f"{wd['system_reference']} | {wd.get('source_kind','Cash Source')} | "
+                      f"{wd['txn_date']}{owner_text} | {money(wd['available_cents'])} available"),
+                variable=selected, command=self.refresh_source_total,
+            ).pack(side='left',fill='x',expand=True)
             ttk.Label(line,text='Use:').pack(side='left',padx=6)
             entry=ttk.Entry(line,textvariable=amount,width=16);entry.pack(side='left')
             amount.trace_add('write',lambda *_:self.refresh_source_total())
             self.source_rows.append((wd,selected,amount,entry))
-        if not rows:ttk.Label(self.source_frame,text='No eligible withdrawal cash remains on or before this date.').pack(anchor='w')
+        if not rows:
+            ttk.Label(
+                self.source_frame,
+                text='No eligible withdrawal or placed project-receipt cash remains on this date.'
+            ).pack(anchor='w')
         self.refresh_source_total()
 
     def refresh_source_total(self):
@@ -12890,6 +13816,7 @@ class CashAllocationDialog(tk.Toplevel):
         self.balance_note.config(
             text=(f"Shared cash on-hand: {money(self.db.cash_summary()[2])} | "
                   f"Unallocated cash: {money(self.db.unallocated_cash())} | "
+                  f"Cash account view: {self.vars['cash_owner'].get()} | "
                   f"Registered heads available: {len(rows)}")
         )
 
@@ -12904,11 +13831,10 @@ class CashAllocationDialog(tk.Toplevel):
     def save(self):
         if flash_missing_fields(self,self.vars,self.widgets,['allocation_type','amount','allocation_date','issuer','receiver','purpose']):return
         try:
-            project_id = self.project_id()
+            selected_owner = self.project_id()
             issuer_id = self.heads.get(self.vars["issuer"].get())
             receiver_id = self.heads.get(self.vars["receiver"].get())
             amount = cents(self.vars["amount"].get())
-            if not project_id: raise ValueError("Create a project before allocating withdrawn cash.")
             if not issuer_id or not receiver_id: raise ValueError("Select both registered project heads.")
             if issuer_id == receiver_id: raise ValueError("Issuer and receiver must be different people.")
             if amount <= 0: raise ValueError("Amount must be positive.")
@@ -12916,6 +13842,7 @@ class CashAllocationDialog(tk.Toplevel):
             if self.vars["allocation_type"].get() == "Direct Procurement" and not self.vars["supplier"].get().strip():
                 raise ValueError("Supplier or payee is required for Direct Procurement.")
             selected=[]
+            selected_account_owners=set()
             for wd,checked,source_amount,entry in self.source_rows:
                 if checked.get():
                     try:
@@ -12923,8 +13850,27 @@ class CashAllocationDialog(tk.Toplevel):
                         if contribution<=0:raise ValueError('Enter a positive contribution for each checked withdrawal.')
                     except ValueError:
                         flash_required_widgets(self,[entry]);raise
+                    owner_project_id=wd.get('owner_project_id')
+                    if owner_project_id:
+                        selected_account_owners.add(owner_project_id)
                     selected.append((wd['id'],contribution))
-            self.db.validate_manual_withdrawal_sources(amount,allocation_date,selected)
+            if len(selected_account_owners)>1:
+                raise ValueError(
+                    "One PC/DP allocation cannot mix cash owned by different projects. "
+                    "Create a separate allocation for each cash-account owner."
+                )
+            inferred_owner=(next(iter(selected_account_owners))
+                            if selected_account_owners else None)
+            if selected_owner and inferred_owner and selected_owner!=inferred_owner:
+                raise ValueError("The selected receipt cash belongs to a different project account.")
+            project_id=selected_owner or inferred_owner
+            if not project_id:
+                raise ValueError(
+                    "Choose a specific Cash account owner when allocating only shared withdrawal cash."
+                )
+            self.db.validate_manual_cash_sources(
+                amount, allocation_date, selected, project_id
+            )
             self.result = {
                 "project_id": project_id,
                 "allocation_type": self.vars["allocation_type"].get(), "amount_cents": amount,
@@ -12972,6 +13918,26 @@ class ExpensesTab(BaseTab):
             self.total_card, self.payments_card, self.cash_card, self.deposit_card,
             self.budget_card, self.contract_card,
         ))
+        self.funding_cards = ttk.Frame(self)
+        self.funding_cards.pack(fill="x", pady=(0, 8))
+        self.client_paid_card, self.client_paid_value = metric_card(
+            self.funding_cards, "Client-paid expenses", "#64748B"
+        )
+        self.other_funded_card, self.other_funded_value = metric_card(
+            self.funding_cards, "Funded by other projects", "#2563EB"
+        )
+        self.funder_reimbursed_card, self.funder_reimbursed_value = metric_card(
+            self.funding_cards, "Reimbursed to funders", GREEN
+        )
+        self.funder_outstanding_card, self.funder_outstanding_value = metric_card(
+            self.funding_cards, "Outstanding to funders", RED
+        )
+        for column, card in enumerate((
+            self.client_paid_card, self.other_funded_card,
+            self.funder_reimbursed_card, self.funder_outstanding_card,
+        )):
+            card.grid(row=0, column=column, sticky="nsew", padx=(0, 8) if column < 3 else 0)
+            self.funding_cards.columnconfigure(column, weight=1, uniform="funding_metric_cards")
         self.reconciliation_label = ttk.Label(
             self,
             text="Cash on-hand is shared across projects. Project budget remaining = deposits − all active expenses.",
@@ -12982,12 +13948,15 @@ class ExpensesTab(BaseTab):
         self.head_cash_frame.pack(fill="x", pady=(0, 8))
         self.expense_notebook = ttk.Notebook(self)
         self.expense_notebook.pack(fill="both", expand=True)
+        self.control_page = ttk.Frame(self.expense_notebook, padding=(8, 6))
         self.ledger_page = ttk.Frame(self.expense_notebook, padding=(2, 6))
         self.cash_page = ttk.Frame(self.expense_notebook, padding=(2, 6))
+        self.expense_notebook.add(self.control_page, text="Financial Overview")
         self.expense_notebook.add(self.ledger_page, text="Expense Ledger")
-        self.expense_notebook.add(self.cash_page, text="Petty Cash & Direct Procurement")
+        self.expense_notebook.add(self.cash_page, text="Cash Operations")
         self.funding_page=ttk.Frame(self.expense_notebook,padding=(8,6))
-        self.expense_notebook.add(self.funding_page,text='Inter-project Funding')
+        self.expense_notebook.add(self.funding_page,text='Funding & Receipts')
+        self._build_financial_control_page()
         self._build_project_funding_page()
         filters = ttk.Frame(self.ledger_page); filters.pack(fill="x")
         self.filter_var = tk.StringVar()
@@ -13034,28 +14003,60 @@ class ExpensesTab(BaseTab):
         search = ttk.Entry(search_group, textvariable=self.filter_var, width=16); search.pack(fill="x")
         search.bind("<KeyRelease>", lambda _e: self.refresh())
         date_filters = ttk.Frame(self.ledger_page); date_filters.pack(fill="x", pady=(3, 0))
-        today = date.today().isoformat()
-        self.date_from_filter = tk.StringVar(value=today)
-        self.date_to_filter = tk.StringVar(value=today)
+        # Start with the complete ledger. Date filtering remains available, but
+        # new or historical project-funded expenses must not be hidden merely
+        # because the application was opened on a later day.
+        self.date_from_filter = tk.StringVar(value="")
+        self.date_to_filter = tk.StringVar(value="")
         self.funding_option_map = {}
-        ttk.Label(date_filters, text="Funding source").pack(side="left")
+        self.funder_option_map = {}
+        # Keep the funding selectors and the date range on separate lines.  The
+        # former single-line layout clipped the To field and All Dates button
+        # on ordinary laptop-sized windows.
+        self.funding_filter_row = ttk.Frame(date_filters)
+        self.funding_filter_row.pack(fill="x")
+        self.date_filter_row = ttk.Frame(date_filters)
+        self.date_filter_row.pack(fill="x", pady=(5, 0))
+        ttk.Label(self.funding_filter_row, text="Funding source").pack(side="left")
         self.funding_selector = DynamicChecklist(
-            date_filters, "All Funding Sources", "No Funding Sources", "funding sources",
+            self.funding_filter_row, "All Funding Sources", "No Funding Sources", "funding sources",
             command=self.refresh, width=28,
         )
         self.funding_selector.pack(side="left", fill="x", padx=(4, 12))
-        ttk.Label(date_filters, text="Expense date").pack(side="left")
+        ttk.Label(self.funding_filter_row, text="Funded by").pack(side="left")
+        self.funded_by_selector = DynamicChecklist(
+            self.funding_filter_row, "All Funders", "No Funders", "funders",
+            command=self.refresh, width=23,
+        )
+        self.funded_by_selector.pack(side="left", fill="x", padx=(4, 12))
+        ttk.Label(self.funding_filter_row, text="Settlement").pack(side="left")
+        self.settlement_selector = DynamicChecklist(
+            self.funding_filter_row, "All Settlement States", "No Settlement States",
+            "settlement states", command=self.refresh, width=22,
+        )
+        self.settlement_selector.set_options((
+            ("outstanding", "Outstanding"),
+            ("partial", "Partially Settled"),
+            ("settled", "Settled"),
+            ("none", "No Inter-project Funding"),
+        ))
+        self.settlement_selector.pack(side="left", fill="x", padx=(4, 12))
+        ttk.Label(self.date_filter_row, text="Expense date").pack(side="left")
         for label, variable, boundary in (("From", self.date_from_filter, "from"),
                                            ("To", self.date_to_filter, "to")):
-            ttk.Label(date_filters, text=label).pack(side="left", padx=(12, 4))
-            entry = ttk.Entry(date_filters, textvariable=variable, width=12, state="readonly")
+            ttk.Label(self.date_filter_row, text=label).pack(side="left", padx=(12, 4))
+            entry = ttk.Entry(self.date_filter_row, textvariable=variable, width=12, state="readonly")
             entry.pack(side="left")
             entry.bind("<Button-1>", lambda _event, which=boundary: self.open_date_filter(which))
-            ttk.Button(date_filters, text="ðŸ“…", width=3,
-                       command=lambda which=boundary: self.open_date_filter(which)).pack(side="left", padx=(3, 0))
-            date_filters.winfo_children()[-1].configure(text="\U0001F4C5")
+            calendar_button = ttk.Button(
+                self.date_filter_row, text="\U0001F4C5", width=3,
+                command=lambda which=boundary: self.open_date_filter(which),
+            )
+            calendar_button.pack(side="left", padx=(3, 0))
             setattr(self, f"date_{boundary}_entry", entry)
-        ttk.Button(date_filters, text="All Dates", command=self.clear_date_filters).pack(side="left", padx=12)
+        ttk.Button(
+            self.date_filter_row, text="All Dates", command=self.clear_date_filters
+        ).pack(side="left", padx=12)
         controls = ttk.Frame(self.ledger_page); controls.pack(fill="x", pady=(4, 0))
         ttk.Button(controls, text="Edit (all heads)", command=self.edit).pack(side="left")
         ttk.Button(controls, text="Payments / Funding", command=self.pay).pack(side="left", padx=5)
@@ -13072,10 +14073,14 @@ class ExpensesTab(BaseTab):
             ("total", "Total Amount", 105), ("recovered", "Recovered", 95),
             ("net", "Net Amount", 100), ("paid", "Amount Paid", 105),
             ("outstanding", "Outstanding Amount", 125), ("date", "Payment Dates â–¾", 125),
-            ("allocation", "Cash Allocation Ref.", 150), ("withdrawal", "Withdrawal Ref.", 115),
+            ("allocation", "Cash Allocation Ref.", 150), ("withdrawal", "Cash Source Ref.", 125),
             ("item", "Item", 145), ("supplier", "Supplier", 125), ("area", "Area", 115),
             ("phase", "Phase", 105),
-            ("authorized", "Authorized by", 125),('funding_project','Funding project',170),('project_debt','Project repayment owed',145)])
+            ("authorized", "Authorized by", 125),
+            ('funding_project','Funded By',170),
+            ('project_reimbursed','Reimbursed',110),
+            ('project_debt','Inter-project Outstanding',150),
+            ('project_settlement','Settlement',125)])
         self.tree.configure(selectmode="extended")
         self.tree.tag_configure("paid", background="#ECFDF5", foreground="#065F46")
         self.tree.tag_configure("unpaid", background="#FEF2F2", foreground="#991B1B")
@@ -13083,12 +14088,220 @@ class ExpensesTab(BaseTab):
         self.tree.tag_configure("pending-partial", background="#FFF7ED", foreground="#9A3412")
         self.tree.tag_configure("void", background="#F3F4F6", foreground="#6B7280")
         self.tree.tag_configure("ca-detail", background="#EFF6FF", foreground="#1E3A8A")
+        self.tree.tag_configure("funding-outstanding", background="#FEF2F2", foreground="#991B1B")
+        self.tree.tag_configure("funding-partial", background="#FFF7ED", foreground="#9A3412")
+        self.tree.tag_configure("funding-settled", background="#ECFDF5", foreground="#065F46")
+        self.tree.tag_configure("client-paid", background="#F1F5F9", foreground="#334155")
         self.tree.bind("<ButtonRelease-1>", self._ledger_click, add="+")
         self.tree.bind("<Double-1>", self._ledger_double_click, add="+")
         self.tree.full_ledger_callback = self._ledger_size_changed
         self.current_rows = []
         self.ca_attribution_rows = {}
         self._build_cash_allocation_tab()
+
+    def _build_financial_control_page(self):
+        bar = ttk.Frame(self.control_page)
+        bar.pack(fill="x", pady=(0, 7))
+        ttk.Label(bar, text="Financial overview", style="Section.TLabel").pack(side="left")
+        ttk.Label(bar, text="View project").pack(side="left", padx=(20, 5))
+        self.control_project = tk.StringVar(value=ALL_PROJECTS_LABEL)
+        self.control_project_combo = ttk.Combobox(
+            bar, textvariable=self.control_project, state="readonly", width=28
+        )
+        self.control_project_combo.pack(side="left")
+        self.control_project_combo.bind(
+            "<<ComboboxSelected>>", lambda _event: self._refresh_financial_control()
+        )
+        ttk.Button(
+            bar, text="Open Funding & Receipts", command=self._open_funding_receipts
+        ).pack(side="right")
+        ttk.Label(
+            self.control_page,
+            text=("Cash position answers where the money is. Cash ownership answers whose money it is. "
+                  "Project costs remain separate from reimbursements and management-fee income."),
+            style="Muted.TLabel", wraplength=1180,
+        ).pack(fill="x", anchor="w", pady=(0, 7))
+
+        cash_cards = ttk.Labelframe(self.control_page, text="Cash position", padding=7)
+        cash_cards.pack(fill="x", pady=(0, 7))
+        self.control_cash_values = {}
+        for column, (key, title, color) in enumerate((
+            ("physical", "Physical cash on hand", INK),
+            ("allocable", "Available to allocate", GREEN),
+            ("petty", "Reserved in Petty Cash", ORANGE),
+            ("direct", "Reserved in Direct Procurement", "#2563EB"),
+            ("surrendered", "Surrendered awaiting deposit", "#7C3AED"),
+        )):
+            card, value = metric_card(cash_cards, title, color)
+            card.grid(row=0, column=column, sticky="nsew", padx=(0, 6) if column < 4 else 0)
+            cash_cards.columnconfigure(column, weight=1, uniform="control_cash")
+            self.control_cash_values[key] = value
+
+        ownership_cards = ttk.Labelframe(
+            self.control_page, text="Cash receipts and ownership", padding=7
+        )
+        ownership_cards.pack(fill="x", pady=(0, 7))
+        self.control_ownership_values = {}
+        for column, (key, title, color) in enumerate((
+            ("received", "Physical client receipts", INK),
+            ("reimbursed", "Reimbursed to funding projects", "#2563EB"),
+            ("fee", "Montarra management fees", GREEN),
+            ("credit", "Client credits held", ORANGE),
+            ("outstanding", "Inter-project still outstanding", RED),
+        )):
+            card, value = metric_card(ownership_cards, title, color)
+            card.grid(row=0, column=column, sticky="nsew", padx=(0, 6) if column < 4 else 0)
+            ownership_cards.columnconfigure(column, weight=1, uniform="control_owner")
+            self.control_ownership_values[key] = value
+
+        self.control_boundary_note = ttk.Label(
+            self.control_page, text="", style="Muted.TLabel", wraplength=1180
+        )
+        self.control_boundary_note.pack(fill="x", anchor="w", pady=(0, 7))
+
+        details = ttk.Notebook(self.control_page)
+        details.pack(fill="both", expand=True)
+        project_page = ttk.Frame(details, padding=4)
+        receipt_page = ttk.Frame(details, padding=4)
+        settlement_page = ttk.Frame(details, padding=4)
+        # Detailed receipt and settlement operations live together in Funding
+        # & Receipts.  The overview keeps only the non-duplicated responsibility
+        # table and the summary cards above.
+        details.add(project_page, text="Project Cost Responsibility")
+
+        ttk.Label(
+            project_page,
+            text=("Construction cost is shown once. The payment columns identify whether the client, "
+                  "the same project, or another project supplied the value."),
+            style="Muted.TLabel", wraplength=1120,
+        ).pack(fill="x", anchor="w", pady=(0, 5))
+        self.control_project_tree = make_tree(project_page, [
+            ("project", "Project", 160), ("total", "Total Construction Cost", 145),
+            ("client", "Client Paid Direct", 125), ("own", "Own Project Paid", 125),
+            ("other", "Other Project / Montarra Funded", 175),
+            ("ca", "CA Cost Funded Elsewhere", 150),
+            ("unpaid", "Unpaid / Uncovered", 130),
+            ("received", "Physical Cash Received", 145),
+        ])
+
+        ttk.Label(
+            receipt_page,
+            text=("Every physical receipt keeps its original amount visible. Applications transfer "
+                  "ownership; they do not create or destroy company cash."),
+            style="Muted.TLabel", wraplength=1120,
+        ).pack(fill="x", anchor="w", pady=(0, 5))
+        self.control_receipt_tree = make_tree(receipt_page, [
+            ("date", "Date", 95), ("reference", "Receipt Ref.", 145),
+            ("project", "Received From / Project", 165), ("original", "Original Receipt", 115),
+            ("repaid", "Inter-project Repaid", 130), ("fee", "Management Fee", 115),
+            ("credit", "Client Credit", 105), ("unclassified", "Unclassified", 105),
+            ("available", "Not Applied to Repayment", 145),
+            ("location", "Recorded Cash Location", 145),
+            ("purpose", "Purpose / Notes", 260),
+        ])
+
+        ttk.Label(
+            settlement_page,
+            text=("Settled rows confirm reimbursement. Outstanding rows are newer obligations and are "
+                  "not part of the first Grace payment."),
+            style="Muted.TLabel", wraplength=1120,
+        ).pack(fill="x", anchor="w", pady=(0, 5))
+        self.control_settlement_tree = make_tree(settlement_page, [
+            ("reference", "Funding Ref.", 145), ("lender", "Funding Project", 145),
+            ("borrower", "Expense Project", 145), ("kind", "Type", 120),
+            ("expense", "Linked Expense", 220), ("provided", "Provided", 105),
+            ("repaid", "Repaid", 105), ("outstanding", "Outstanding", 110),
+            ("status", "Status", 95), ("date", "Date", 95),
+        ])
+        self.control_settlement_tree.tag_configure(
+            "outstanding", background="#FEF2F2", foreground="#991B1B"
+        )
+        self.control_settlement_tree.tag_configure(
+            "partial", background="#FFF7ED", foreground="#9A3412"
+        )
+        self.control_settlement_tree.tag_configure(
+            "settled", background="#ECFDF5", foreground="#065F46"
+        )
+
+    def _refresh_financial_control(self):
+        if not hasattr(self, "control_project_combo"):
+            return
+        options = {ALL_PROJECTS_LABEL: None}
+        options.update({
+            f"{row['name']} [#{row['id']}]": row["id"]
+            for row in self.db.all("SELECT id,name FROM projects ORDER BY name COLLATE NOCASE")
+        })
+        self.control_project_combo.configure(values=list(options))
+        if self.control_project.get() not in options:
+            self.control_project.set(ALL_PROJECTS_LABEL)
+        project_id = options[self.control_project.get()]
+
+        position = self.db.financial_control_position()
+        for key, amount in (
+            ("physical", position["physical_cents"]),
+            ("allocable", position["allocable_cents"]),
+            ("petty", position["petty_cents"]),
+            ("direct", position["direct_cents"]),
+            ("surrendered", position["surrendered_cents"]),
+        ):
+            self.control_cash_values[key].config(text=money(amount))
+
+        receipts = self.db.financial_control_receipts(project_id)
+        received = sum(row["amount_cents"] for row in receipts)
+        reimbursed = sum(row["reimbursement_cents"] for row in receipts)
+        fee = sum(row["management_fee_cents"] for row in receipts)
+        credit = sum(row["client_credit_cents"] for row in receipts)
+        loans = self.db.interproject_loans(project_id)
+        outstanding = sum(row["outstanding_cents"] for row in loans)
+        for key, amount in (
+            ("received", received), ("reimbursed", reimbursed), ("fee", fee),
+            ("credit", credit), ("outstanding", outstanding),
+        ):
+            self.control_ownership_values[key].config(text=money(amount))
+        self.control_boundary_note.config(
+            text=(f"Available source check: eligible WD cash {money(position['eligible_wd_cents'])} + "
+                  f"placed project receipts {money(position['physical_receipt_cents'])} = "
+                  f"{money(position['eligible_wd_cents'] + position['physical_receipt_cents'])}. "
+                  f"Receipts awaiting placement {money(position['pending_receipt_cents'])} | "
+                  f"receipt cash deposited to banks {money(position['banked_receipt_cents'])}. "
+                  f"Live boundary {position['cutoff_date']} | Opening physical cash "
+                  f"{money(position['opening_cash_cents'])} | Source-ledger bridge "
+                  f"{money(position['reconciliation_adjustment_cents'])}. Historical expenses remain "
+                  "reportable but no longer consume current allocable cash twice.")
+        )
+
+        self.control_project_tree.delete(*self.control_project_tree.get_children())
+        for row in self.db.financial_control_projects(project_id):
+            self.control_project_tree.insert("", "end", iid=row["project_id"], values=(
+                row["project"], money(row["total_cents"]), money(row["client_paid_cents"]),
+                money(row["own_paid_cents"]), money(row["other_funded_cents"]),
+                money(row["ca_funded_cents"]), money(row["outstanding_cents"]),
+                money(row["cash_received_cents"]),
+            ))
+
+        self.control_receipt_tree.delete(*self.control_receipt_tree.get_children())
+        for row in receipts:
+            self.control_receipt_tree.insert("", "end", iid=row["id"], values=(
+                row["txn_date"], row["system_reference"] or f"CR-{row['id']:06d}",
+                row["project"], money(row["amount_cents"]), money(row["repayment_cents"]),
+                money(row["management_fee_cents"]), money(row["client_credit_cents"]),
+                money(row["unclassified_cents"]), money(row["unapplied_cents"]),
+                "Cash on hand" if row["cash_received"] else "Deposited to bank",
+                row["purpose"] or row["notes"],
+            ))
+
+        self.control_settlement_tree.delete(*self.control_settlement_tree.get_children())
+        for row in loans:
+            status = ("Settled" if row["outstanding_cents"] == 0 else
+                      "Partially Settled" if row["repaid_cents"] else "Outstanding")
+            tag = ("settled" if row["outstanding_cents"] == 0 else
+                   "partial" if row["repaid_cents"] else "outstanding")
+            self.control_settlement_tree.insert("", "end", iid=row["id"], values=(
+                row["reference"], row["lender"], row["borrower"], row["kind"],
+                row["expense_name"], money(row["amount_cents"]), money(row["repaid_cents"]),
+                money(row["outstanding_cents"]),
+                status, row["loan_date"],
+            ), tags=(tag,))
 
     def _build_cash_allocation_tab(self):
         toolbar = ttk.Frame(self.cash_page); toolbar.pack(fill="x", pady=(0, 8))
@@ -13099,7 +14312,7 @@ class ExpensesTab(BaseTab):
         )
         self.cash_project_combo.pack(side="left", padx=(6, 10))
         self.cash_project_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_cash_tab())
-        ttk.Button(toolbar, text="+ Allocate Withdrawal", style="Primary.TButton",
+        ttk.Button(toolbar, text="+ Allocate Cash", style="Primary.TButton",
                    command=self.issue_cash_allocation).pack(side="right")
         ttk.Button(toolbar, text="Deposit All Surrendered", style="Primary.TButton",
                    command=self.deposit_surrendered_cash).pack(side="right", padx=(0, 6))
@@ -13136,16 +14349,14 @@ class ExpensesTab(BaseTab):
 
         overview = ttk.Frame(self.cash_page); overview.pack(fill="x", pady=(0, 8))
         overview.columnconfigure(0,weight=1);overview.columnconfigure(1,weight=1)
-        overview.columnconfigure(2,weight=1)
         self.cash_overview_vars={};self.cash_overview_combos={}
         self.cash_overview_maps={};self.cash_overview_details={}
         for column,key,title in (
             (0,"petty","All active Petty Cash allocations"),
             (1,"direct","All active Direct Procurement allocations"),
-            (2,"grace","Project Grace cash receipts / deposits"),
         ):
             box=ttk.Labelframe(overview,text=title,padding=7)
-            box.grid(row=0,column=column,sticky="nsew",padx=(0,6) if column<2 else 0)
+            box.grid(row=0,column=column,sticky="nsew",padx=(0,6) if column<1 else 0)
             variable=tk.StringVar(value="")
             combo=ttk.Combobox(box,textvariable=variable,state="readonly",width=38)
             combo.pack(fill="x")
@@ -13170,7 +14381,7 @@ class ExpensesTab(BaseTab):
         self.allocation_tree = make_tree(allocations, [
             ("reference", "Reference", 155), ("project", "Scope", 125),
             ("type", "Type", 125), ("holder", "Holder / Payee", 145),
-            ("withdrawal", "Withdrawal", 100), ("issued", "Issued", 105),
+            ("withdrawal", "Cash Sources", 125), ("issued", "Issued", 105),
             ("spent", "Money Out", 105), ("repayment", "Repayment Surrendered", 135),
             ("net_used", "Net Expense", 105), ("remaining", "Spendable Remaining", 125),
             ("date", "Date & Time", 145), ("status", "Status", 100),
@@ -13203,10 +14414,28 @@ class ExpensesTab(BaseTab):
                 self.allocation_tree.selection_set(iid);self.allocation_tree.focus(iid)
                 self.allocation_tree.see(iid);self._refresh_allocation_transactions()
         else:
+            receipt = next(
+                (row for row in self.db.financial_control_receipts(record["project_id"])
+                 if row["id"] == record["id"]),
+                None,
+            )
+            application = ""
+            if receipt:
+                application = (
+                    f" | Reimbursed {money(receipt['reimbursement_cents'])}"
+                    f" | Fee {money(receipt['management_fee_cents'])}"
+                    f" | Client credit {money(receipt['client_credit_cents'])}"
+                    f" | Not applied {money(receipt['unapplied_cents'])}"
+                )
             self.cash_overview_details[kind].configure(
                 text=(f"{record['receipt_type']} | {record['destination']} | "
-                      f"{record['purpose'] or 'No purpose entered'}")
+                      f"{record['purpose'] or 'No purpose entered'}{application}")
             )
+
+    def view_cash_receipt_activity(self):
+        """Open the consolidated, non-project-specific receipt activity view."""
+        self._open_funding_receipts()
+        self.refresh_receipt_register()
 
     def _refresh_cash_overview(self):
         if not hasattr(self,"cash_overview_combos"):return
@@ -13227,21 +14456,6 @@ class ExpensesTab(BaseTab):
                                                (values[0] if values else "No active allocations"))
             self.cash_overview_details[kind].configure(
                 text=f"{len(records)} active | Total spendable {money(total)}")
-        receipts=self.db.project_receipt_overview("Project Grace")
-        mapping={}
-        for row in receipts:
-            reference=row["system_reference"] or f"Deposit #{row['id']}"
-            label=(f"{reference} | {row['txn_date']} | {row['receipt_type']} | "
-                   f"{money(row['amount_cents'])}")
-            mapping[label]=row
-        values=list(mapping)
-        self.cash_overview_maps["grace"]=mapping
-        self.cash_overview_combos["grace"].configure(values=values)
-        current=self.cash_overview_vars["grace"].get()
-        self.cash_overview_vars["grace"].set(current if current in mapping else
-                                              (values[0] if values else "No active Grace receipts"))
-        if values:self._select_cash_overview("grace")
-        else:self.cash_overview_details["grace"].configure(text="No active Project Grace deposits found.")
 
     def edit_cash_allocation(self):
         selected=self.allocation_tree.selection()
@@ -13280,7 +14494,7 @@ class ExpensesTab(BaseTab):
         data = win.result
         approval_details = (
             f"Shared {data['allocation_type']} of {money(data['amount_cents'])}; "
-            'withdrawals: '+', '.join(f"{self.db.one('SELECT system_reference FROM remittances WHERE id=?',(wid,))['system_reference']} {money(value)}" for wid,value in data['withdrawal_sources'])
+            'cash sources: '+', '.join(f"{self.db.one('SELECT system_reference FROM remittances WHERE id=?',(wid,))['system_reference']} {money(value)}" for wid,value in data['withdrawal_sources'])
         )
         if cash_allocation_approval_mode(data["allocation_type"]) == "Single Issuer":
             approval = self.app.authorize_registered_head(
@@ -13858,6 +15072,8 @@ class ExpensesTab(BaseTab):
         if 'Paid' not in self.status_selector.selected():return 0,0
         if 'Other' not in self.mop_selector.selected():return 0,0
         if len(self.funding_selector.selected())!=len(self.funding_selector.options):return 0,0
+        if len(self.funded_by_selector.selected())!=len(self.funded_by_selector.options):return 0,0
+        if len(self.settlement_selector.selected())!=len(self.settlement_selector.options):return 0,0
         count=total=0
         for source in self.db.payroll_ca_attributions(project_ids):
             row=dict(source)
@@ -13882,15 +15098,23 @@ class ExpensesTab(BaseTab):
                 row['allocation_references'] or '—',row['withdrawal_references'] or '—',
                 f"{reference}; transaction #{row['transaction_id']}; already included in payroll gross cost",
                 row['employee'],row['area'],row['phase'],row['authorized_by'],row['cash_funder'],
-                money(row['project_debt_cents'])),tags=('ca-detail',))
+                '0.00',money(row['project_debt_cents']),
+                'Outstanding' if row['project_debt_cents'] else 'Settled'),tags=('ca-detail',))
             count+=1;total+=row['amount_cents']
         return count,total
 
     def _display_lender_recoverables(self,project_ids):
         # Virtual ledger rows cannot enter SQL expense/payment totals or be voided independently.
         if len(self.funding_selector.selected())!=len(self.funding_selector.options):return
+        selected_funders=set(self.funded_by_selector.selected())
+        all_funders=len(selected_funders)==len(self.funded_by_selector.options)
+        selected_settlements=set(self.settlement_selector.selected())
         for loan in self.db.interproject_loans():
             if loan['lender_project_id'] not in project_ids:continue
+            if not all_funders and f"project:{loan['lender_project_id']}" not in selected_funders:continue
+            settlement_key=('settled' if loan['outstanding_cents']==0 else
+                            'partial' if loan['repaid_cents'] else 'outstanding')
+            if settlement_key not in selected_settlements:continue
             if 'Paid' not in self.status_selector.selected():continue
             if self.date_from_filter.get() and loan['loan_date']<self.date_from_filter.get():continue
             if self.date_to_filter.get() and loan['loan_date']>self.date_to_filter.get():continue
@@ -13916,7 +15140,10 @@ class ExpensesTab(BaseTab):
                 f"Funds provided to {loan['borrower']}",method,'',money(loan['amount_cents']),
                 money(loan['repaid_cents']),'Excluded from costs',money(loan['amount_cents']),
                 'No supplier bill',loan['loan_date'],allocation,withdrawal,expense['item'],expense['supplier'],expense['area'],'',
-                'Linked funding record',loan['lender'],money(loan['outstanding_cents'])),tags=('recoverable',))
+                'Linked funding record',loan['lender'],money(loan['repaid_cents']),
+                money(loan['outstanding_cents']),
+                'Settled' if loan['outstanding_cents']==0 else
+                'Partially Settled' if loan['repaid_cents'] else 'Outstanding'),tags=('recoverable',))
         self.tree.tag_configure('recoverable',foreground='#2563EB')
 
     def open_date_filter(self, boundary):
@@ -13944,8 +15171,298 @@ class ExpensesTab(BaseTab):
         return {row["name"]: row["id"] for row in self.db.all(
             "SELECT id,name FROM phases WHERE project_id=? ORDER BY sort_order,id", (project_id,))}
 
+    def _open_funding_receipts(self):
+        self.expense_notebook.select(self.funding_page)
+        if hasattr(self, "funding_notebook"):
+            self.funding_notebook.select(self.receipts_page)
+
+    def _build_receipt_register(self):
+        page = self.receipts_page
+        bar = ttk.Frame(page); bar.pack(fill="x", pady=(0, 7))
+        ttk.Label(bar, text="Project").pack(side="left")
+        self.receipt_project = tk.StringVar(value=ALL_PROJECTS_LABEL)
+        self.receipt_project_widget = ttk.Combobox(
+            bar, textvariable=self.receipt_project, state="readonly", width=28
+        )
+        self.receipt_project_widget.pack(side="left", padx=8)
+        self.receipt_project_widget.bind(
+            "<<ComboboxSelected>>", lambda _event: self.refresh_receipt_register()
+        )
+        ttk.Button(
+            bar, text="+ Record Cash Receipt", style="Primary.TButton",
+            command=self.record_project_cash_receipt,
+        ).pack(side="right")
+        ttk.Button(
+            bar, text="Deposit to Bank", command=lambda: self.place_selected_receipt("Bank Deposit")
+        ).pack(side="right", padx=6)
+        ttk.Button(
+            bar, text="Place in Project Cash Pool",
+            command=lambda: self.place_selected_receipt("Project Cash Pool")
+        ).pack(side="right")
+
+        ttk.Label(
+            page,
+            text=("Physical location and project ownership are tracked separately. New cash receipts "
+                  "remain unavailable until placed in the receiving project's cash pool or deposited "
+                  "to an enrolled bank. Partial splits are allowed."),
+            style="Muted.TLabel", wraplength=1120,
+        ).pack(fill="x", anchor="w", pady=(0, 7))
+
+        cards = ttk.Frame(page); cards.pack(fill="x", pady=(0, 7))
+        self.receipt_metric_values = {}
+        for column, (key, title, color) in enumerate((
+            ("received", "Total Project Receipts / Deposits", INK),
+            ("pending", "Awaiting Placement", ORANGE),
+            ("pool", "Placed in Project Cash Pools", GREEN),
+            ("bank", "Deposited to Banks", "#2563EB"),
+        )):
+            card, value = metric_card(cards, title, color)
+            card.grid(row=0, column=column, sticky="nsew", padx=(0, 6) if column < 3 else 0)
+            cards.columnconfigure(column, weight=1, uniform="receipt_metrics")
+            self.receipt_metric_values[key] = value
+
+        register = ttk.Labelframe(page, text="All project receipts and deposits", padding=6)
+        register.pack(fill="both", expand=True, pady=(0, 7))
+        self.receipt_tree = make_tree(register, [
+            ("date", "Date", 95), ("reference", "Receipt Ref.", 145),
+            ("project", "Receiving Project", 155), ("type", "Receipt Type", 140),
+            ("original", "Original Amount", 115), ("pending", "Awaiting Placement", 125),
+            ("pool", "Project Cash Pool", 115), ("bank", "Deposited to Bank", 115),
+            ("reimbursed", "Reimbursed", 105), ("fee", "Management Fee", 105),
+            ("credit", "Client Credit", 95), ("status", "Placement Status", 125),
+        ])
+        self.receipt_tree.tag_configure("pending", background="#FFF7ED", foreground="#9A3412")
+        self.receipt_tree.tag_configure("partial", background="#FFFBEB", foreground="#92400E")
+        self.receipt_tree.tag_configure("placed", background="#ECFDF5", foreground="#065F46")
+        self.receipt_tree.tag_configure("bank", background="#EFF6FF", foreground="#1E3A8A")
+        self.receipt_tree.bind(
+            "<<TreeviewSelect>>", lambda _event: self.refresh_receipt_activity()
+        )
+
+        activity = ttk.Labelframe(page, text="Selected receipt activity", padding=6)
+        activity.pack(fill="both", expand=True)
+        self.receipt_activity_note = ttk.Label(
+            activity, text="Select a receipt to see its complete cash trail.",
+            style="Muted.TLabel", wraplength=1120,
+        )
+        self.receipt_activity_note.pack(fill="x", anchor="w", pady=(0, 4))
+        self.receipt_activity_tree = make_tree(activity, [
+            ("date", "Date", 95), ("reference", "Activity Ref.", 145),
+            ("activity", "Activity", 170), ("amount", "Amount", 105),
+            ("destination", "Destination / Ownership", 210),
+            ("status", "Status", 90), ("notes", "Notes", 280),
+        ])
+        self.receipt_activity_tree.tag_configure(
+            "void", background="#F3F4F6", foreground="#6B7280"
+        )
+
+    def _selected_receipt(self):
+        selected = self.receipt_tree.selection() if hasattr(self, "receipt_tree") else ()
+        if not selected:
+            return None
+        return self.receipt_rows.get(int(selected[0]))
+
+    def record_project_cash_receipt(self):
+        initial = {"type": "Deposit", "destination": "Cash Received On Hand"}
+        project_id = self.receipt_project_options.get(self.receipt_project.get())
+        if project_id:
+            initial["project"] = next(
+                (label for label, value in self.project_options().items() if value == project_id), ""
+            )
+        self.app.pages["Remittances"].add(initial)
+        self.refresh_receipt_register()
+
+    def place_selected_receipt(self, placement_type):
+        row = self._selected_receipt()
+        if not row:
+            messagebox.showinfo(APP_TITLE, "Select a physical cash receipt first.", parent=self)
+            return
+        if not row["cash_received"]:
+            messagebox.showinfo(
+                APP_TITLE, "This entry was deposited directly to a bank and needs no placement.",
+                parent=self,
+            )
+            return
+        pending = row["pending_cents"]
+        if pending <= 0:
+            messagebox.showinfo(
+                APP_TITLE, "This receipt has already been fully placed.", parent=self
+            )
+            return
+        fields = [
+            ("_receipt", "Receipt", None, "display"),
+            ("_project", "Receiving project", None, "display"),
+            ("_pending", "Awaiting placement", None, "display"),
+            ("amount", "Amount"), ("placement_date", "Placement date"),
+        ]
+        banks = {}
+        if placement_type == "Bank Deposit":
+            banks = self.app.pages["Remittances"].bank_options()
+            if not banks:
+                messagebox.showerror(
+                    APP_TITLE, "Enroll an active bank account before depositing this receipt.",
+                    parent=self,
+                )
+                return
+            fields.append(("bank", "Destination bank", list(banks)))
+        fields.append(("notes", "Notes"))
+        initial = {
+            "_receipt": row["system_reference"] or f"CR-{row['id']:06d}",
+            "_project": row["project"], "_pending": money(pending),
+            "amount": money(pending), "placement_date": date.today().isoformat(),
+        }
+        if banks:
+            initial["bank"] = next(iter(banks))
+        data = dialog(
+            self, placement_type, fields, initial,
+            required_keys=("amount", "placement_date") + (("bank",) if banks else ()),
+        )
+        if not data:
+            return
+        try:
+            amount = cents(data["amount"])
+            details = (
+                f"{row['system_reference']} | {row['project']} | {money(amount)} -> "
+                f"{placement_type}"
+            )
+            head = self.app.authorize_for_project(
+                row["project_id"], f"{placement_type} from client receipt", details
+            )
+            if not head:
+                return
+            result = self.db.place_cash_receipt(
+                row["id"], placement_type, amount, data["placement_date"], head["id"],
+                banks.get(data.get("bank")) if banks else None, data.get("notes", ""),
+            )
+            self.app.refresh_all()
+            self.refresh_receipt_register(select_id=row["id"])
+            messagebox.showinfo(
+                APP_TITLE,
+                f"{result['reference']} recorded.\nRemaining awaiting placement: "
+                f"{money(result['remaining_cents'])}", parent=self,
+            )
+        except (ValueError, sqlite3.Error, KeyError) as exc:
+            messagebox.showerror(APP_TITLE, str(exc), parent=self)
+
+    def refresh_receipt_register(self, select_id=None):
+        if not hasattr(self, "receipt_project_widget"):
+            return
+        options = {ALL_PROJECTS_LABEL: None}
+        options.update({
+            f"{row['name']} [#{row['id']}]": row["id"]
+            for row in self.db.all("SELECT id,name FROM projects ORDER BY name COLLATE NOCASE")
+        })
+        self.receipt_project_options = options
+        self.receipt_project_widget.configure(values=list(options))
+        if self.receipt_project.get() not in options:
+            self.receipt_project.set(ALL_PROJECTS_LABEL)
+        project_id = options[self.receipt_project.get()]
+        rows = self.db.cash_receipt_register(project_id)
+        self.receipt_rows = {row["id"]: row for row in rows}
+        total = sum(row["amount_cents"] for row in rows)
+        pending = sum(row["pending_cents"] for row in rows)
+        pool = sum(row["pool_cents"] for row in rows)
+        bank = sum(row["bank_cents"] for row in rows)
+        for key, amount in (("received", total), ("pending", pending),
+                            ("pool", pool), ("bank", bank)):
+            self.receipt_metric_values[key].config(text=money(amount))
+        previous = select_id or (
+            int(self.receipt_tree.selection()[0]) if self.receipt_tree.selection() else None
+        )
+        self.receipt_tree.delete(*self.receipt_tree.get_children())
+        for row in rows:
+            tag = ("bank" if not row["cash_received"] else
+                   "pending" if row["placement_status"] == "Awaiting Placement" else
+                   "partial" if row["placement_status"] == "Partially Placed" else "placed")
+            self.receipt_tree.insert("", "end", iid=row["id"], values=(
+                row["txn_date"], row["system_reference"] or f"Deposit #{row['id']}",
+                row["project"], row["receipt_type"], money(row["amount_cents"]),
+                money(row["pending_cents"]), money(row["pool_cents"]), money(row["bank_cents"]),
+                money(row["reimbursement_cents"]), money(row["management_fee_cents"]),
+                money(row["client_credit_cents"]), row["placement_status"],
+            ), tags=(tag,))
+        if previous in self.receipt_rows:
+            self.receipt_tree.selection_set(previous); self.receipt_tree.focus(previous)
+            self.receipt_tree.see(previous)
+        elif rows:
+            self.receipt_tree.selection_set(rows[0]["id"]); self.receipt_tree.focus(rows[0]["id"])
+        self.refresh_receipt_activity()
+
+    def refresh_receipt_activity(self):
+        if not hasattr(self, "receipt_activity_tree"):
+            return
+        self.receipt_activity_tree.delete(*self.receipt_activity_tree.get_children())
+        row = self._selected_receipt()
+        if not row:
+            self.receipt_activity_note.configure(
+                text="Select a receipt to see its complete cash trail."
+            )
+            return
+        accounts = self.db.cash_receipt_project_accounts(row["id"])
+        self.receipt_activity_note.configure(
+            text=(f"{row['system_reference']} | {row['project']} | Original {money(row['amount_cents'])} | "
+                  f"Pending {money(row['pending_cents'])} | {len(accounts)} project cash account(s) | "
+                  f"{row['purpose'] or 'No purpose entered'}")
+        )
+        self.receipt_activity_tree.insert("", "end", iid=f"receipt-{row['id']}", values=(
+            row["txn_date"], row["system_reference"], "Receipt recorded",
+            money(row["amount_cents"]), row["project"], "Active", row["notes"],
+        ))
+        for account in accounts:
+            notes = (
+                f"Available {money(account['available_cents'])} | "
+                f"Allocated {money(account['allocated_cents'])}"
+            )
+            if account["breakdown"]:
+                notes += f" | {account['breakdown']}"
+            self.receipt_activity_tree.insert(
+                "", "end", iid=f"account-{row['id']}-{account['project_id']}", values=(
+                    account["receipt_date"], account["account_reference"],
+                    account["account_type"], money(account["owned_cents"]),
+                    f"{account['project']} cash account", account["status"], notes,
+                )
+            )
+        for placement in self.db.all(
+            """SELECT cp.*,COALESCE(b.bank_name || CASE WHEN b.account_name<>''
+                       THEN ' - ' || b.account_name ELSE '' END,'') bank_name
+               FROM cash_receipt_placements cp
+               LEFT JOIN bank_accounts b ON b.id=cp.bank_account_id
+               WHERE cp.receipt_id=? ORDER BY cp.placement_date,cp.id""",
+            (row["id"],),
+        ):
+            destination = (row["project"] + " cash pool" if
+                           placement["placement_type"] == "Project Cash Pool" else
+                           placement["bank_name"] or "Bank")
+            self.receipt_activity_tree.insert("", "end", iid=f"placement-{placement['id']}", values=(
+                placement["placement_date"], placement["system_reference"],
+                placement["placement_type"], money(placement["amount_cents"]), destination,
+                "Voided" if placement["voided"] else "Recorded", placement["notes"],
+            ), tags=("void",) if placement["voided"] else ())
+        for repayment in self.db.all(
+            """SELECT pr.*,l.reference funding_reference,lender.name lender
+               FROM project_funding_repayments pr
+               JOIN project_funding_loans l ON l.id=pr.loan_id
+               JOIN projects lender ON lender.id=l.lender_project_id
+               WHERE pr.source_remittance_id=? ORDER BY pr.repayment_date,pr.id""",
+            (row["id"],),
+        ):
+            self.receipt_activity_tree.insert("", "end", iid=f"repayment-{repayment['id']}", values=(
+                repayment["repayment_date"], repayment["system_reference"],
+                "Inter-project repayment", money(repayment["amount_cents"]),
+                repayment["lender"], "Undone" if repayment["voided"] else "Settled",
+                f"{repayment['funding_reference']} | {repayment['notes']}",
+            ), tags=("void",) if repayment["voided"] else ())
+
     def _build_project_funding_page(self):
-        bar=ttk.Frame(self.funding_page);bar.pack(fill='x')
+        self.funding_notebook = ttk.Notebook(self.funding_page)
+        self.funding_notebook.pack(fill="both", expand=True)
+        self.receipts_page = ttk.Frame(self.funding_notebook, padding=(4, 5))
+        self.loans_page = ttk.Frame(self.funding_notebook, padding=(4, 5))
+        self.funding_notebook.add(self.receipts_page, text="Client Receipts")
+        self.funding_notebook.add(self.loans_page, text="Inter-project Balances")
+        self._build_receipt_register()
+        loan_page = self.loans_page
+        bar=ttk.Frame(loan_page);bar.pack(fill='x')
         self.loan_project=tk.StringVar(value=ALL_PROJECTS_LABEL)
         ttk.Label(bar,text='Project').pack(side='left')
         self.loan_project_widget=ttk.Combobox(bar,textvariable=self.loan_project,state='readonly',width=28)
@@ -13953,17 +15470,17 @@ class ExpensesTab(BaseTab):
         self.loan_project_widget.bind('<<ComboboxSelected>>',lambda _e:self.refresh_project_funding())
         ttk.Button(bar,text='Repay selected',command=self.record_project_repayment).pack(side='right')
         ttk.Button(bar,text='Undo selected repayment',command=self.undo_project_repayment).pack(side='right',padx=6)
-        self.loan_summary=ttk.Label(self.funding_page,style='Section.TLabel')
+        self.loan_summary=ttk.Label(loan_page,style='Section.TLabel')
         self.loan_summary.pack(anchor='w',pady=8)
-        ttk.Label(self.funding_page,text='Lender: recoverable money out. Borrower: supplier paid, project repayment outstanding. These are linked records, not duplicate expenses.',style='Muted.TLabel',wraplength=1000).pack(anchor='w')
-        self.loan_tree=make_tree(self.funding_page,[('ref','Borrowing reference',145),('lender','Funding project',150),
+        ttk.Label(loan_page,text='Lender: recoverable money out. Borrower: supplier paid, project repayment outstanding. These are linked records, not duplicate expenses.',style='Muted.TLabel',wraplength=1000).pack(anchor='w')
+        self.loan_tree=make_tree(loan_page,[('ref','Borrowing reference',145),('lender','Funding project',150),
             ('borrower','Expense project',150),('expense','Linked expense',210),('kind','Type',125),
             ('amount','Provided',100),('repaid','Repaid',95),('balance','Outstanding',100),('status','Status',100),('date','Date',100)])
         self.loan_tree.configure(selectmode='extended')
         self.loan_tree.bind('<<TreeviewSelect>>',lambda _e:self.refresh_project_repayments())
         self.loan_tree.bind('<Double-1>',self.open_borrowed_expense)
-        ttk.Label(self.funding_page,text='Repayment history for the selected borrowing',style='Section.TLabel').pack(anchor='w',pady=5)
-        self.loan_repayments=make_tree(self.funding_page,[('date','Date',95),('amount','Amount',90),
+        ttk.Label(loan_page,text='Repayment history for the selected borrowing',style='Section.TLabel').pack(anchor='w',pady=5)
+        self.loan_repayments=make_tree(loan_page,[('date','Date',95),('amount','Amount',90),
             ('system_ref','Repayment Ref.',150),('batch_ref','Batch Ref.',150),('source','Source',240),
             ('ref','Supporting Ref.',150),('notes','Notes',230),('status','Status',90)])
 
@@ -14107,8 +15624,6 @@ class ExpensesTab(BaseTab):
         except (ValueError,sqlite3.Error) as exc:messagebox.showerror(APP_TITLE,str(exc),parent=self)
 
     def add(self, initial=None):
-        if not self.db.one("SELECT 1 FROM bank_accounts WHERE active=1 LIMIT 1"):
-            messagebox.showerror(APP_TITLE, "Enroll a bank account in Remittances before adding expenses."); return
         if not self.db.one("SELECT 1 FROM projects WHERE status<>'Completed' LIMIT 1"):
             messagebox.showinfo(
                 APP_TITLE, "There are no active projects. Create or reactivate a project before adding expenses."
@@ -14235,15 +15750,17 @@ class ExpensesTab(BaseTab):
                     for item in items:
                         cursor = self.db.conn.execute("""INSERT INTO expenses(project_id,name,item,dimensions,supplier,
                             qty,unit,unit_price_cents,total_cents,phase_id,area,trade,expense_date,due_date,invoice_no,
-                            notes,authorized_by_head_id,status,default_cash_allocation_id,expense_batch_id,funding_project_id)
-                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            notes,authorized_by_head_id,status,default_cash_allocation_id,expense_batch_id,
+                            funding_project_id,funding_source_type)
+                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                             (project_id, item["name"], item["item"], item["dimensions"], item["supplier"], item["qty"],
                              item["unit"], item["unit_price_cents"], item["total_cents"], phases.get(item["phase"]),
                              item["area"], item["trade"], item["expense_date"], item["due_date"], item["invoice_no"],
                              ((item["notes"] + " | " if item["notes"] else "") +
                               (f"Import row {item.get('import_source_row')}" if item.get("import_source_row") else "")),
                              approvals[project_id]["id"], item["status"],
-                             item.get("cash_allocation_id"), batch_id,item.get('funding_project_id',project_id)))
+                             item.get("cash_allocation_id"), batch_id,item.get('funding_project_id',project_id),
+                             item.get("funding_source_type", "Project")))
                         if item["payment_amount_cents"] > 0:
                             bank_transfer = "bank" in item["payment_method"].lower()
                             payment_reference = self.db._next_system_reference(
@@ -14251,12 +15768,13 @@ class ExpensesTab(BaseTab):
                             ) if bank_transfer else ""
                             payment_cursor = self.db.conn.execute("""INSERT INTO payments(expense_id,amount_cents,payment_date,method,
                                 reference,notes,bank_account_id,authorized_by_head_id,cash_allocation_id,
-                                system_reference,transaction_time,funding_project_id)
-                                VALUES(?,?,?,?,?,'Initial payment from bulk entry',?,?,?,?,?,?)""",
+                                system_reference,transaction_time,funding_project_id,funding_source_type)
+                                VALUES(?,?,?,?,?,'Initial payment from bulk entry',?,?,?,?,?,?,?)""",
                                 (cursor.lastrowid, item["payment_amount_cents"], item["expense_date"],
                                  item["payment_method"], "", item.get("bank_account_id"),
                                  approvals[project_id]["id"], item.get("cash_allocation_id"),
-                                 payment_reference, local_timestamp(),item.get('funding_project_id',project_id)))
+                                 payment_reference, local_timestamp(),item.get('funding_project_id',project_id),
+                                 item.get("funding_source_type", "Project")))
                             self.db._sync_project_funding_loan(payment_cursor.lastrowid)
                             if item.get("cash_allocation_id"):
                                 self.db.register_allocation_payment(
@@ -14794,6 +16312,83 @@ class ExpensesTab(BaseTab):
             )
             self.app.refresh_all()
 
+    def _expense_funding_context(self):
+        """Return one funding/settlement summary per expense for UI filtering.
+
+        Supplier-payment status and inter-project settlement are deliberately
+        separate. An expense may be fully paid to the supplier while the cost
+        project still owes the project that supplied the money.
+        """
+        project_names = {
+            row["id"]: row["name"]
+            for row in self.db.all("SELECT id,name FROM projects ORDER BY name COLLATE NOCASE")
+        }
+        context = {}
+
+        def item(expense_id):
+            return context.setdefault(expense_id, {
+                "funder_project_ids": set(), "funder_keys": set(),
+                "funder_labels": set(), "client_paid_cents": 0,
+                "interproject_cents": 0, "repaid_cents": 0,
+                "outstanding_cents": 0, "loan_count": 0,
+                "loans": [],
+                "settlement_key": "none", "settlement_label": "No Inter-project Funding",
+            })
+
+        for expense in self.db.all(
+            """SELECT id FROM expenses
+               WHERE voided=0 AND funding_source_type='Client Funded'"""
+        ):
+            record = item(expense["id"])
+            record["funder_keys"].add("client")
+            record["funder_labels"].add("Client Funded")
+
+        for payment in self.db.all(
+            """SELECT pay.expense_id,pay.amount_cents,pay.method,
+                      COALESCE(pay.funding_project_id,e.project_id) funding_project_id
+               FROM payments pay JOIN expenses e ON e.id=pay.expense_id
+               WHERE pay.accounting_excluded=0 AND e.voided=0"""
+        ):
+            record = item(payment["expense_id"])
+            if "client paid" in (payment["method"] or "").strip().lower():
+                record["client_paid_cents"] += payment["amount_cents"]
+                record["funder_keys"].add("client")
+                record["funder_labels"].add("Client Funded")
+            else:
+                project_id = payment["funding_project_id"]
+                record["funder_project_ids"].add(project_id)
+                record["funder_keys"].add(f"project:{project_id}")
+                record["funder_labels"].add(project_names.get(project_id, f"Project #{project_id}"))
+
+        for loan in self.db.interproject_loans():
+            if not loan["expense_id"]:
+                continue
+            record = item(loan["expense_id"])
+            record["funder_project_ids"].add(loan["lender_project_id"])
+            record["funder_keys"].add(f"project:{loan['lender_project_id']}")
+            record["funder_labels"].add(loan["lender"])
+            record["interproject_cents"] += loan["amount_cents"]
+            record["repaid_cents"] += loan["repaid_cents"]
+            record["outstanding_cents"] += loan["outstanding_cents"]
+            record["loan_count"] += 1
+            record["loans"].append(loan)
+
+        for record in context.values():
+            if record["loan_count"]:
+                if record["outstanding_cents"] <= 0:
+                    record["settlement_key"] = "settled"
+                    record["settlement_label"] = "Settled"
+                elif record["repaid_cents"] > 0:
+                    record["settlement_key"] = "partial"
+                    record["settlement_label"] = "Partially Settled"
+                else:
+                    record["settlement_key"] = "outstanding"
+                    record["settlement_label"] = "Outstanding"
+            if not record["funder_keys"]:
+                record["funder_keys"].add("unfunded")
+                record["funder_labels"].add("Unfunded / No Payment")
+        return context
+
     def filtered_rows(self,date_from=None,date_to=None,project_ids_override=None):
         projects = self.project_options(); where, params = ["1=1"], []
         all_project_ids = list(projects.values())
@@ -14985,7 +16580,7 @@ class ExpensesTab(BaseTab):
             where.append("e.expense_date>=?"); params.append(date_from)
         if date_to:
             where.append("e.expense_date<=?"); params.append(date_to)
-        return self.db.all(f"""SELECT e.*,pr.name project,COALESCE(ph.name,'') phase,
+        rows = self.db.all(f"""SELECT e.*,pr.name project,COALESCE(ph.name,'') phase,
             COALESCE(h.name,'') authorized_by,COALESCE(SUM(pay.amount_cents),0) payment_total,
             COALESCE(GROUP_CONCAT(DISTINCT NULLIF(TRIM(pay.method),'')),'') payment_methods,
             COALESCE(MAX(pay.payment_date),'') latest_payment_date,COUNT(pay.id) payment_count,
@@ -15019,11 +16614,45 @@ class ExpensesTab(BaseTab):
             FROM expenses e JOIN projects pr ON pr.id=e.project_id LEFT JOIN phases ph ON ph.id=e.phase_id
             LEFT JOIN project_heads h ON h.id=e.authorized_by_head_id
             LEFT JOIN payments pay ON pay.expense_id=e.id AND pay.accounting_excluded=0
-            WHERE {' AND '.join(where)} GROUP BY e.id ORDER BY e.expense_date DESC,e.id DESC""", tuple(params)), project_ids
+            WHERE {' AND '.join(where)} GROUP BY e.id ORDER BY e.expense_date DESC,e.id DESC""", tuple(params))
+
+        funding_context = self._expense_funding_context()
+        empty_context = {
+            "funder_project_ids": set(), "funder_keys": {"unfunded"},
+            "funder_labels": {"Unfunded / No Payment"}, "client_paid_cents": 0,
+            "interproject_cents": 0, "repaid_cents": 0,
+            "outstanding_cents": 0, "loan_count": 0,
+            "loans": [],
+            "settlement_key": "none", "settlement_label": "No Inter-project Funding",
+        }
+        selected_funders = set(self.funded_by_selector.selected())
+        if self.funded_by_selector.options:
+            if not selected_funders:
+                rows = []
+            elif len(selected_funders) != len(self.funded_by_selector.options):
+                rows = [
+                    row for row in rows
+                    if selected_funders.intersection(
+                        funding_context.get(row["id"], empty_context)["funder_keys"]
+                    )
+                ]
+        selected_settlements = set(self.settlement_selector.selected())
+        if not selected_settlements:
+            rows = []
+        elif len(selected_settlements) != len(self.settlement_selector.options):
+            rows = [
+                row for row in rows
+                if funding_context.get(row["id"], empty_context)["settlement_key"]
+                in selected_settlements
+            ]
+        self._funding_context = funding_context
+        self._empty_funding_context = empty_context
+        return rows, project_ids
 
     def refresh(self):
         projects = self.project_options()
         self.refresh_project_funding()
+        self.refresh_receipt_register()
         self.project_selector.set_projects([
             {"id": project_id, "name": label} for label, project_id in projects.items()
         ])
@@ -15042,8 +16671,35 @@ class ExpensesTab(BaseTab):
             funding[f"Head: {head['name']}"] = ("head", head["id"])
         self.funding_option_map = funding
         self.funding_selector.set_options((label, label) for label in funding)
+        all_funding_context = self._expense_funding_context()
+        project_names = {
+            row["id"]: row["name"]
+            for row in self.db.all("SELECT id,name FROM projects ORDER BY name COLLATE NOCASE")
+        }
+        used_project_ids = sorted({
+            project_id
+            for record in all_funding_context.values()
+            for project_id in record["funder_project_ids"]
+        }, key=lambda project_id: project_names.get(project_id, "").casefold())
+        funder_options = [
+            (f"project:{project_id}", project_names.get(project_id, f"Project #{project_id}"))
+            for project_id in used_project_ids
+        ]
+        if any("client" in record["funder_keys"] for record in all_funding_context.values()):
+            funder_options.append(("client", "Client Funded"))
+        active_expense_ids = {
+            row["id"] for row in self.db.all("SELECT id FROM expenses WHERE voided=0")
+        }
+        if active_expense_ids.difference(all_funding_context):
+            funder_options.append(("unfunded", "Unfunded / No Payment"))
+        self.funder_option_map = dict(funder_options)
+        self.funded_by_selector.set_options(funder_options)
         self.tree.delete(*self.tree.get_children()); self.current_rows, project_ids = self.filtered_rows()
         total = 0; filtered_payments = 0; filtered_outstanding = 0; verified_total = 0
+        filtered_client_paid = 0
+        filtered_other_funded = 0
+        filtered_reimbursed = 0
+        filtered_funder_outstanding = 0
         borrowing={};ca_sources={}
         for loan in self.db.interproject_loans():
             borrowing[loan['expense_id']]=borrowing.get(loan['expense_id'],0)+loan['outstanding_cents']
@@ -15051,6 +16707,9 @@ class ExpensesTab(BaseTab):
                 ca_sources.setdefault(loan['expense_id'],set()).add(loan['lender'])
         for row in self.current_rows:
             amounts=expense_ledger_amounts(row)
+            funding_record = self._funding_context.get(
+                row["id"], self._empty_funding_context
+            )
             outstanding=amounts['outstanding_cents']
             net_total=amounts['cost_cents']
             net_payments=amounts['settled_cents']
@@ -15068,7 +16727,18 @@ class ExpensesTab(BaseTab):
                               f"Paid - {advance_status}" if row["cash_advance_id"] else
                               "Paid" if outstanding <= 0 and net_total > 0 else
                               "Partially Paid" if net_payments > 0 else "Unpaid")
-            row_tag = "void" if row["voided"] else "paid" if outstanding <= 0 else "pending-partial" if net_payments else "unpaid"
+            if row["voided"]:
+                row_tag = "void"
+            elif funding_record["loan_count"] and funding_record["outstanding_cents"] > 0:
+                row_tag = ("funding-partial" if funding_record["repaid_cents"] > 0
+                           else "funding-outstanding")
+            elif funding_record["loan_count"]:
+                row_tag = "funding-settled"
+            elif funding_record["client_paid_cents"]:
+                row_tag = "client-paid"
+            else:
+                row_tag = ("paid" if outstanding <= 0 else
+                           "pending-partial" if net_payments else "unpaid")
             methods = [method.strip() for method in row["payment_methods"].split(",") if method.strip()]
             if payroll_deduction and 'Salary Deduction' not in methods:methods.append('Salary Deduction')
             mop = " / ".join(methods) if methods else "Not Paid"
@@ -15081,12 +16751,14 @@ class ExpensesTab(BaseTab):
             withdrawal = row["withdrawal_references"] or "—"
             item=row['item']+(f" | CA salary deductions attributed here: {money(payroll_deduction)}"
                               if payroll_deduction else '')
-            funding_names=[p['name'] for p in self.db.all("""SELECT DISTINCT pr.name FROM projects pr
-                    JOIN payments p ON COALESCE(p.funding_project_id,?)=pr.id
-                    WHERE p.expense_id=? AND p.accounting_excluded=0""",(row['project_id'],row['id']))]
+            funding_names = sorted(funding_record["funder_labels"], key=str.casefold)
             funding_names.extend(sorted(ca_sources.get(row['id'],set())))
-            funding_text=' / '.join(dict.fromkeys(funding_names)) or self.db.one(
-                'SELECT name FROM projects WHERE id=?',(row['funding_project_id'] or row['project_id'],))['name']
+            funding_text = ' / '.join(dict.fromkeys(funding_names))
+            if not funding_text:
+                funding_text = self.db.one(
+                    'SELECT name FROM projects WHERE id=?',
+                    (row['funding_project_id'] or row['project_id'],)
+                )['name']
             self.tree.insert("", "end", iid=row["id"], values=(row["project"], row["batch_reference"], display_status,
                 row["verification_status"] or "Unverified", row["verification_reference"] or "—",
                 row["name"], mop, row["bank_transfer_references"] or "—", money(row["total_cents"]),
@@ -15095,7 +16767,27 @@ class ExpensesTab(BaseTab):
                 row["supplier"], row["area"], row["phase"],
                 row["authorized_by"] or "Legacy / not recorded",
                 funding_text,
-                money(borrowing.get(row['id'],0))), tags=(row_tag,))
+                money(funding_record["repaid_cents"]),
+                money(funding_record["outstanding_cents"]),
+                funding_record["settlement_label"]), tags=(row_tag,))
+
+            selected_funder_keys = set(self.funded_by_selector.selected())
+            all_funders_selected = (
+                len(selected_funder_keys) == len(self.funded_by_selector.options)
+            )
+            if all_funders_selected or "client" in selected_funder_keys:
+                filtered_client_paid += funding_record["client_paid_cents"]
+            selected_project_funders = {
+                int(key.split(":", 1)[1]) for key in selected_funder_keys
+                if key.startswith("project:")
+            }
+            for loan in funding_record["loans"]:
+                if (not all_funders_selected and
+                        loan["lender_project_id"] not in selected_project_funders):
+                    continue
+                filtered_other_funded += loan["amount_cents"]
+                filtered_reimbursed += loan["repaid_cents"]
+                filtered_funder_outstanding += loan["outstanding_cents"]
         ca_detail_count,ca_detail_total=self._display_ca_attributions(project_ids)
         self._display_lender_recoverables(project_ids)
         _withdrawn, _cash_spent, cash = self.db.cash_summary()
@@ -15104,6 +16796,13 @@ class ExpensesTab(BaseTab):
         self.payments_value.config(text=money(filtered_payments), fg=GREEN)
         self.payments_outstanding_value.config(
             text=money(filtered_outstanding), fg=RED if filtered_outstanding > 0 else GREEN
+        )
+        self.client_paid_value.config(text=money(filtered_client_paid), fg="#64748B")
+        self.other_funded_value.config(text=money(filtered_other_funded), fg="#2563EB")
+        self.funder_reimbursed_value.config(text=money(filtered_reimbursed), fg=GREEN)
+        self.funder_outstanding_value.config(
+            text=money(filtered_funder_outstanding),
+            fg=RED if filtered_funder_outstanding > 0 else GREEN,
         )
         self.cash_value.config(text=money(cash), fg=GREEN if cash >= 0 else RED)
         unallocated = self.db.unallocated_cash()
@@ -15140,6 +16839,7 @@ class ExpensesTab(BaseTab):
         )
         self._refresh_head_cash_breakdown()
         self._refresh_cash_tab()
+        self._refresh_financial_control()
         visible_rows = self.tree.get_children()
         if visible_rows:
             self.tree.selection_set(visible_rows[0])
@@ -18672,7 +20372,7 @@ class RemittancesTab(BaseTab):
         for label, variable, values, width in (
             ("Type", self.transaction_type_filter,
             ["All Transaction Types", "Deposit", "Cash Receipt", "Withdrawal", "Inter-bank Transfer",
-              "Bank Transfer", "Cash Redeposit", "Repayment"], 20),
+              "Bank Transfer", "Receipt Bank Deposit", "Cash Redeposit", "Repayment"], 20),
             ("Status", self.transaction_status_filter, ["All Statuses", "Active", "VOID"], 12),
         ):
             ttk.Label(extra, text=label).pack(side="left", padx=(0, 4))
@@ -18900,13 +20600,20 @@ class RemittancesTab(BaseTab):
         self.wait_window(win)
         return win.result, projects, banks
 
-    def add(self):
-        if not self.bank_options():
+    def add(self, initial=None):
+        initial = initial or {}
+        is_initial_cash_receipt = (
+            initial.get("type", "Deposit") == "Deposit"
+            and initial.get("destination") == "Cash Received On Hand"
+        )
+        if not is_initial_cash_receipt and not self.bank_options():
             if messagebox.askyesno(APP_TITLE, "Enroll a bank account before recording remittances. Enroll one now?"):
                 self.enroll_bank()
             if not self.bank_options(): return
         initial_project = next((label for label,pid in self.project_options().items() if pid == self.project_id), "")
-        data, projects, banks = self.transaction_form({"project": initial_project})
+        form_initial = {"project": initial_project}
+        form_initial.update(initial)
+        data, projects, banks = self.transaction_form(form_initial)
         if not data: return
         is_withdrawal = data["type"] == "Withdrawal"
         cash_receipt = not is_withdrawal and data.get("destination") == "Cash Received On Hand"
@@ -19014,7 +20721,20 @@ class RemittancesTab(BaseTab):
                 """SELECT COALESCE(SUM(s.amount_cents),0) total
                    FROM cash_allocation_sources s JOIN cash_allocations a ON a.id=s.allocation_id
                    WHERE s.withdrawal_id=? AND a.voided=0""", (record_id,)
-            )["total"] if row["type"] == "Withdrawal" else 0
+            )["total"]
+            placements = self.db.one(
+                """SELECT COALESCE(SUM(amount_cents),0) total
+                   FROM cash_receipt_placements WHERE receipt_id=? AND voided=0""",
+                (record_id,),
+            )["total"] if row["cash_received"] else 0
+            if placements and (
+                amount != row["amount_cents"] or project_id != row["project_id"]
+                or not cash_receipt or data["type"] != row["type"]
+            ):
+                raise ValueError(
+                    "This cash receipt already has placement history. Its amount, project, and "
+                    "receipt type are locked; purpose and notes may still be corrected."
+                )
             if allocated and not is_withdrawal:
                 raise ValueError("A withdrawal with FIFO allocation history cannot be changed into a deposit.")
             if allocated and bank_id != row["bank_account_id"]:
@@ -19135,10 +20855,28 @@ class RemittancesTab(BaseTab):
                    WHERE s.withdrawal_id=? AND a.voided=0""",
                 (record_id,),
             )["n"]
+            receipt_activity = self.db.one(
+                """SELECT
+                     (SELECT COUNT(*) FROM cash_receipt_placements
+                       WHERE receipt_id=? AND voided=0) placements,
+                     (SELECT COUNT(*) FROM project_funding_repayments
+                       WHERE source_remittance_id=? AND voided=0) repayments""",
+                (record_id, record_id),
+            ) if row and row["cash_received"] else None
             if row and row["type"] == "Withdrawal" and linked:
                 messagebox.showerror(
                     APP_TITLE,
                     "This withdrawal has cash-allocation history and cannot be voided. Close its active allocations instead.",
+                    parent=self,
+                )
+                return
+            if row and row["cash_received"] and (
+                linked or receipt_activity["placements"] or receipt_activity["repayments"]
+            ):
+                messagebox.showerror(
+                    APP_TITLE,
+                    "This cash receipt has placement, allocation, or repayment history and cannot "
+                    "be voided from Remittances. Its audit trail must remain intact.",
                     parent=self,
                 )
                 return
@@ -19193,6 +20931,13 @@ class RemittancesTab(BaseTab):
                 "This is a surrendered-cash redeposit. Its immutable source history is managed from the Expenses petty-cash tab.",
             )
             return None
+        if record.startswith("receipt-placement-"):
+            messagebox.showinfo(
+                APP_TITLE,
+                "This is a linked client-receipt placement. Review it from Expenses → "
+                "Funding & Receipts.",
+            )
+            return None
         if record.startswith("interbank-"):
             return None
         if record.startswith("remittance-"):
@@ -19238,6 +20983,15 @@ class RemittancesTab(BaseTab):
                 """SELECT COALESCE(SUM(amount_cents),0) total FROM cash_redeposits
                    WHERE bank_account_id=? AND voided=0""", (account["id"],)
             )["total"]
+            receipt_clause = " AND project_id=?" if project_id else ""
+            receipt_params = ((account["id"], project_id) if project_id else (account["id"],))
+            receipt_deposits = self.db.one(
+                f"""SELECT COALESCE(SUM(amount_cents),0) total
+                    FROM cash_receipt_placements
+                    WHERE bank_account_id=? AND placement_type='Bank Deposit'
+                      AND voided=0{receipt_clause}""",
+                receipt_params,
+            )["total"]
             interbank_in = self.db.one(
                 """SELECT COALESCE(SUM(amount_cents),0) total FROM bank_account_transfers
                    WHERE to_bank_account_id=? AND voided=0""", (account["id"],)
@@ -19249,7 +21003,8 @@ class RemittancesTab(BaseTab):
             net_withdrawals = max(0, totals["withdrawals"] - redeposits)
             balance = self.db.bank_balance(account["id"])
             self.account_tree.insert("", "end", iid=account["id"], values=(account["bank_name"],
-                f"{account['account_name']} ••{account['account_number'][-4:]}", money(totals["deposits"]),
+                f"{account['account_name']} ••{account['account_number'][-4:]}",
+                money(totals["deposits"] + receipt_deposits),
                 money(totals["withdrawals"]), money(redeposits), money(net_withdrawals),
                 money(interbank_in), money(interbank_out), money(transfers), money(repayments),
                 money(balance)))
@@ -19309,6 +21064,26 @@ class RemittancesTab(BaseTab):
             LEFT JOIN head_registry h ON h.id=d.authorized_by_registry_id
             WHERE {' AND '.join(redeposit_where)} ORDER BY d.deposit_date DESC,d.id DESC""",
             tuple(redeposit_params))
+        receipt_placement_where = ["cp.placement_type='Bank Deposit'", "cp.voided=0"]
+        receipt_placement_params = []
+        if project_id:
+            receipt_placement_where.append("cp.project_id=?")
+            receipt_placement_params.append(project_id)
+        if bank_id:
+            receipt_placement_where.append("cp.bank_account_id=?")
+            receipt_placement_params.append(bank_id)
+        receipt_placement_rows = self.db.all(f"""SELECT cp.id,cp.placement_date txn_date,
+            cp.created_at transaction_time,cp.system_reference,r.system_reference receipt_reference,
+            p.name project,b.bank_name || ' ••' || SUBSTR(b.account_number,-4) bank,
+            cp.amount_cents,'Deposit from client receipt ' || r.system_reference purpose,
+            '' care_of,COALESCE(h.name,'Legacy / not recorded') authorized_by,cp.voided
+            FROM cash_receipt_placements cp
+            JOIN remittances r ON r.id=cp.receipt_id
+            JOIN projects p ON p.id=cp.project_id
+            JOIN bank_accounts b ON b.id=cp.bank_account_id
+            LEFT JOIN project_heads h ON h.id=cp.authorized_by_head_id
+            WHERE {' AND '.join(receipt_placement_where)}
+            ORDER BY cp.placement_date DESC,cp.id DESC""", tuple(receipt_placement_params))
         interbank_where, interbank_params = ["1=1"], []
         if bank_id:
             interbank_where.append("(t.from_bank_account_id=? OR t.to_bank_account_id=?)")
@@ -19335,6 +21110,7 @@ class RemittancesTab(BaseTab):
         ledger_rows.extend(("payment", row) for row in transfer_rows)
         ledger_rows.extend(("recovery", row) for row in recovery_rows)
         ledger_rows.extend(("redeposit", row) for row in redeposit_rows)
+        ledger_rows.extend(("receipt-placement", row) for row in receipt_placement_rows)
         ledger_rows.extend(("interbank", row) for row in interbank_rows)
         ledger_rows.sort(key=lambda entry: (entry[1]["txn_date"], entry[1]["id"]), reverse=True)
 
@@ -19342,6 +21118,7 @@ class RemittancesTab(BaseTab):
             row_type = (("Cash Receipt" if row["cash_received"] else row["type"]) if kind == "remittance" else
                         "Bank Transfer" if kind == "payment" else
                         "Inter-bank Transfer" if kind == "interbank" else
+                        "Receipt Bank Deposit" if kind == "receipt-placement" else
                         "Cash Redeposit" if kind == "redeposit" else "Repayment")
             selected_type = self.transaction_type_filter.get()
             if selected_type != "All Transaction Types" and selected_type != row_type:
@@ -19383,6 +21160,13 @@ class RemittancesTab(BaseTab):
                     occurred, reference, row["project"], row["bank"], "Cash Redeposit",
                     money(row["amount_cents"]), row["purpose"], row["care_of"],
                     row["authorized_by"], "Active",
+                ))
+                continue
+            if kind == "receipt-placement":
+                self.tree.insert("", "end", iid=f"receipt-placement-{row['id']}", values=(
+                    occurred, reference, row["project"], row["bank"], "Receipt Bank Deposit",
+                    money(row["amount_cents"]), row["purpose"], "", row["authorized_by"],
+                    "VOID" if row["voided"] else "Active",
                 ))
                 continue
             if kind == "interbank":
@@ -19682,7 +21466,10 @@ class ContractorApp(tk.Tk):
         tools.configure(menu=tools_menu); tools.pack(side="right", padx=8)
 
         page_host = tk.Frame(body, bg=SURFACE)
-        page_host.pack(fill="both", expand=True, padx=(18, 8), pady=16)
+        # Reserve a bottom safe area for Windows configurations where the
+        # taskbar overlays a maximized application.  Ledger horizontal
+        # scrollbars therefore remain visible and clickable on every tab.
+        page_host.pack(fill="both", expand=True, padx=(18, 8), pady=(16, 72))
         self.page_scrollbar = ttk.Scrollbar(page_host, orient="vertical")
         self.page_scrollbar.pack(side="right", fill="y")
         self.page_canvas = tk.Canvas(
@@ -19697,6 +21484,9 @@ class ContractorApp(tk.Tk):
         )
         # Give every tab enough vertical working room for its ledgers. The page
         # canvas remains scrollable when the application window is shorter.
+        # Keep this multiplier in one place so every main page gets the same
+        # extended scrolling area without changing embedded tables or dialogs.
+        self.page_scroll_length_multiplier = 2
         self.page_requested_height = 1000
         self.page_canvas.bind("<Configure>", self._resize_page_canvas)
         self.notebook.bind(
@@ -19742,16 +21532,22 @@ class ContractorApp(tk.Tk):
                              fg=WHITE if active else "#AAB4C5")
 
     def _resize_page_canvas(self, event):
-        page_height = max(event.height, self.page_requested_height, 1000)
+        page_height = self._effective_page_height(event.height)
         self.page_canvas.itemconfigure(self.page_window, width=event.width, height=page_height)
         self.notebook.configure(width=event.width, height=page_height)
         self.page_canvas.configure(scrollregion=(0, 0, event.width, page_height))
+
+    def _effective_page_height(self, viewport_height):
+        """Return the shared two-times scroll length used by every main tab."""
+        requested = max(1000, int(self.page_requested_height))
+        multiplier = max(1, int(getattr(self, "page_scroll_length_multiplier", 2)))
+        return max(int(viewport_height), requested * multiplier)
 
     def set_page_content_height(self, requested_height):
         """Let a page grow below the viewport while retaining whole-page scrolling."""
         self.page_requested_height = max(1000, int(requested_height))
         width = max(1, self.page_canvas.winfo_width())
-        height = max(self.page_canvas.winfo_height(), self.page_requested_height)
+        height = self._effective_page_height(self.page_canvas.winfo_height())
         self.page_canvas.itemconfigure(self.page_window, width=width, height=height)
         self.notebook.configure(width=width, height=height)
         self.page_canvas.configure(scrollregion=(0, 0, width, height))

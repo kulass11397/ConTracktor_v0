@@ -1,0 +1,36 @@
+ConTrackTor 1.7.11 - Project cash accounts and client-funded expenses
+
+INSTALLATION
+1. Close ConTrackTor and all kiosk windows.
+2. Make a fresh database backup from the client computer.
+3. Download ConTrackTor_v1_Update_1.7.11.exe from the v1.7.11 GitHub release.
+4. Run the updater under the same Windows user as the existing installation.
+5. Do not uninstall ConTrackTor and do not replace or move its database.
+6. The updater creates timestamped application and database safety backups before replacing application files.
+
+ALLOCATE PROJECT-OWNED RECEIPT CASH
+1. Open Expenses > Cash Operations.
+2. Choose Allocate Withdrawal.
+3. In Cash account owner, choose All Project Cash Accounts to inspect every available account, or choose one project to filter the list.
+4. The Grace receipt trail is shown separately as:
+   - Oasis inter-project reimbursement cash: PHP 125,804.00
+   - Grace retained receipt cash: PHP 9,896.00
+5. Select one project's receipt cash account, enter its contribution and complete the PC/DP allocation.
+6. Receipt cash owned by different projects cannot be mixed in one allocation. Create separate allocations when needed.
+
+RECORD AN EXPENSE PAID DIRECTLY BY THE CLIENT
+1. Open Expenses > Add Expense Batch.
+2. Choose the expense project.
+3. Set Funding project to Client Funded (Paid Directly by Client).
+4. Complete and commit the expense normally.
+5. The expense remains in the project's construction cost but does not consume Montarra cash, bank funds or PC/DP cash and creates no inter-project debt.
+
+DATA SAFETY
+The updater contains application files only. It contains no client database and does not rewrite the PHP 135,700 receipt or unrelated records. The two receipt cash accounts are calculated from the existing receipt and repayment trail. New data is written only when an authorized user records a new transaction.
+
+Default app: %LOCALAPPDATA%\Programs\ConTrackTor_v1
+Default data: %LOCALAPPDATA%\ConTrackTor_v1\Data\contractor_tracker.db
+Data backups: %LOCALAPPDATA%\ConTrackTor_v1\Data\Backups
+App backups: %LOCALAPPDATA%\ConTrackTor_v1\AppBackups
+
+Security: this updater is unsigned. Do not disable Defender or add exclusions if it is flagged. Submit the exact file to Microsoft for review instead.

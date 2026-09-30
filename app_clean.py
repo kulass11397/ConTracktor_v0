@@ -244,7 +244,10 @@ class CleanContractorApp(core.ContractorApp):
                       padx=(0, 8), pady=(8, 0))
             card.grid_remove()
 
-    def _metric_details_toggle(self, page, cards_parent, detail_cards, *, before):
+    def _metric_details_toggle(self, page, cards_parent, detail_cards, *, before,
+                               extra_widgets=()):
+        for widget in extra_widgets:
+            widget.pack_forget()
         row = ttk.Frame(page)
         row.pack(fill="x", before=before, pady=(0, 5))
         shown = tk.BooleanVar(value=False)
@@ -257,15 +260,22 @@ class CleanContractorApp(core.ContractorApp):
                     card.grid()
                 else:
                     card.grid_remove()
+            for widget in extra_widgets:
+                if shown.get():
+                    widget.pack(fill="x", before=before, pady=(0, 8))
+                else:
+                    widget.pack_forget()
             label.set("Hide financial breakdown ▴" if shown.get() else "Show financial breakdown ▾")
             self.after_idle(lambda: self.set_page_content_height(
                 page.requested_page_height() if hasattr(page, "requested_page_height") else 1000
             ))
 
-        ttk.Button(row, textvariable=label, command=toggle,
-                   style="CleanSubtle.TButton").pack(side="right")
+        button = ttk.Button(row, textvariable=label, command=toggle,
+                            style="CleanSubtle.TButton")
+        button.pack(side="right")
         ttk.Label(row, text="Primary operating figures are shown above.",
                   style="Muted.TLabel").pack(side="left")
+        return button
 
     # ------------------------------------------------------------------
     # Global header and page-specific control consolidation
@@ -315,12 +325,17 @@ class CleanContractorApp(core.ContractorApp):
         primary = (page.total_card, page.payments_card, page.cash_card, page.budget_card)
         detail = (page.deposit_card, page.contract_card)
         self._clean_metrics(cards, primary, detail)
-        self._metric_details_toggle(page, cards, detail, before=page.reconciliation_label)
+        page.financial_breakdown_button = self._metric_details_toggle(
+            page, cards, detail, before=page.reconciliation_label,
+            extra_widgets=(page.funding_cards,),
+        )
 
         filters = self._container_with_labels(
             page.ledger_page, ("Project", "Status", "Verification", "MOP", "Area", "Supplier", "Search")
         )
-        dates = self._container_with_labels(page.ledger_page, ("Funding source", "Expense date"))
+        dates = self._container_with_labels(
+            page.ledger_page, ("Funding source", "Funded by", "Settlement", "Expense date")
+        )
         controls_button = self._first_button(page.ledger_page, "Edit (all heads)")
         controls = controls_button.master if controls_button else None
         filter_bar = self._collapsible_section(
@@ -346,7 +361,7 @@ class CleanContractorApp(core.ContractorApp):
                               side="right", padx=(6, 0))
             self._selection_controls(page.tree, selected_actions)
 
-        cash_allocate = self._first_button(page.cash_page, "+ Allocate Withdrawal")
+        cash_allocate = self._first_button(page.cash_page, "+ Allocate Cash")
         if cash_allocate:
             toolbar = cash_allocate.master
             allocation_actions = self._first_menubutton(toolbar, "Allocation Actions")
@@ -367,7 +382,12 @@ class CleanContractorApp(core.ContractorApp):
             original_refresh = page.refresh
             def clean_refresh(*args, **kwargs):
                 result = original_refresh(*args, **kwargs)
-                parts = [page.project_selector.display_text(), page.status_selector.display_text()]
+                parts = [
+                    page.project_selector.display_text(),
+                    page.status_selector.display_text(),
+                    page.funded_by_selector.display_text(),
+                    page.settlement_selector.display_text(),
+                ]
                 if page.filter_var.get().strip():
                     parts.append(f"Search: {page.filter_var.get().strip()}")
                 filter_bar.summary_var.set(" · ".join(parts))

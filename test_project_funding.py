@@ -103,6 +103,8 @@ class ProjectFundingTests(unittest.TestCase):
         receipt=self.db.execute("""INSERT INTO remittances(project_id,type,amount_cents,txn_date,
             cash_received,system_reference,purpose) VALUES(?,'Deposit',200000,'2026-09-15',1,
             'CR-20260915-0001','Client reimbursement cash')""",(self.grace,)).lastrowid
+        self.db.place_cash_receipt(receipt,'Project Cash Pool',200000,'2026-09-15',
+            self.heads[1],notes='Test reimbursement cash placement')
         first=self.expense(self.grace,100000)
         second=self.expense(self.grace,50000)
         self.db.record_project_payment(first,100000,'2026-09-14','Cash',self.heads[0],self.oasis,self.allocation)
@@ -131,6 +133,8 @@ class ProjectFundingTests(unittest.TestCase):
         receipt=self.db.execute("""INSERT INTO remittances(project_id,type,amount_cents,txn_date,
             cash_received,system_reference) VALUES(?,'Deposit',100000,'2026-09-15',1,
             'CR-20260915-0001')""",(self.grace,)).lastrowid
+        self.db.place_cash_receipt(receipt,'Project Cash Pool',100000,'2026-09-15',
+            self.heads[1],notes='Test reimbursement cash placement')
         expense=self.expense(self.grace,40000)
         self.db.record_project_payment(expense,40000,'2026-09-14','Cash',self.heads[0],self.oasis,self.allocation)
         loan=self.db.interproject_loans(self.grace)[0]
