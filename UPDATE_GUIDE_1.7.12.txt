@@ -1,0 +1,36 @@
+ConTrackTor 1.7.12 - Multi-project expense imports
+
+INSTALLATION
+1. Close ConTrackTor and all kiosk windows.
+2. Make a fresh database backup from the client computer.
+3. Download ConTrackTor_v1_Update_1.7.12.exe from the v1.7.12 GitHub release.
+4. Run the updater under the same Windows user as the existing installation.
+5. Do not uninstall ConTrackTor and do not replace or move its database.
+6. The updater creates timestamped application and database safety backups before replacing application files.
+
+CREATE A MULTI-PROJECT IMPORT FORM
+1. Open Expenses > Add Expense Batch.
+2. Choose Create Import Form.
+3. Open the generated XLSX file in Excel or Google Sheets.
+4. For every expense row, independently choose the Expense Project and Funding Source.
+5. Rows in the same workbook may belong to different projects.
+6. Enter the declared batch total for the complete workbook.
+
+IMPORT AND COMMIT
+1. Choose Import Filled Form and select the completed XLSX or compatible CSV file.
+2. Review every row. No row is staged unless the complete form is valid and its total reconciles.
+3. Commit the staged form.
+4. ConTrackTor creates a separate auditable expense batch for every expense project represented in the workbook.
+5. Inter-project funding and Client Funded rows retain their selected funding treatment.
+
+Existing single-project forms continue to work. Older generated forms can also contain multiple projects if their existing Project and Funding Source columns are completed per row.
+
+DATA SAFETY
+The updater contains application files only and packages no client database. Installation does not rewrite existing transactions. New records are created only after an authorized user commits a reviewed import.
+
+Default app: %LOCALAPPDATA%\Programs\ConTrackTor_v1
+Default data: %LOCALAPPDATA%\ConTrackTor_v1\Data\contractor_tracker.db
+Data backups: %LOCALAPPDATA%\ConTrackTor_v1\Data\Backups
+App backups: %LOCALAPPDATA%\ConTrackTor_v1\AppBackups
+
+Security: this updater is unsigned. Do not disable Defender or add exclusions if it is flagged. Submit the exact file to Microsoft for review instead.
