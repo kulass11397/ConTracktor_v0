@@ -1,8 +1,27 @@
-# ConTrackTor — working-copy historical baseline, 2026-10-07
+# ConTracktor — current application and project documentation
 
 Local Windows contractor-management system for projects, expenses, petty cash, remittances, company-wide attendance/payroll, advances, inventory and contacts.
 
-This source baseline preserves the application used by the **ConTracktor - Current Working Copy** desktop shortcut, before the proposed repository restructuring. Its application files match the working copy in `Updates/Latest_App_Preview_20261003`. The historical reference is the `baseline-2026-10-07` Git tag on the `ConTracktor_v1` branch.
+This repository documents the application used by the **ConTracktor - Current Working Copy** desktop shortcut, before repository restructuring. The current application is based on GitHub commit `a329efc` on `ConTracktor_v1` and includes the later weekly attendance roster/workbook changes documented below. The earlier historical checkpoint is the unchanged `baseline-2026-10-07` Git tag.
+
+## Documentation map
+
+Start with [agent instructions](AGENTS.md), [architecture](docs/ARCHITECTURE.md), [database](docs/DATABASE.md), and [accounting rules](docs/ACCOUNTING_RULES.md).
+
+| Module | Current workflow documentation |
+|---|---|
+| Employees | [Identity, deployment and rates](docs/modules/EMPLOYEES.md) |
+| Projects | [Lifecycle, heads and budgets](docs/modules/PROJECTS.md) |
+| Attendance | [Weekly grid, shifts and corrections](docs/modules/ATTENDANCE.md) |
+| Payroll | [Commitment, payment and reopening](docs/modules/PAYROLL.md) |
+| Cash advances | [Grants, deductions and recoveries](docs/modules/CASH_ADVANCES.md) |
+| Expenses | [Entry, imports, funding and verification](docs/modules/EXPENSES.md) |
+| Cash operations | [PC/DP, receipts, returns and custody](docs/modules/CASH_OPERATIONS.md) |
+| Inter-project funding | [Borrowing, repayment and ownership](docs/modules/INTER_PROJECT_FUNDING.md) |
+| Bank transactions | [Deposits, withdrawals and transfers](docs/modules/BANK_TRANSACTIONS.md) |
+| Reporting | [Financial figures, summaries and billing](docs/modules/REPORTING.md) |
+
+These describe current code, not every historical proposal. They flag older-note conflicts and separate general behavior from client-specific compatibility repairs. Local record totals and bespoke billing PDFs are not permanent accounting rules.
 
 The last packaged updater is [v1.7.12](https://github.com/kulass11397/ConTracktor_v0/releases/tag/v1.7.12). This baseline is a source checkpoint; it does not replace that installer or create a new executable release.
 
@@ -14,6 +33,8 @@ The last packaged updater is [v1.7.12](https://github.com/kulass11397/ConTrackto
 - Updated the phase regression test to require the Personal phase and the new default phase count.
 - Preserved the current working-copy launcher as `launch_contracttor.pyw`. It selects the working database explicitly, supports an alternative database through `CONTRACTOR_LAUNCH_DB_PATH`, and records startup failures in `launch_error.log`.
 - Added `run_working_copy.bat` as a portable launcher for this source checkpoint. It uses a local virtual environment when available, or Python from PATH, without a developer-specific absolute path.
+- Added a weekly batch-attendance workbook generated from the active project/site rosters. It uses one tab per active project, supports `P`, `A`, custom/split times and additional-employee dropdowns, and can be round-tripped through Google Sheets before `.xlsx` import.
+- Weekly workbook import validates the complete file and stages it in the existing grid without bypassing draft saving, project-head authorization, overlap checks or payroll finalization.
 
 The current UI, weekly attendance grid, payroll, cash-advance attribution, project receipt ownership, inter-project reimbursements, client-funded expense entry, and multi-project imports remain part of the preserved application. Earlier changes are documented in the release and workflow notes below.
 
@@ -40,8 +61,12 @@ For a separate checkout, install Python with Tkinter, provide an appropriate pri
 The core application uses Python's standard library and Tkinter. A typical development check is:
 
 ```text
-python -m unittest discover -p "test_*.py"
+python -B -m unittest discover -p "test_*.py"
 ```
+
+The current working tree passed 183 automated tests on 2026-10-07. This is a dated source-level result, not installer validation or a promise that future edits are tested. Tests use disposable databases; never aim them at the working client database. Constructing `Database` runs upgrades and repairs. See [database safety](docs/DATABASE.md).
+
+Known architectural limits include a monolithic core, duplicate/legacy class definitions, string-based financial classifications, mixed database/application constraints, and guarded client-specific startup repairs. This is a local operational tracker, not a complete double-entry accounting or automatic revenue-recognition system. Documentation does not implement new features.
 
 ## DP allocation reactivation patch — 2026-10-07
 

@@ -13,6 +13,7 @@ import hashlib
 import io
 import json
 import os
+import posixpath
 import re
 import secrets
 import shutil
@@ -1700,6 +1701,9 @@ EXPENSE_IMPORT_REQUIRED_FIELDS = (
     "phase", "area", "status", "payment_method", "expense_date",
 )
 
+WEEKLY_ATTENDANCE_TEMPLATE_MARKER = "CONTRACTOR WEEKLY ATTENDANCE"
+WEEKLY_ATTENDANCE_TEMPLATE_VERSION = "1"
+
 
 def _normalized_import_header(value):
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
@@ -1893,8 +1897,8 @@ def _xlsx_cell_value(cell, shared_strings):
     return raw
 
 
-def _read_xlsx_rows(path):
-    """Read displayed cell values from the first worksheet without dependencies."""
+def _read_xlsx_worksheets(path):
+    """Read displayed cell values from every worksheet without dependencies."""
     main_ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
     rel_ns = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
     package_rel_ns = "{http://schemas.openxmlformats.org/package/2006/relationships}"
@@ -1905,35 +1909,425 @@ def _read_xlsx_rows(path):
             for item in root.findall(main_ns + "si"):
                 shared_strings.append("".join(node.text or "" for node in item.findall(".//" + main_ns + "t")))
         workbook = ET.fromstring(archive.read("xl/workbook.xml"))
-        first_sheet = workbook.find(".//" + main_ns + "sheet")
-        if first_sheet is None:
+        sheet_nodes = workbook.findall(".//" + main_ns + "sheet")
+        if not sheet_nodes:
             raise ValueError("The workbook has no worksheet.")
-        relation_id = first_sheet.attrib.get(rel_ns + "id")
         relations = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
-        target = None
+        targets = {}
         for relation in relations.findall(package_rel_ns + "Relationship"):
-            if relation.attrib.get("Id") == relation_id:
-                target = relation.attrib.get("Target")
-                break
-        if not target:
-            raise ValueError("The first worksheet could not be read.")
-        sheet_path = target.lstrip("/")
-        if not sheet_path.startswith("xl/"):
-            sheet_path = "xl/" + sheet_path
-        sheet = ET.fromstring(archive.read(sheet_path))
-        rows = []
-        for row in sheet.findall(".//" + main_ns + "row"):
-            values = {}
-            for cell in row.findall(main_ns + "c"):
-                reference = cell.attrib.get("r", "A1")
-                letters = re.match(r"[A-Z]+", reference.upper()).group(0)
-                column = 0
-                for letter in letters:
-                    column = column * 26 + ord(letter) - 64
-                values[column - 1] = _xlsx_cell_value(cell, shared_strings)
-            width = max(values, default=-1) + 1
-            rows.append([values.get(index, "") for index in range(width)])
-        return rows
+            targets[relation.attrib.get("Id")] = relation.attrib.get("Target", "")
+        worksheets = []
+        for sheet_node in sheet_nodes:
+            relation_id = sheet_node.attrib.get(rel_ns + "id")
+            target = targets.get(relation_id, "")
+            if not target:
+                raise ValueError(f"Worksheet {sheet_node.attrib.get('name', '')!r} could not be read.")
+            if target.startswith("/"):
+                sheet_path = target.lstrip("/")
+            elif target.startswith("xl/"):
+                sheet_path = target
+            else:
+                sheet_path = posixpath.normpath(posixpath.join("xl", target))
+            sheet = ET.fromstring(archive.read(sheet_path))
+            row_values = {}
+            max_row = 0
+            for sequential_row, row in enumerate(sheet.findall(".//" + main_ns + "row"), 1):
+                try:
+                    row_number = int(row.attrib.get("r", sequential_row))
+                except ValueError:
+                    row_number = sequential_row
+                max_row = max(max_row, row_number)
+                values = {}
+                next_column = 0
+                for cell in row.findall(main_ns + "c"):
+                    reference = cell.attrib.get("r", "")
+                    match = re.match(r"\$?([A-Z]+)", reference.upper())
+                    if match:
+                        column = 0
+                        for letter in match.group(1):
+                            column = column * 26 + ord(letter) - 64
+                        next_column = column - 1
+                    values[next_column] = _xlsx_cell_value(cell, shared_strings)
+                    next_column += 1
+                row_values[row_number] = values
+            rows = []
+            for row_number in range(1, max_row + 1):
+                values = row_values.get(row_number, {})
+                width = max(values, default=-1) + 1
+                rows.append([values.get(index, "") for index in range(width)])
+            worksheets.append({
+                "name": sheet_node.attrib.get("name", ""),
+                "state": sheet_node.attrib.get("state", "visible"),
+                "rows": rows,
+            })
+        return worksheets
+
+
+def _read_xlsx_rows(path):
+    """Read displayed cell values from the first worksheet without dependencies."""
+    worksheets = _read_xlsx_worksheets(path)
+    return worksheets[0]["rows"]
+
+
+def _xlsx_column_name(index):
+    """Return a one-based Excel column name."""
+    if index < 1:
+        raise ValueError("Excel columns are one-based.")
+    result = ""
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def _xml_attribute(value):
+    return xml_escape(str(value or ""), {'"': '&quot;'})
+
+
+def _record_value(row, key, default=None):
+    try:
+        value = row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if value is None else value
+
+
+def _weekly_cell_token(cell):
+    if not cell:
+        return ""
+    if cell.get("state") == "Absent":
+        return "A"
+    segments = cell.get("segments", [])
+    if segments == [["08:00", "17:00"]]:
+        return "P"
+    return "; ".join(f"{start}-{end}" for start, end in segments)
+
+
+def _weekly_locked_token(recorded_rows=None, finalized_absence=False):
+    recorded_rows = recorded_rows or []
+    if recorded_rows:
+        prefix = "COMMITTED" if any(_record_value(row, "payroll_batch_id") for row in recorded_rows) else "RECORDED"
+        times = ", ".join(
+            f"{str(_record_value(row, 'clock_in', ''))[11:16]}-{str(_record_value(row, 'clock_out', ''))[11:16]}"
+            for row in recorded_rows
+        )
+        return f"{prefix} {times}".strip()
+    return "ABSENT (FINAL)" if finalized_absence else ""
+
+
+def _safe_worksheet_name(value, used):
+    base = re.sub(r"[\\/*?:\[\]]", "-", str(value or "Project")).strip(" '") or "Project"
+    base = base[:31]
+    candidate = base
+    suffix = 2
+    while candidate.casefold() in used:
+        tail = f" ({suffix})"
+        candidate = base[:31 - len(tail)] + tail
+        suffix += 1
+    used.add(candidate.casefold())
+    return candidate
+
+
+def write_weekly_attendance_xlsx(path, week_value, projects, employees,
+                                  project_employee_ids, cells, recorded=None,
+                                  finalized_absences=None, prepared_by=""):
+    """Create the multi-site batch-attendance workbook used by the weekly grid."""
+    if not projects:
+        raise ValueError("There are no active project sites to include in this attendance workbook.")
+    week_start, week_end = payroll_week_bounds(week_value)
+    dates = [(date.fromisoformat(week_start) + timedelta(days=offset)).isoformat()
+             for offset in range(7)]
+    recorded = recorded or {}
+    finalized_absences = set(finalized_absences or ())
+    employees_by_id = {int(_record_value(employee, "id")): employee for employee in employees}
+    used_names = set()
+    sheets = []
+    reference_columns = []
+    for sheet_index, project in enumerate(projects, 1):
+        project_id = int(_record_value(project, "id"))
+        project_name = str(_record_value(project, "name", f"Project {project_id}"))
+        sheet_name = _safe_worksheet_name(project_name, used_names)
+        roster_ids = [employee_id for employee_id in project_employee_ids.get(project_id, set())
+                      if employee_id in employees_by_id]
+        roster_ids.sort(key=lambda employee_id: (
+            str(_record_value(employees_by_id[employee_id], "name", "")).casefold(), employee_id))
+        additional = [employee for employee in employees
+                      if int(_record_value(employee, "id")) not in set(roster_ids)]
+        list_name = f"ProjectEmployees_{project_id}"
+        reference_columns.append((list_name, project_name, [
+            f"{_record_value(employee, 'name', '')} [{_record_value(employee, 'employee_no', '')}]"
+            for employee in additional
+        ]))
+        additional_rows = max(10, len(additional))
+        last_row = 10 + len(roster_ids) + additional_rows
+        rows = [
+            '<row r="1" ht="26">' + _xlsx_inline_cell("A1", WEEKLY_ATTENDANCE_TEMPLATE_MARKER, 1) + '</row>',
+            '<row r="2">' + _xlsx_inline_cell("A2", "Template Version", 2) + _xlsx_inline_cell("B2", WEEKLY_ATTENDANCE_TEMPLATE_VERSION, 3) + '</row>',
+            '<row r="3">' + _xlsx_inline_cell("A3", "Project ID", 2) + _xlsx_inline_cell("B3", project_id, 3) + '</row>',
+            '<row r="4">' + _xlsx_inline_cell("A4", "Project", 2) + _xlsx_inline_cell("B4", project_name, 3) + '</row>',
+            '<row r="5">' + _xlsx_inline_cell("A5", "Week Start", 2) + _xlsx_inline_cell("B5", week_start, 3) + '</row>',
+            '<row r="6">' + _xlsx_inline_cell("A6", "Week End", 2) + _xlsx_inline_cell("B6", week_end, 3) + '</row>',
+            '<row r="7">' + _xlsx_inline_cell("A7", "Prepared By", 2) + _xlsx_inline_cell("B7", prepared_by, 3) + '</row>',
+            '<row r="8" ht="34">' + _xlsx_inline_cell(
+                "A8", "Enter P for present, A for absent, or times such as 08:00-12:00; 13:00-17:00. Leave blank to ignore. Use the employee dropdown on the blank rows for workers outside this site's initial roster.", 4) + '</row>',
+        ]
+        headers = ["Employee", "MONCON No."] + [
+            datetime.strptime(work_date, "%Y-%m-%d").strftime("%a %d %b") + "\n" + work_date
+            for work_date in dates
+        ] + ["Notes"]
+        rows.append('<row r="10" ht="34">' + ''.join(
+            _xlsx_inline_cell(f"{_xlsx_column_name(column)}10", header, 5)
+            for column, header in enumerate(headers, 1)
+        ) + '</row>')
+        for offset, employee_id in enumerate(roster_ids, 11):
+            employee = employees_by_id[employee_id]
+            row_cells = [
+                _xlsx_inline_cell(f"A{offset}", f"{_record_value(employee, 'name', '')} [{_record_value(employee, 'employee_no', '')}]", 6),
+                _xlsx_inline_cell(f"B{offset}", _record_value(employee, "employee_no", ""), 6),
+            ]
+            for day_index, work_date in enumerate(dates, 3):
+                key = (employee_id, work_date, project_id)
+                locked = _weekly_locked_token(recorded.get(key), key in finalized_absences)
+                value = locked or _weekly_cell_token(cells.get(key))
+                row_cells.append(_xlsx_inline_cell(
+                    f"{_xlsx_column_name(day_index)}{offset}", value, 9 if locked else 8))
+            row_cells.append(_xlsx_inline_cell(f"J{offset}", "", 10))
+            rows.append(f'<row r="{offset}">' + ''.join(row_cells) + '</row>')
+        first_additional_row = 11 + len(roster_ids)
+        for row_number in range(first_additional_row, last_row + 1):
+            row_cells = [_xlsx_inline_cell(f"A{row_number}", "", 7),
+                         _xlsx_inline_cell(f"B{row_number}", "", 7)]
+            row_cells.extend(_xlsx_inline_cell(f"{_xlsx_column_name(column)}{row_number}", "", 8)
+                             for column in range(3, 10))
+            row_cells.append(_xlsx_inline_cell(f"J{row_number}", "", 10))
+            rows.append(f'<row r="{row_number}">' + ''.join(row_cells) + '</row>')
+        validation = (
+            f'<dataValidations count="1"><dataValidation type="list" allowBlank="1" '
+            f'showErrorMessage="1" errorStyle="stop" errorTitle="Invalid employee" '
+            f'error="Choose an employee from this workbook list." sqref="A{first_additional_row}:A{last_row}">'
+            f'<formula1>{list_name}</formula1></dataValidation></dataValidations>'
+        )
+        attendance_range = f"C11:I{last_row}"
+        conditional = (
+            f'<conditionalFormatting sqref="{attendance_range}">'
+            '<cfRule type="cellIs" dxfId="0" priority="1" operator="equal"><formula>"P"</formula></cfRule>'
+            '<cfRule type="cellIs" dxfId="1" priority="2" operator="equal"><formula>"A"</formula></cfRule>'
+            '<cfRule type="expression" dxfId="2" priority="3"><formula>AND(C11&lt;&gt;"",C11&lt;&gt;"P",C11&lt;&gt;"A",LEFT(C11,8)&lt;&gt;"RECORDED",LEFT(C11,9)&lt;&gt;"COMMITTED",C11&lt;&gt;"ABSENT (FINAL)")</formula></cfRule>'
+            '</conditionalFormatting>'
+        )
+        sheet_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<dimension ref="A1:J{last_row}"/>
+<sheetViews><sheetView workbookViewId="0" showGridLines="0"><pane xSplit="2" ySplit="10" topLeftCell="C11" activePane="bottomRight" state="frozen"/></sheetView></sheetViews>
+<cols><col min="1" max="1" width="31" customWidth="1"/><col min="2" max="2" width="16" customWidth="1"/><col min="3" max="9" width="20" customWidth="1"/><col min="10" max="10" width="24" customWidth="1"/></cols>
+<sheetData>{''.join(rows)}</sheetData>
+<autoFilter ref="A10:J{last_row}"/>
+<mergeCells count="2"><mergeCell ref="A1:J1"/><mergeCell ref="A8:J8"/></mergeCells>
+{conditional}{validation}
+<pageMargins left="0.25" right="0.25" top="0.5" bottom="0.5" header="0.2" footer="0.2"/>
+</worksheet>'''
+        sheets.append((sheet_name, sheet_xml, project_id, sheet_index))
+
+    reference_rows = []
+    if reference_columns:
+        reference_rows.append('<row r="1">' + ''.join(
+            _xlsx_inline_cell(f"{_xlsx_column_name(index)}1", title, 5)
+            for index, (_name, title, _values) in enumerate(reference_columns, 1)
+        ) + '</row>')
+        max_options = max((len(values) for _name, _title, values in reference_columns), default=0)
+        for option_index in range(max_options):
+            row_number = option_index + 2
+            values = []
+            for column_index, (_name, _title, options) in enumerate(reference_columns, 1):
+                if option_index < len(options):
+                    values.append(_xlsx_inline_cell(
+                        f"{_xlsx_column_name(column_index)}{row_number}", options[option_index]))
+            reference_rows.append(f'<row r="{row_number}">' + ''.join(values) + '</row>')
+    reference_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>{''.join(reference_rows)}</sheetData></worksheet>'''
+    styles_xml = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<fonts count="4"><font><sz val="10"/><name val="Arial"/></font><font><b/><sz val="15"/><color rgb="FF0F1A2E"/><name val="Arial"/></font><font><b/><sz val="10"/><color rgb="FFFFFFFF"/><name val="Arial"/></font><font><b/><sz val="10"/><color rgb="FF374151"/><name val="Arial"/></font></fonts>
+<fills count="7"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF0F1A2E"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFF8FAFC"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFFFF4CC"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFE5E7EB"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFEAF4FF"/><bgColor indexed="64"/></patternFill></fill></fills>
+<borders count="2"><border/><border><left style="thin"><color rgb="FFCBD5E1"/></left><right style="thin"><color rgb="FFCBD5E1"/></right><top style="thin"><color rgb="FFCBD5E1"/></top><bottom style="thin"><color rgb="FFCBD5E1"/></bottom></border></borders>
+<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+<cellXfs count="11"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/><xf numFmtId="0" fontId="3" fillId="3" borderId="0" xfId="0" applyFont="1"/><xf numFmtId="49" fontId="0" fillId="3" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment wrapText="1" vertical="center"/></xf><xf numFmtId="0" fontId="2" fillId="2" borderId="1" xfId="0" applyAlignment="1"><alignment wrapText="1" horizontal="center" vertical="center"/></xf><xf numFmtId="49" fontId="0" fillId="6" borderId="1" xfId="0" applyNumberFormat="1" applyAlignment="1"><alignment vertical="center"/></xf><xf numFmtId="49" fontId="0" fillId="4" borderId="1" xfId="0" applyNumberFormat="1" applyAlignment="1"><alignment vertical="center"/></xf><xf numFmtId="49" fontId="0" fillId="4" borderId="1" xfId="0" applyNumberFormat="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf><xf numFmtId="49" fontId="0" fillId="5" borderId="1" xfId="0" applyNumberFormat="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf><xf numFmtId="49" fontId="0" fillId="3" borderId="1" xfId="0" applyNumberFormat="1" applyAlignment="1"><alignment vertical="center"/></xf></cellXfs>
+<dxfs count="3"><dxf><fill><patternFill patternType="solid"><fgColor rgb="FFD1FAE5"/><bgColor indexed="64"/></patternFill></fill><font><color rgb="FF065F46"/><b/></font></dxf><dxf><fill><patternFill patternType="solid"><fgColor rgb="FFFEE2E2"/><bgColor indexed="64"/></patternFill></fill><font><color rgb="FF991B1B"/><b/></font></dxf><dxf><fill><patternFill patternType="solid"><fgColor rgb="FFFEF3C7"/><bgColor indexed="64"/></patternFill></fill><font><color rgb="FF92400E"/><b/></font></dxf></dxfs>
+<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
+</styleSheet>'''
+    defined_names = []
+    for column_index, (name, _title, values) in enumerate(reference_columns, 1):
+        column = _xlsx_column_name(column_index)
+        last = max(2, len(values) + 1)
+        defined_names.append(
+            f'<definedName name="{_xml_attribute(name)}">\'Reference Lists\'!${column}$2:${column}${last}</definedName>')
+    all_sheets = sheets + [("Reference Lists", reference_xml, None, len(sheets) + 1)]
+    workbook_sheets = []
+    relationships = []
+    content_overrides = []
+    for relation_index, (sheet_name, _xml, _project_id, sheet_id) in enumerate(all_sheets, 1):
+        hidden = ' state="hidden"' if sheet_name == "Reference Lists" else ""
+        workbook_sheets.append(
+            f'<sheet name="{_xml_attribute(sheet_name)}" sheetId="{sheet_id}"{hidden} r:id="rId{relation_index}"/>')
+        relationships.append(
+            f'<Relationship Id="rId{relation_index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{relation_index}.xml"/>')
+        content_overrides.append(
+            f'<Override PartName="/xl/worksheets/sheet{relation_index}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>')
+    style_relation_id = len(all_sheets) + 1
+    relationships.append(
+        f'<Relationship Id="rId{style_relation_id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>')
+    workbook_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<bookViews><workbookView xWindow="0" yWindow="0" windowWidth="24000" windowHeight="14000"/></bookViews>
+<sheets>{''.join(workbook_sheets)}</sheets><definedNames>{''.join(defined_names)}</definedNames>
+<calcPr calcId="191029" calcMode="auto" fullCalcOnLoad="1" forceFullCalc="1"/>
+</workbook>'''
+    workbook_rels = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{''.join(relationships)}</Relationships>'''
+    root_rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'''
+    content_types = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>{''.join(content_overrides)}<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>'''
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", root_rels)
+        archive.writestr("xl/workbook.xml", workbook_xml)
+        archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        archive.writestr("xl/styles.xml", styles_xml)
+        for relation_index, (_name, sheet_xml, _project_id, _sheet_id) in enumerate(all_sheets, 1):
+            archive.writestr(f"xl/worksheets/sheet{relation_index}.xml", sheet_xml)
+
+
+def _sheet_cell(rows, row_number, column_index):
+    if row_number < 1 or row_number > len(rows):
+        return ""
+    row = rows[row_number - 1]
+    return str(row[column_index - 1] if column_index - 1 < len(row) else "").strip()
+
+
+def _normalized_workbook_value(value):
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _attendance_employee_number(employee_text, number_text):
+    number_text = str(number_text or "").strip()
+    match = re.search(r"\[([^\[\]]+)\]\s*$", str(employee_text or "").strip())
+    embedded = match.group(1).strip() if match else ""
+    if number_text and embedded and number_text.casefold() != embedded.casefold():
+        raise ValueError("An employee row has conflicting MONCON numbers.")
+    return number_text or embedded
+
+
+def _parse_attendance_workbook_cell(value, employee_name, work_date):
+    value = str(value or "").strip()
+    if not value:
+        return None
+    marker = value.casefold()
+    if marker == "p":
+        return {"state": "Present", "segments": [["08:00", "17:00"]]}
+    if marker == "a":
+        return {"state": "Absent", "segments": []}
+    if marker.startswith(("recorded ", "committed ")) or marker == "absent (final)":
+        raise ValueError(f"{employee_name} on {work_date} contains a read-only attendance marker in an editable cell.")
+    segments = []
+    for part in value.split(";"):
+        part = part.strip()
+        match = re.fullmatch(r"(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})", part)
+        if not match:
+            raise ValueError(
+                f"Invalid attendance for {employee_name} on {work_date}. Use P, A, or times like 08:00-12:00; 13:00-17:00.")
+        segments.append(list(match.groups()))
+    return {"state": "Present", "segments": segments}
+
+
+def read_weekly_attendance_xlsx(path, week_value, projects, employees, recorded=None,
+                                finalized_absences=None, expected_project_ids=None):
+    """Read a generated weekly workbook, including a Google Sheets round trip."""
+    try:
+        worksheets = _read_xlsx_worksheets(path)
+    except (KeyError, zipfile.BadZipFile, ET.ParseError) as exc:
+        raise ValueError("The selected XLSX file is damaged or is not a valid workbook.") from exc
+    week_start, week_end = payroll_week_bounds(week_value)
+    expected_dates = [(date.fromisoformat(week_start) + timedelta(days=offset)).isoformat()
+                      for offset in range(7)]
+    project_by_id = {int(_record_value(project, "id")): project for project in projects}
+    expected = set(expected_project_ids if expected_project_ids is not None else project_by_id)
+    employee_numbers = {}
+    for employee in employees:
+        employee_no = str(_record_value(employee, "employee_no", "")).strip().casefold()
+        employee_numbers.setdefault(employee_no, []).append(employee)
+    recorded = recorded or {}
+    finalized_absences = set(finalized_absences or ())
+    cells = {}
+    row_employee_ids = {}
+    found_projects = set()
+    for worksheet in worksheets:
+        rows = worksheet["rows"]
+        if _normalized_workbook_value(_sheet_cell(rows, 1, 1)) != WEEKLY_ATTENDANCE_TEMPLATE_MARKER.casefold():
+            continue
+        if _sheet_cell(rows, 2, 2) != WEEKLY_ATTENDANCE_TEMPLATE_VERSION:
+            raise ValueError("This attendance workbook version is not supported. Generate a fresh workbook.")
+        try:
+            project_id = int(_sheet_cell(rows, 3, 2))
+        except ValueError as exc:
+            raise ValueError("A ConTracktor project sheet has a missing or invalid Project ID.") from exc
+        if project_id not in expected or project_id not in project_by_id:
+            raise ValueError(f"Project ID {project_id} is not active in this batch-attendance week.")
+        if project_id in found_projects:
+            raise ValueError(f"Project ID {project_id} appears on more than one attendance sheet.")
+        found_projects.add(project_id)
+        if _sheet_cell(rows, 5, 2) != week_start or _sheet_cell(rows, 6, 2) != week_end:
+            raise ValueError(f"The sheet for project ID {project_id} is for a different payroll week.")
+        header_dates = []
+        for column in range(3, 10):
+            match = re.search(r"\d{4}-\d{2}-\d{2}", _sheet_cell(rows, 10, column))
+            header_dates.append(match.group(0) if match else "")
+        if header_dates != expected_dates:
+            raise ValueError(f"The attendance date columns for project ID {project_id} were changed.")
+        if _normalized_import_header(_sheet_cell(rows, 10, 1)) != "employee" or \
+                _normalized_import_header(_sheet_cell(rows, 10, 2)) != "monconno":
+            raise ValueError(f"The employee headers for project ID {project_id} were changed.")
+        seen_employees = set()
+        row_employee_ids[project_id] = set()
+        for row_number in range(11, len(rows) + 1):
+            employee_text = _sheet_cell(rows, row_number, 1)
+            number_text = _sheet_cell(rows, row_number, 2)
+            attendance_values = [_sheet_cell(rows, row_number, column) for column in range(3, 10)]
+            if not employee_text and not number_text and not any(attendance_values):
+                continue
+            employee_no = _attendance_employee_number(employee_text, number_text)
+            if not employee_no:
+                raise ValueError(f"Project ID {project_id}, row {row_number} needs an employee selection or MONCON number.")
+            matches = employee_numbers.get(employee_no.casefold(), [])
+            if len(matches) != 1:
+                reason = "not active" if not matches else "not unique"
+                raise ValueError(f"MONCON number {employee_no!r} is {reason} in the current employee list.")
+            employee = matches[0]
+            employee_id = int(_record_value(employee, "id"))
+            if employee_id in seen_employees:
+                raise ValueError(f"{_record_value(employee, 'name', employee_no)} appears more than once on project ID {project_id}.")
+            seen_employees.add(employee_id)
+            row_employee_ids[project_id].add(employee_id)
+            for day_index, (work_date, value) in enumerate(zip(expected_dates, attendance_values), 3):
+                key = (employee_id, work_date, project_id)
+                locked = _weekly_locked_token(recorded.get(key), key in finalized_absences)
+                if locked:
+                    if _normalized_workbook_value(value) != _normalized_workbook_value(locked):
+                        raise ValueError(
+                            f"Recorded attendance for {_record_value(employee, 'name', employee_no)} on {work_date} was changed or removed.")
+                    continue
+                parsed = _parse_attendance_workbook_cell(
+                    value, _record_value(employee, "name", employee_no), work_date)
+                if parsed:
+                    cells[key] = parsed
+    missing = expected - found_projects
+    if missing:
+        missing_names = [str(_record_value(project_by_id[project_id], "name", project_id))
+                         for project_id in sorted(missing) if project_id in project_by_id]
+        raise ValueError("The workbook is missing project sheet(s): " + ", ".join(missing_names or map(str, missing)))
+    if not found_projects:
+        raise ValueError("No ConTracktor weekly attendance project sheets were found.")
+    return {"cells": cells, "project_employee_ids": row_employee_ids}
 
 
 def read_expense_import_form(path):
@@ -7818,6 +8212,31 @@ class Database:
                          WHERE any_assignment.employee_id=e.id)))
                ORDER BY e.name COLLATE NOCASE,e.employee_no""",
             (project_id, on_date, on_date, project_id, project_id),
+        )
+
+    def employees_deployed_during(self, project_id: int, date_from: str, date_to: str):
+        """Return active employees enrolled in a project for any part of a date range."""
+        date_from = valid_date(date_from, True)
+        date_to = valid_date(date_to, True)
+        if date_to < date_from:
+            raise ValueError("The deployment date range is invalid.")
+        return self.all(
+            """SELECT e.* FROM employees e
+               WHERE e.active=1 AND (
+                   EXISTS(
+                       SELECT 1 FROM employee_project_assignments a
+                       WHERE a.employee_id=e.id AND a.project_id=?
+                         AND a.effective_from<=?
+                         AND (a.effective_to='' OR a.effective_to>=?)
+                   ) OR (
+                       e.project_id=? AND NOT EXISTS(
+                           SELECT 1 FROM employee_project_assignments any_assignment
+                           WHERE any_assignment.employee_id=e.id
+                       )
+                   )
+               )
+               ORDER BY e.name COLLATE NOCASE,e.employee_no""",
+            (project_id, date_to, date_from, project_id),
         )
 
     def employee_deployments(self, employee_id: int):
@@ -17775,6 +18194,7 @@ class WeeklyAttendanceGridDialog(tk.Toplevel):
         self.dates=[(date.fromisoformat(self.week_start)+timedelta(days=i)).isoformat() for i in range(7)]
         self.projects=db.all("SELECT id,name FROM projects WHERE status<>'Completed' ORDER BY name")
         self.employees=db.all('SELECT id,name,employee_no FROM employees WHERE active=1 ORDER BY name COLLATE NOCASE')
+        self.employee_by_id={employee['id']:employee for employee in self.employees}
         self.cells=db.weekly_attendance_draft(self.week_start)
         self.finalized_absences={(r['employee_id'],r['work_date'],r['project_id']) for r in
             db.all('SELECT employee_id,work_date,project_id FROM weekly_attendance_marks WHERE week_start=?',
@@ -17789,6 +18209,21 @@ class WeeklyAttendanceGridDialog(tk.Toplevel):
                 ORDER BY a.clock_in''',(self.week_start,self.week_end)):
             key=(row['employee_id'],row['clock_in'][:10],row['project_id'])
             self.recorded.setdefault(key,[]).append(row)
+        self.project_employee_ids={}
+        for project in self.projects:
+            pid=project['id']
+            visible={row['id'] for row in db.employees_deployed_during(
+                pid,self.week_start,self.week_end)}
+            visible.update(eid for eid,_day,project_id in self.cells if project_id==pid)
+            visible.update(eid for eid,_day,project_id in self.finalized_absences if project_id==pid)
+            visible.update(eid for eid,_day,project_id in self.recorded if project_id==pid)
+            self.project_employee_ids[pid]={eid for eid in visible if eid in self.employee_by_id}
+        self.project_employee_ids[None]=set().union(
+            *(self.project_employee_ids[project['id']] for project in self.projects)
+        ) if self.projects else set()
+        self.add_employee_vars={}
+        self.add_employee_boxes={}
+        self.add_employee_options={}
         self.dirty=False
         self.title(f'Weekly Attendance | Saturday {self.week_start} to Friday {self.week_end}')
         self.geometry('1320x730');self.minsize(1050,600)
@@ -17813,12 +18248,65 @@ class WeeklyAttendanceGridDialog(tk.Toplevel):
         buttons=ttk.Frame(body);buttons.pack(fill='x',pady=(6,0))
         ttk.Button(buttons,text='Save Weekly Draft',command=self.save_draft).pack(side='left')
         ttk.Button(buttons,text='Review and Finalize Week',style='Primary.TButton',command=self.finalize).pack(side='left',padx=8)
+        ttk.Button(buttons,text='Generate Attendance Workbook',command=self.generate_attendance_workbook).pack(side='left',padx=(8,0))
+        ttk.Button(buttons,text='Import Filled Workbook',command=self.import_attendance_workbook).pack(side='left',padx=(8,0))
         ttk.Button(buttons,text='Close',command=self.close).pack(side='right')
         self.transient(parent);self.grab_set();self.protocol('WM_DELETE_WINDOW',self.close)
         self.render()
 
+    def _employees_for_project_tab(self,project_id):
+        return [employee for employee in self.employees
+                if employee['id'] in self.project_employee_ids.get(project_id,set())]
+
+    def _refresh_add_employee_choices(self,project_id):
+        current=self.project_employee_ids.get(project_id,set())
+        options={f"{employee['name']} [{employee['employee_no']}]":employee['id']
+                 for employee in self.employees if employee['id'] not in current}
+        self.add_employee_options[project_id]=options
+        box=self.add_employee_boxes.get(project_id)
+        variable=self.add_employee_vars.get(project_id)
+        if box:
+            box.configure(values=list(options))
+        if variable:
+            variable.set(next(iter(options),'') if variable.get() not in options else variable.get())
+
+    def add_employee_to_project(self,project_id,employee_id=None):
+        if employee_id is None:
+            employee_id=self.add_employee_options.get(project_id,{}).get(
+                self.add_employee_vars[project_id].get())
+        employee=self.employee_by_id.get(int(employee_id)) if employee_id else None
+        if not employee or employee['id'] in self.project_employee_ids.get(project_id,set()):
+            return False
+        self.project_employee_ids[project_id].add(employee['id'])
+        self.project_employee_ids[None].add(employee['id'])
+        tree=self.trees[project_id]
+        tree.insert('','end',iid=str(employee['id']),values=(
+            employee['name'],employee['employee_no'],*(['']*7)))
+        review=self.trees.get(None)
+        if review and not review.exists(str(employee['id'])):
+            review.insert('','end',iid=str(employee['id']),values=(
+                employee['name'],employee['employee_no'],*(['']*7)))
+        self._refresh_add_employee_choices(project_id)
+        self.render()
+        return True
+
     def _add_tab(self,project_id,title):
         frame=ttk.Frame(self.tabs,padding=7);self.tabs.add(frame,text=title)
+        tree_row=0
+        if project_id is not None:
+            chooser=ttk.Frame(frame)
+            chooser.grid(row=0,column=0,columnspan=2,sticky='ew',pady=(0,6))
+            ttk.Label(chooser,text='Additional employee').pack(side='left')
+            variable=tk.StringVar()
+            box=ttk.Combobox(chooser,textvariable=variable,state='readonly',width=38)
+            box.pack(side='left',padx=(6,6))
+            ttk.Button(chooser,text='Show in this site',
+                       command=lambda pid=project_id:self.add_employee_to_project(pid)).pack(side='left')
+            ttk.Label(chooser,text='This does not change the employee deployment.',
+                      style='Muted.TLabel').pack(side='left',padx=(8,0))
+            self.add_employee_vars[project_id]=variable
+            self.add_employee_boxes[project_id]=box
+            tree_row=1
         columns=('employee','no',*self.dates)
         tree=ttk.Treeview(frame,columns=columns,show='headings',selectmode='browse')
         tree.heading('employee',text='Employee');tree.column('employee',width=180,stretch=False)
@@ -17829,16 +18317,18 @@ class WeeklyAttendanceGridDialog(tk.Toplevel):
         yscroll=ttk.Scrollbar(frame,orient='vertical',command=tree.yview)
         xscroll=ttk.Scrollbar(frame,orient='horizontal',command=tree.xview)
         tree.configure(yscrollcommand=yscroll.set,xscrollcommand=xscroll.set)
-        tree.grid(row=0,column=0,sticky='nsew');yscroll.grid(row=0,column=1,sticky='ns')
-        xscroll.grid(row=1,column=0,sticky='ew');frame.rowconfigure(0,weight=1);frame.columnconfigure(0,weight=1)
+        tree.grid(row=tree_row,column=0,sticky='nsew');yscroll.grid(row=tree_row,column=1,sticky='ns')
+        xscroll.grid(row=tree_row+1,column=0,sticky='ew');frame.rowconfigure(tree_row,weight=1);frame.columnconfigure(0,weight=1)
         tree.tag_configure('split',background='#EAF4FF')
-        for employee in self.employees:
+        for employee in self._employees_for_project_tab(project_id):
             tree.insert('','end',iid=str(employee['id']),values=(employee['name'],employee['employee_no'],*(['']*7)))
         if project_id is not None:
             tree.bind('<ButtonRelease-1>',lambda event,pid=project_id:self._queue_click(event,pid))
             tree.bind('<Double-1>',lambda event,pid=project_id:self._double_click(event,pid))
             tree.bind('<Button-3>',lambda event,pid=project_id:self.cell_click(event,pid,edit=True))
         self.trees[project_id]=tree
+        if project_id is not None:
+            self._refresh_add_employee_choices(project_id)
 
     def _cell_text(self,eid,work_date,pid):
         key=(eid,work_date,pid)
@@ -17854,7 +18344,7 @@ class WeeklyAttendanceGridDialog(tk.Toplevel):
 
     def render(self):
         for pid,tree in self.trees.items():
-            for employee in self.employees:
+            for employee in self._employees_for_project_tab(pid):
                 eid=employee['id']
                 if pid is None:
                     days=[]
@@ -17953,6 +18443,79 @@ class WeeklyAttendanceGridDialog(tk.Toplevel):
             self.cells[key]=candidate[key]
         self.dirty=True;self.render()
 
+    def generate_attendance_workbook(self):
+        filename = f"ConTracktor_Attendance_{self.week_start}_to_{self.week_end}.xlsx"
+        path = filedialog.asksaveasfilename(
+            parent=self, title='Generate Weekly Attendance Workbook',
+            defaultextension='.xlsx', initialfile=filename,
+            filetypes=[('Excel workbook', '*.xlsx')],
+        )
+        if not path:
+            return
+        try:
+            write_weekly_attendance_xlsx(
+                path, self.week_start, self.projects, self.employees,
+                self.project_employee_ids, self.cells, self.recorded,
+                self.finalized_absences,
+            )
+        except (OSError, ValueError, zipfile.BadZipFile) as exc:
+            messagebox.showerror(APP_TITLE, f'Could not generate the attendance workbook.\n\n{exc}', parent=self)
+            return
+        messagebox.showinfo(
+            APP_TITLE,
+            'The weekly attendance workbook was generated.\n\n'
+            'It may be uploaded to Google Sheets, edited by the site engineers, '
+            'then downloaded as an Excel (.xlsx) file for import.',
+            parent=self,
+        )
+
+    def import_attendance_workbook(self):
+        path = filedialog.askopenfilename(
+            parent=self, title='Import Filled Weekly Attendance Workbook',
+            filetypes=[('Excel workbook', '*.xlsx')],
+        )
+        if not path:
+            return
+        try:
+            imported = read_weekly_attendance_xlsx(
+                path, self.week_start, self.projects, self.employees,
+                self.recorded, self.finalized_absences,
+                expected_project_ids={project['id'] for project in self.projects},
+            )
+            _start, _end, normalized, _segments = self.db._validated_weekly_cells(
+                self.week_start, imported['cells'])
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            messagebox.showerror(APP_TITLE, str(exc), parent=self)
+            return
+        present = sum(cell['state'] == 'Present' for cell in normalized.values())
+        absent = sum(cell['state'] == 'Absent' for cell in normalized.values())
+        custom = sum(cell['state'] == 'Present' and cell['segments'] != [['08:00', '17:00']]
+                     for cell in normalized.values())
+        added = sum(len(employee_ids - self.project_employee_ids.get(project_id, set()))
+                    for project_id, employee_ids in imported['project_employee_ids'].items())
+        warning = ('\n\nThis replaces the unsaved marks currently shown in the grid.'
+                   if self.dirty or self.cells else '')
+        if not messagebox.askyesno(
+            'Import weekly attendance',
+            f'Load {present} present and {absent} absent cell(s) from the workbook?\n'
+            f'{custom} present cell(s) use custom times. '
+            f'{added} additional employee/site row(s) will be shown.{warning}\n\n'
+            'This only stages the grid. Nothing is saved or finalized yet.',
+            parent=self,
+        ):
+            return
+        self.cells = normalized
+        for project_id, employee_ids in imported['project_employee_ids'].items():
+            for employee_id in sorted(employee_ids - self.project_employee_ids.get(project_id, set())):
+                self.add_employee_to_project(project_id, employee_id)
+        self.dirty = True
+        self.render()
+        messagebox.showinfo(
+            APP_TITLE,
+            'The workbook was loaded into the weekly grid. Review the entries, then use Save Weekly Draft or Review and Finalize Week.',
+            parent=self,
+        )
+
     def save_draft(self):
         try:
             count=self.db.save_weekly_attendance_draft(self.week_start,self.cells)
@@ -17969,7 +18532,8 @@ class WeeklyAttendanceGridDialog(tk.Toplevel):
             messagebox.showerror(APP_TITLE,'Mark at least one attendance cell first.',parent=self);return
         missing=sum((eid,day,pid) not in self.cells and (eid,day,pid) not in self.recorded
                     and (eid,day,pid) not in self.finalized_absences
-                    for eid in [e['id'] for e in self.employees] for day in self.dates for pid in [p['id'] for p in self.projects])
+                    for pid,employee_ids in self.project_employee_ids.items() if pid is not None
+                    for eid in employee_ids for day in self.dates)
         if not messagebox.askyesno('Review weekly attendance',
             f'{len(segments)} present and {sum(c["state"]=="Absent" for c in self.cells.values())} absent cell(s) '
             f'across {len({pid for _eid,_day,pid in self.cells})} project(s). '
