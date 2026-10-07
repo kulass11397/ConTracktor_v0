@@ -43,9 +43,20 @@ The core application uses Python's standard library and Tkinter. A typical devel
 python -m unittest discover -p "test_*.py"
 ```
 
-### Application fingerprints
+## DP allocation reactivation patch — 2026-10-07
 
-The following SHA-256 values identify the exact application files preserved from the current working copy:
+- Voiding an expense immediately refreshes its original PC/DP allocation: restored cash reopens it as Active or Partially Used and clears its closure date.
+- Restored cash can be returned through Cash Operations > Return unused cash to shared pool. It is not automatically moved or duplicated.
+- Opening the application repairs stale Completed/Fully Used allocation labels only when an available balance remains. Payment amounts, cash-source links and expense records are not rewritten by this repair.
+- Restoring a voided expense checks available allocation funds first, preventing a second use of money already returned or consumed.
+- Surrendered, redeposited and voided allocations retain their separate custody workflow. Fully returned allocations remain closed.
+- Added regression coverage for full/partial voids, restoration, return-to-pool and repeat-safe startup repair.
+
+This patch updates source only; it does not publish a new installer. The historical baseline tag remains unchanged.
+
+### Historical baseline application fingerprints
+
+The following SHA-256 values identify the application files at `baseline-2026-10-07`, before the DP reactivation patch:
 
 ```text
 app.py        4bb5459c2d6b04e613ab7dde8da138566cd74b93716ac69549931dc190df23a1

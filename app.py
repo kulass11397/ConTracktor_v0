@@ -2175,6 +2175,17 @@ class Database:
         self._create_schema()
         self._ensure_personal_phase()
         self._migrate_company_employee_numbers()
+        self._reopen_restored_allocations()
+
+    def _reopen_restored_allocations(self):
+        """Repair stale usage labels without altering payments or cash sources."""
+        with self.conn:
+            for row in self.all(
+                """SELECT id FROM cash_allocations WHERE voided=0
+                   AND status IN ('Completed','Fully Used')"""
+            ):
+                if self.allocation_balance(row['id']) > 0:
+                    self._sync_allocation_usage_status(row['id'])
 
     def _ensure_personal_phase(self):
         """Make company-owned expenses importable under a dedicated phase."""
@@ -6936,10 +6947,12 @@ class Database:
             return
         # A surrendered/returned allocation has a separate custody workflow and
         # must not be reopened merely because a payment source was corrected.
-        if allocation["status"] in ("Surrendered", "Returned", "Voided"):
+        if allocation["status"] in ("Surrendered", "Returned", "Redeposited", "Voided"):
             return
         spent = self.allocation_spent(allocation_id)
         balance = self.allocation_balance(allocation_id)
+        if balance <= 0 and allocation['status'] == 'Returned to Shared Pool':
+            return
         if balance <= 0:
             self.conn.execute(
                 "UPDATE cash_allocations SET status='Completed' WHERE id=?", (allocation_id,)
@@ -6954,6 +6967,35 @@ class Database:
                 "UPDATE cash_allocations SET status='Active',closed_at='' WHERE id=?",
                 (allocation_id,),
             )
+
+    def set_expense_voided(self, expense_id: int, should_void: bool):
+        """Reverse/restore expense usage and refresh the original PC/DP custody."""
+        with self.conn:
+            expense = self.one('SELECT voided,project_id FROM expenses WHERE id=?', (expense_id,))
+            if not expense:
+                raise ValueError('Select an existing expense.')
+            if bool(expense['voided']) == bool(should_void):
+                return
+            allocations = self.all(
+                """SELECT cash_allocation_id id,SUM(amount_cents) amount
+                   FROM payments WHERE expense_id=? AND accounting_excluded=0
+                   AND cash_allocation_id IS NOT NULL GROUP BY cash_allocation_id""",
+                (expense_id,),
+            )
+            if should_void:
+                self.assert_funding_reversal_allowed(expense_id)
+            else:
+                for allocation in allocations:
+                    # Restored expense payments cannot consume cash already
+                    # returned, surrendered, deposited, or spent elsewhere.
+                    self.validate_cash_allocation_payment(
+                        expense['project_id'], allocation['id'], allocation['amount'])
+            self.conn.execute(
+                """UPDATE expenses SET voided=?,verification_status='Unverified',
+                   verified_at='' WHERE id=?""", (int(should_void), expense_id),
+            )
+            for allocation in allocations:
+                self._sync_allocation_usage_status(allocation['id'])
 
     def _sync_expense_payment_status(self, expense_id: int):
         row = self.one(
@@ -16328,10 +16370,11 @@ class ExpensesTab(BaseTab):
             )
             if not head:
                 return
-            self.db.execute(
-                """UPDATE expenses SET voided=CASE voided WHEN 1 THEN 0 ELSE 1 END,
-                   verification_status='Unverified',verified_at='' WHERE id=?""", (expense_id,)
-            )
+            try:
+                self.db.set_expense_voided(expense_id, not expense['voided'])
+            except (ValueError, sqlite3.Error) as exc:
+                messagebox.showerror(APP_TITLE, str(exc), parent=self)
+                return
             self.db.audit(
                 expense["project_id"], "EXPENSE_VOID_TOGGLED",
                 f"#{expense_id} {action.lower()} authorized by {head['name']}",
