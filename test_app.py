@@ -1543,7 +1543,12 @@ class ContractorTrackerTests(unittest.TestCase):
                 "start_date": "2026-08-01", "target_date": "2026-12-01", "notes": "",
             })
             count = db.one("SELECT COUNT(*) count FROM phases WHERE project_id=?", (project_id,))["count"]
-            self.assertEqual(count, 9)
+            personal = db.one(
+                "SELECT name FROM phases WHERE project_id=? AND LOWER(name)='personal'",
+                (project_id,),
+            )
+            self.assertEqual(count, 10)
+            self.assertEqual(personal["name"], "Personal")
             db.close()
 
     def test_project_address_is_stored(self):

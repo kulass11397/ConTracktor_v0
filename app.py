@@ -86,6 +86,7 @@ DB_PATH = resolve_db_path()
 DEFAULT_PHASES = [
     "Pre-Construction", "Site Preparation", "Foundation", "Structural",
     "Roofing", "Electrical", "Plumbing", "Finishes", "Inspection & Handover",
+    "Personal",
 ]
 DEFAULT_EXPENSE_CATEGORIES = [
     "MATERIALS", "PAYROLL", "TOOLS & EQUIPMENT", "MOBILIZATION",
@@ -2172,7 +2173,25 @@ class Database:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
         self._create_schema()
+        self._ensure_personal_phase()
         self._migrate_company_employee_numbers()
+
+    def _ensure_personal_phase(self):
+        """Make company-owned expenses importable under a dedicated phase."""
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO phases(project_id,name,sort_order)
+                   SELECT p.id,'Personal',
+                          COALESCE((SELECT MAX(existing.sort_order)+1
+                                      FROM phases existing
+                                     WHERE existing.project_id=p.id),0)
+                     FROM projects p
+                    WHERE NOT EXISTS(
+                          SELECT 1 FROM phases existing
+                           WHERE existing.project_id=p.id
+                             AND LOWER(TRIM(existing.name))='personal'
+                    )"""
+            )
 
     def _migrate_company_employee_numbers(self):
         """Rename profiles, not identities; keep former references as aliases."""
@@ -13068,6 +13087,8 @@ class BulkExpenseDialog(tk.Toplevel):
             phases = [row["name"] for row in self.db.all(
                 "SELECT DISTINCT name FROM phases ORDER BY name COLLATE NOCASE"
             ) if row["name"]]
+            if not any(name.casefold() == "personal" for name in phases):
+                phases.append("Personal")
             categories = [row["name"] for row in self.db.all(
                 "SELECT name FROM expense_categories ORDER BY name COLLATE NOCASE"
             )]
