@@ -64,7 +64,7 @@ The core application uses Python's standard library and Tkinter. A typical devel
 python -B -m unittest discover -p "test_*.py"
 ```
 
-The current working tree passed 183 automated tests on 2026-10-07. This is a dated source-level result, not installer validation or a promise that future edits are tested. Tests use disposable databases; never aim them at the working client database. Constructing `Database` runs upgrades and repairs. See [database safety](docs/DATABASE.md).
+The current working tree passed 184 automated tests on 2026-10-07. This is a dated source-level result, not installer validation or a promise that future edits are tested. Tests use disposable databases; never aim them at the working client database. Constructing `Database` runs upgrades and repairs. See [database safety](docs/DATABASE.md).
 
 Known architectural limits include a monolithic core, duplicate/legacy class definitions, string-based financial classifications, mixed database/application constraints, and guarded client-specific startup repairs. This is a local operational tracker, not a complete double-entry accounting or automatic revenue-recognition system. Documentation does not implement new features.
 

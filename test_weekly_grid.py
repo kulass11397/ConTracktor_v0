@@ -3,6 +3,7 @@ import tkinter as tk
 import re
 import tempfile
 import zipfile
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
@@ -130,6 +131,35 @@ class WeeklyGridTests(unittest.TestCase):
             self.assertEqual(result['cells'][(extra,'2026-09-12',self.oasis)],
                              {'state':'Present','segments':[['08:00','17:00']]})
             self.assertIn(extra,result['project_employee_ids'][self.oasis])
+
+    def test_attendance_workbook_styles_follow_excel_schema_order(self):
+        projects,employees,rosters=self.workbook_inputs()
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'generated.xlsx'
+            write_weekly_attendance_xlsx(path,'2026-09-14',projects,employees,rosters,{})
+            with zipfile.ZipFile(path) as archive:
+                styles=ET.fromstring(archive.read('xl/styles.xml'))
+                worksheet_names=[name for name in archive.namelist()
+                                 if name.startswith('xl/worksheets/sheet') and name.endswith('.xml')]
+                worksheets=[ET.fromstring(archive.read(name)) for name in worksheet_names]
+        local_names=[node.tag.rsplit('}',1)[-1] for node in styles]
+        style_sequence=['fonts','fills','borders','cellStyleXfs','cellXfs','cellStyles','dxfs']
+        self.assertEqual([name for name in local_names if name in style_sequence],style_sequence)
+        namespace='{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
+        cell_xfs=styles.find(namespace+'cellXfs')
+        dxfs=styles.find(namespace+'dxfs')
+        self.assertEqual(int(cell_xfs.attrib['count']),len(cell_xfs))
+        self.assertEqual(int(dxfs.attrib['count']),len(dxfs))
+        for differential_style in dxfs:
+            self.assertEqual([node.tag.rsplit('}',1)[-1] for node in differential_style],
+                             ['font','fill'])
+        for worksheet in worksheets:
+            for cell in worksheet.findall('.//'+namespace+'c'):
+                if 's' in cell.attrib:
+                    self.assertLess(int(cell.attrib['s']),len(cell_xfs))
+            for rule in worksheet.findall('.//'+namespace+'cfRule'):
+                if 'dxfId' in rule.attrib:
+                    self.assertLess(int(rule.attrib['dxfId']),len(dxfs))
 
     def test_attendance_workbook_rejects_changed_recorded_cell(self):
         projects,employees,rosters=self.workbook_inputs()

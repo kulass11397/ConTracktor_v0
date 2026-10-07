@@ -68,6 +68,6 @@ Startup snapshots, migration backups and user backup/export actions coexist. Bac
 
 ## Testing and maintenance limits
 
-The current source passed 183 discovered tests on 2026-10-07. Fixtures cover payroll, split-site attendance, attendance-workbook round trips, source attribution, imports, reports, reviewed migration guards and allocation reactivation; coverage is not proof of every UI/layout or installer path. GUI tests need Tk. Executable packaging/security checks are a distinct release task.
+The current source passed 184 discovered tests on 2026-10-07. Fixtures cover payroll, split-site attendance, attendance-workbook round trips, source attribution, imports, reports, reviewed migration guards and allocation reactivation; coverage is not proof of every UI/layout or installer path. GUI tests need Tk. Executable packaging/security checks are a distinct release task.
 
 Technical debt: monolithic source and direct SQL in UI; shadowed legacy classes; label-dependent presentation patches; JSON payloads and string method/status conventions; inconsistent declared foreign keys across upgraded databases; client-specific historical guards; no formal general-ledger accounting. Repository migration and further decomposition are **proposed—not implemented**. Maintain behavior and data provenance before refactoring.
